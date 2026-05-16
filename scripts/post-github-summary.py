@@ -31,8 +31,13 @@ def main():
     pr_context = json.loads(Path(args.pr_context).read_text(encoding="utf-8"))
     pr_number = str(pr_context.get("number") or "")
     repo = args.repo or pr_context.get("repo") or ""
-    if not pr_number:
-        raise RuntimeError("PR context is missing number")
+    try:
+        parsed_pr_number = int(pr_number)
+    except ValueError as exc:
+        raise RuntimeError(f"PR number must be a positive integer, got: {pr_number!r}") from exc
+    if parsed_pr_number <= 0:
+        raise RuntimeError(f"PR number must be a positive integer, got: {pr_number!r}")
+    pr_number = str(parsed_pr_number)
 
     cmd = ["gh", "pr", "comment", pr_number, "--body-file", args.body_file]
     if args.edit_last:

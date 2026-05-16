@@ -45,8 +45,6 @@ def run(args, cwd=None, check=False, timeout=30):
 
 def parse_pr(value):
     raw = value.strip().rstrip("/")
-    if re.fullmatch(r"#?\d+", raw):
-        return "", raw.lstrip("#")
     normalized = re.split(r"[?#]", raw, maxsplit=1)[0]
     if "github.com/" in normalized and "/pull/" in normalized:
         parts = [part for part in normalized.split("/") if part]
@@ -56,8 +54,14 @@ def parse_pr(value):
             raise ValueError(f"unsupported PR URL: {value}")
         if pull_index < 2 or pull_index + 1 >= len(parts):
             raise ValueError(f"unsupported PR URL: {value}")
-        return f"{parts[pull_index - 2]}/{parts[pull_index - 1]}", parts[pull_index + 1]
-    return "", normalized.lstrip("#")
+        pr_number = parts[pull_index + 1]
+        if not re.fullmatch(r"\d+", pr_number):
+            raise ValueError(f"unsupported PR URL: {value}")
+        return f"{parts[pull_index - 2]}/{parts[pull_index - 1]}", pr_number
+    pr_number = (normalized or raw).lstrip("#")
+    if not re.fullmatch(r"\d+", pr_number):
+        raise ValueError(f"unsupported PR input: {value}")
+    return "", pr_number
 
 
 def current_repo():
