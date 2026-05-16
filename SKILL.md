@@ -21,15 +21,24 @@ Invocation examples:
 - `/local-ultra-review origin/main`
 - `/local-ultra-review HEAD~3..HEAD`
 - `/local-ultra-review pr 123`
+- `/local-ultra-review https://github.com/org/repo/pull/123`
 - `/local-ultra-review --base origin/main --mode deep`
+- `/local-ultra-review pr 123 --post summary`
 
 If no target is provided, review the current branch against the default base branch and include staged and unstaged tracked changes.
+
+If the target is a GitHub PR, default to `deep` mode, collect PR metadata, review the PR head in an isolated worktree, and render a GitHub-ready summary comment. Do not post the comment unless the user passes `--post summary`.
 
 Modes:
 
 - `light`: correctness, security/integration, and tests/verification
 - `deep`: default, five reviewer lenses plus verification
 - `max`: broader review for large or high-risk changes
+
+GitHub output:
+
+- `--post none`: default; write local artifacts only
+- `--post summary`: post one top-level PR summary comment after verification and report rendering
 
 ## Hard Rules
 
@@ -94,10 +103,25 @@ If no argument is provided, use current branch versus the detected default base 
 
 ### Phase 2: Prepare Isolated Workspace
 
-Run:
+For branch or working-tree targets, run:
 
 ```bash
 bash ${CLAUDE_SKILL_DIR}/scripts/prepare-worktree.sh --base <base-ref>
+```
+
+For GitHub PR targets, first collect PR metadata and then prepare the PR worktree:
+
+```bash
+python3 ${CLAUDE_SKILL_DIR}/scripts/collect-pr-context.py \
+  --pr <pr-number-or-url> \
+  --repo <owner/repo-if-known> \
+  --out .local-ultra-review/<session-id>/pr-context.json
+
+bash ${CLAUDE_SKILL_DIR}/scripts/prepare-pr-worktree.sh \
+  --pr <pr-number-or-url> \
+  --repo <owner/repo-if-known> \
+  --base <pr-base-ref-name> \
+  --session-id <session-id>
 ```
 
 Expected behavior:
@@ -174,6 +198,33 @@ Write:
 - `.local-ultra-review/<session-id>/review-bundle.json`
 - `.local-ultra-review/<session-id>/logs/`
 
+For GitHub PR targets, also write:
+
+- `.local-ultra-review/<session-id>/pr-context.json`
+- `.local-ultra-review/<session-id>/github-pr-comment.md`
+
+Render the GitHub summary with:
+
+```bash
+python3 ${CLAUDE_SKILL_DIR}/scripts/render-github-summary.py \
+  --pr-context .local-ultra-review/<session-id>/pr-context.json \
+  --findings .local-ultra-review/<session-id>/findings.json \
+  --report .local-ultra-review/<session-id>/report.md \
+  --out .local-ultra-review/<session-id>/github-pr-comment.md \
+  --mode <mode> \
+  --session-id <session-id>
+```
+
+If and only if the user passed `--post summary`, post exactly one top-level PR comment:
+
+```bash
+python3 ${CLAUDE_SKILL_DIR}/scripts/post-github-summary.py \
+  --pr-context .local-ultra-review/<session-id>/pr-context.json \
+  --body-file .local-ultra-review/<session-id>/github-pr-comment.md
+```
+
+Do not create inline comments or GitHub review events in this version.
+
 The final response to the user should include only:
 
 1. Important count
@@ -183,4 +234,3 @@ The final response to the user should include only:
 5. Top 3 findings, if any
 
 Do not paste large logs into chat.
-

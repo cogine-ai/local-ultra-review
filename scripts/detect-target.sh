@@ -42,6 +42,8 @@ mode = "deep"
 base = None
 target = None
 target_type = None
+repo = None
+post_mode = "none"
 include_uncommitted = True
 include_untracked = False
 errors = []
@@ -52,14 +54,38 @@ while i < len(args):
     if arg == "--mode" and i + 1 < len(args):
         mode = args[i + 1]
         i += 2
+    elif arg == "--mode":
+        errors.append("missing value for --mode")
+        i += 1
     elif arg.startswith("--mode="):
         mode = arg.split("=", 1)[1]
         i += 1
     elif arg == "--base" and i + 1 < len(args):
         base = args[i + 1]
         i += 2
+    elif arg == "--base":
+        errors.append("missing value for --base")
+        i += 1
     elif arg.startswith("--base="):
         base = arg.split("=", 1)[1]
+        i += 1
+    elif arg == "--repo" and i + 1 < len(args):
+        repo = args[i + 1]
+        i += 2
+    elif arg == "--repo":
+        errors.append("missing value for --repo")
+        i += 1
+    elif arg.startswith("--repo="):
+        repo = arg.split("=", 1)[1]
+        i += 1
+    elif arg == "--post" and i + 1 < len(args):
+        post_mode = args[i + 1]
+        i += 2
+    elif arg == "--post":
+        errors.append("missing value for --post")
+        i += 1
+    elif arg.startswith("--post="):
+        post_mode = arg.split("=", 1)[1]
         i += 1
     elif arg == "--include-untracked":
         include_untracked = True
@@ -79,7 +105,10 @@ while i < len(args):
         i += 1
     elif "github.com/" in arg and "/pull/" in arg:
         target_type = "pr"
-        target = arg.rstrip("/").split("/")[-1]
+        parts = arg.rstrip("/").split("/")
+        target = parts[-1]
+        if len(parts) >= 5:
+            repo = f"{parts[-4]}/{parts[-3]}"
         include_uncommitted = False
         i += 1
     elif ".." in arg:
@@ -95,6 +124,9 @@ while i < len(args):
 
 if mode not in {"light", "deep", "max"}:
     errors.append(f"unsupported mode: {mode}")
+
+if post_mode not in {"none", "summary"}:
+    errors.append(f"unsupported post mode: {post_mode}")
 
 if target_type is None:
     target_type = "working_tree"
@@ -113,12 +145,14 @@ result = {
     "ok": not errors,
     "target_type": target_type,
     "target": target or "",
+    "repo": repo or "",
     "base": base or "",
     "head": head_proc.stdout.strip() if head_proc.returncode == 0 else "",
     "branch": branch_proc.stdout.strip() if branch_proc.returncode == 0 else "",
     "mode": mode,
     "include_uncommitted": include_uncommitted,
     "include_untracked": include_untracked,
+    "post_mode": post_mode,
     "errors": errors,
 }
 
@@ -130,4 +164,3 @@ else:
 print(json.dumps(result, indent=2, sort_keys=True))
 sys.exit(0 if result["ok"] else 2)
 PY
-

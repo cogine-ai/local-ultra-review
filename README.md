@@ -62,6 +62,7 @@ Default behavior:
 /local-ultra-review --base origin/main --mode light
 /local-ultra-review --base origin/main --mode deep
 /local-ultra-review --base origin/main --mode max
+/local-ultra-review pr 123 --post summary
 ```
 
 ## Modes
@@ -71,6 +72,56 @@ Default behavior:
 | `light` | You want a faster pre-merge bug pass | correctness, security/integration, tests/verification |
 | `deep` | Default. You want high confidence before merge | correctness, security/privacy, integration, state/concurrency/migration, tests |
 | `max` | Large or high-risk changes | same core reviewers, with room for domain-specific expansion |
+
+## GitHub PR Review
+
+GitHub PR targets are first-class review inputs:
+
+```text
+/local-ultra-review pr 123
+/local-ultra-review https://github.com/org/repo/pull/123
+/local-ultra-review pr 123 --repo org/repo
+```
+
+Default PR behavior:
+
+- uses `deep` mode
+- collects PR metadata with `gh pr view`
+- checks out the PR head into an isolated local worktree
+- reviews the PR diff through the normal Local Ultra Review pipeline
+- writes a full local report and `findings.json`
+- renders a GitHub-ready top-level summary comment
+- does **not** post to GitHub unless explicitly requested
+
+To post the summary comment:
+
+```text
+/local-ultra-review pr 123 --post summary
+```
+
+This intentionally posts one PR summary comment, not inline comments. Inline comments require mapping verified findings to GitHub diff-commentable lines; that is useful, but easy to get wrong. The first GitHub version optimizes for a professional, low-noise PR review summary.
+
+The generated PR comment follows this shape:
+
+```markdown
+## Automated Local Ultra Review
+
+**Commit:** `9d6dfb537194`
+**Mode:** `deep`
+
+| Review Score | Findings | Severity Breakdown |
+|---:|---:|---|
+| **100/100** (Pass) | **0** | P0: 0 / P1: 0 / P2: 0 / P3: 0 |
+
+> [!IMPORTANT]
+> This is an automated Local Ultra Review. Treat findings as review candidates for human verification.
+
+### Review Findings
+
+I did not identify any verified, discrete, actionable bugs introduced by this PR.
+
+<!-- pr-review-agent provider=local-ultra-review head=<sha> session=<id> -->
+```
 
 ## Design Mapping
 
@@ -145,10 +196,14 @@ Key files:
 - `prompts/07-verifier.md`: independent verification contract
 - `schemas/*.schema.json`: structured bundle and finding formats
 - `scripts/collect-context.py`: builds the review bundle
+- `scripts/collect-pr-context.py`: records GitHub PR metadata
+- `scripts/prepare-pr-worktree.sh`: checks out PR heads into isolated worktrees
 - `scripts/run-reviewers.py`: generates reviewer packets or runs CLI backends
 - `scripts/verify-findings.py`: applies programmatic finding gates
 - `scripts/dedupe-rank.py`: merges duplicate findings and ranks severity
 - `scripts/render-report.py`: writes the final report
+- `scripts/render-github-summary.py`: writes a GitHub-ready PR summary comment
+- `scripts/post-github-summary.py`: optionally posts that summary via `gh pr comment`
 
 ## Optional Script Usage
 
@@ -164,6 +219,7 @@ python3 scripts/run-reviewers.py --bundle .local-ultra-review/session/review-bun
 python3 scripts/verify-findings.py --bundle .local-ultra-review/session/review-bundle.json --candidates .local-ultra-review/session/candidates --out-jsonl .local-ultra-review/session/verification.jsonl --out-json .local-ultra-review/session/verification.json
 python3 scripts/dedupe-rank.py --verification .local-ultra-review/session/verification.jsonl --out .local-ultra-review/session/findings.json
 python3 scripts/render-report.py --bundle .local-ultra-review/session/review-bundle.json --findings .local-ultra-review/session/findings.json --out .local-ultra-review/session/report.md
+python3 scripts/render-github-summary.py --pr-context .local-ultra-review/session/pr-context.json --findings .local-ultra-review/session/findings.json --report .local-ultra-review/session/report.md --out .local-ultra-review/session/github-pr-comment.md
 ```
 
 `run-reviewers.py` supports three backend shapes:
@@ -185,6 +241,8 @@ Expected session artifacts:
 ├── candidates.jsonl
 ├── verification.jsonl
 ├── review-bundle.json
+├── pr-context.json
+├── github-pr-comment.md
 ├── logs/
 └── worktree-path.txt
 ```
@@ -239,4 +297,3 @@ It is better to return two verified bugs than twenty plausible comments. The ver
 - [Claude Code: Code Review](https://code.claude.com/docs/en/code-review)
 - [Claude Code: Skills](https://code.claude.com/docs/en/skills)
 - [Claude Code: Worktrees](https://code.claude.com/docs/en/worktrees)
-
