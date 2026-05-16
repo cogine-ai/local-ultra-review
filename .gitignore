@@ -1,0 +1,7 @@
+.local-ultra-review/
+output/*
+!output/.gitkeep
+__pycache__/
+*.pyc
+.DS_Store
+
