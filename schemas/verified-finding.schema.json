@@ -45,7 +45,20 @@
       ]
     },
     "category": {
-      "type": "string"
+      "type": "string",
+      "enum": [
+        "correctness",
+        "security",
+        "privacy",
+        "integration",
+        "test",
+        "performance",
+        "migration",
+        "concurrency",
+        "state",
+        "configuration",
+        "other"
+      ]
     },
     "file": {
       "type": "string",
@@ -65,7 +78,26 @@
       "type": "array",
       "items": {
         "type": "object",
-        "additionalProperties": true
+        "additionalProperties": true,
+        "required": [
+          "file",
+          "line",
+          "reason"
+        ],
+        "properties": {
+          "file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
       }
     },
     "verification": {
@@ -112,6 +144,26 @@
     "dedupe_key": {
       "type": "string"
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "confirmed"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "evidence": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ]
 }
-
