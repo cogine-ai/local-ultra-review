@@ -47,6 +47,9 @@ Default behavior:
 - excludes untracked files by default
 - uses `deep` mode
 - creates a local git worktree when possible
+- writes artifacts under `.local-ultra-review/<session-id>/`
+- removes the temporary worktree after a successful report unless `--keep-worktree` is used
+- adds `.local-ultra-review/` to `.git/info/exclude`, not the tracked project `.gitignore`
 - avoids copying secrets or `.env` files
 - avoids network access by default
 - reports only verified Important/Nit findings in the main report
@@ -63,6 +66,8 @@ Default behavior:
 /local-ultra-review --base origin/main --mode deep
 /local-ultra-review --base origin/main --mode max
 /local-ultra-review pr 123 --post summary
+/local-ultra-review pr 123 --post review
+/local-ultra-review pr 123 --keep-worktree
 ```
 
 ## Modes
@@ -90,16 +95,30 @@ Default PR behavior:
 - checks out the PR head into an isolated local worktree
 - reviews the PR diff through the normal Local Ultra Review pipeline
 - writes a full local report and `findings.json`
+- removes the temporary worktree after a successful run unless `--keep-worktree` is used
 - renders a GitHub-ready top-level summary comment
-- does **not** post to GitHub unless explicitly requested
+- does **not** post to GitHub for PR numbers or non-current-repo PR URLs unless explicitly requested
+- automatically posts one GitHub PR review event when the user provides a full PR URL for the current checkout's `origin` repository
 
-To post the summary comment:
+To opt out of posting for a current-repo PR URL:
+
+```text
+/local-ultra-review https://github.com/org/repo/pull/123 --post none
+```
+
+To post the legacy summary comment:
 
 ```text
 /local-ultra-review pr 123 --post summary
 ```
 
-This intentionally posts one PR summary comment, not inline comments. Inline comments require mapping verified findings to GitHub diff-commentable lines; that is useful, but easy to get wrong. The first GitHub version optimizes for a professional, low-noise PR review summary.
+To post a GitHub PR review explicitly:
+
+```text
+/local-ultra-review pr 123 --post review
+```
+
+`--post review` creates one GitHub review event. It leaves CodeRabbit-style inline comments for verified Important/Nit findings that map cleanly to right-side lines in the PR diff. If a verified finding cannot be placed on a GitHub diff-commentable line, Local Ultra Review lists it in the review body instead of forcing a bad inline comment.
 
 The generated PR comment follows this shape:
 
@@ -204,6 +223,9 @@ Key files:
 - `scripts/render-report.py`: writes the final report
 - `scripts/render-github-summary.py`: writes a GitHub-ready PR summary comment
 - `scripts/post-github-summary.py`: optionally posts that summary via `gh pr comment`
+- `scripts/post-github-review.py`: optionally posts a GitHub PR review with inline comments via `gh api`
+- `scripts/ensure-local-ignore.sh`: adds the output directory to `.git/info/exclude`
+- `scripts/finalize-session.sh`: removes or preserves the temporary worktree after report generation
 
 ## Optional Script Usage
 
@@ -220,6 +242,8 @@ python3 scripts/verify-findings.py --bundle .local-ultra-review/session/review-b
 python3 scripts/dedupe-rank.py --verification .local-ultra-review/session/verification.jsonl --out .local-ultra-review/session/findings.json
 python3 scripts/render-report.py --bundle .local-ultra-review/session/review-bundle.json --findings .local-ultra-review/session/findings.json --out .local-ultra-review/session/report.md
 python3 scripts/render-github-summary.py --pr-context .local-ultra-review/session/pr-context.json --findings .local-ultra-review/session/findings.json --report .local-ultra-review/session/report.md --out .local-ultra-review/session/github-pr-comment.md
+python3 scripts/post-github-review.py --pr-context .local-ultra-review/session/pr-context.json --findings .local-ultra-review/session/findings.json --mode deep --session-id session --out .local-ultra-review/session/github-pr-review-payload.json
+bash scripts/finalize-session.sh --session-dir .local-ultra-review/session --status success
 ```
 
 `run-reviewers.py` supports three backend shapes:
@@ -243,9 +267,12 @@ Expected session artifacts:
 ├── review-bundle.json
 ├── pr-context.json
 ├── github-pr-comment.md
+├── github-pr-review-payload.json
 ├── logs/
 └── worktree-path.txt
 ```
+
+The temporary worktree is normally removed after a successful run. `worktree-path.txt` remains as provenance for the review workspace that was used. Failed or interrupted runs preserve the worktree for debugging; remove it later with `scripts/cleanup.sh` or `scripts/finalize-session.sh`.
 
 The final agent response should stay short:
 
