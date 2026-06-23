@@ -26,10 +26,15 @@ def finding_line(row):
     location = f"{row.get('file')}:{row.get('line')}"
     scenario = row.get("failure_scenario", "").strip()
     verification = (row.get("verification") or {}).get("summary", "").strip()
+    best_fix = (row.get("best_fix") or row.get("suggested_fix_direction") or "").strip()
+    proof = (row.get("proof") or verification or "").strip()
+    risk = (row.get("risk") or "").strip()
     lines = [
         f"- **{title}** (`{location}`)",
         f"  - What breaks: {scenario or 'Not recorded.'}",
-        f"  - Verification: {verification or 'Not recorded.'}",
+        f"  - Best fix: {best_fix or 'Not recorded.'}",
+        f"  - Proof: {proof or 'Not recorded.'}",
+        f"  - Risk: {risk or 'Not recorded.'}",
     ]
     return "\n".join(lines)
 

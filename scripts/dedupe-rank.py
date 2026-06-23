@@ -23,6 +23,8 @@ CATEGORY_RANK = {
     "test": 5,
 }
 
+MERGED_TEXT_FIELDS = ["provenance", "best_fix", "refactor", "proof", "risk", "suggested_fix_direction"]
+
 
 def load_rows(path):
     rows = []
@@ -68,6 +70,11 @@ def merge_rows(rows):
         for evidence in row.get("evidence", []):
             if evidence not in existing_evidence:
                 existing_evidence.append(evidence)
+        for field in MERGED_TEXT_FIELDS:
+            current = normalize(target.get(field, ""))
+            incoming = normalize(row.get(field, ""))
+            if incoming and (not current or len(incoming) > len(current)):
+                target[field] = row[field]
         notes = target.setdefault("merged_candidate_ids", [])
         if row.get("candidate_id"):
             notes.append(row["candidate_id"])
@@ -118,4 +125,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

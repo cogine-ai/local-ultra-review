@@ -138,6 +138,21 @@
         }
       }
     },
+    "provenance": {
+      "type": "string"
+    },
+    "best_fix": {
+      "type": "string"
+    },
+    "refactor": {
+      "type": "string"
+    },
+    "proof": {
+      "type": "string"
+    },
+    "risk": {
+      "type": "string"
+    },
     "suggested_fix_direction": {
       "type": "string"
     },
@@ -158,9 +173,31 @@
         ]
       },
       "then": {
+        "required": [
+          "provenance",
+          "best_fix",
+          "refactor",
+          "proof",
+          "risk"
+        ],
         "properties": {
           "evidence": {
             "minItems": 1
+          },
+          "provenance": {
+            "minLength": 1
+          },
+          "best_fix": {
+            "minLength": 1
+          },
+          "refactor": {
+            "minLength": 1
+          },
+          "proof": {
+            "minLength": 1
+          },
+          "risk": {
+            "minLength": 1
           }
         }
       }

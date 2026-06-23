@@ -1,9 +1,8 @@
 interface:
   display_name: "Local Ultra Review"
-  short_description: "Deep local code review workflow"
+  short_description: "Deep verified review with fix and risk proof"
   brand_color: "#2563EB"
-  default_prompt: "Use $local-ultra-review to run a deep local review of the current branch before merge."
+  default_prompt: "Use $local-ultra-review to run a deep local review of the current branch before merge, with provenance, best fix, refactor judgment, proof, and residual risk for confirmed findings."
 
 policy:
   allow_implicit_invocation: false
-

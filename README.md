@@ -174,6 +174,7 @@ A finding must include:
 - evidence from code or contract paths
 - why the current diff introduced or worsened it
 - verification plan or verifier confirmation
+- provenance, best fix, refactor judgment, proof, and residual risk for confirmed findings
 
 The main report excludes:
 

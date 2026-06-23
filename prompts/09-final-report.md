@@ -43,8 +43,11 @@ Each Important or Nit finding must include:
 - what breaks
 - why this diff introduced or worsened it
 - evidence
-- suggested fix direction
+- provenance
+- best fix
+- refactor
+- proof
+- risk
 - verification
 
 Do not include unverified candidates in Important or Nits.
-

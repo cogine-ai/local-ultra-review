@@ -52,4 +52,8 @@ Each candidate must answer:
 - Why is this diff responsible?
 - What code evidence supports it?
 - How should a verifier confirm or reject it?
-
+- Provenance: who/what introduced, made visible, or carried forward the issue when traceable; otherwise `N/A` or `unknown` with the missing evidence.
+- Best fix: the ownership-boundary fix that best addresses the bug class, not just a symptom patch.
+- Refactor: whether a larger refactor would make the invariant clearer or safer, or why it would widen risk without enough benefit.
+- Proof: the strongest proof already checked or available, such as tests, live repro, CI, source, dependency docs, or base-vs-head comparison.
+- Risk: the remaining uncertainty, rollout risk, compatibility concern, or test gap.

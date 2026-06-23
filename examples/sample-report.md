@@ -26,8 +26,12 @@ Confirmed findings: 1 Important, 0 Nits.
 - Why this diff: introduced or worsened by this diff
 - Evidence:
   - `src/users.ts:42`: The changed query uses id without workspaceId after the diff removed the scoped helper.
-- Suggested fix direction: Restore workspaceId scoping or call the scoped helper.
 - Verification: Base used the scoped helper; head queries by id only. A cross-workspace request reaches the changed path.
+- Provenance: introduced by the current diff when it replaced the scoped helper with a raw id lookup
+- Best fix: Restore workspaceId scoping at the user lookup ownership boundary or call the scoped helper.
+- Refactor: No broader refactor is needed if the scoped helper remains the single tenant-boundary API.
+- Proof: Base-vs-head comparison shows the workspaceId predicate disappeared; a cross-workspace fixture should reproduce the leak.
+- Risk: Without the scoped lookup, any route that accepts an arbitrary user id can expose cross-workspace profile data.
 
 ## Nits
 
@@ -58,4 +62,3 @@ No Needs Manual Review items.
 - Review bundle: `.local-ultra-review/20260516T000000Z-abc123/review-bundle.json`
 - Findings JSON: `.local-ultra-review/20260516T000000Z-abc123/findings.json`
 - Verification JSONL: `.local-ultra-review/20260516T000000Z-abc123/verification.jsonl`
-

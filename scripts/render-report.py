@@ -13,6 +13,11 @@ def load_json(path, default):
     return json.loads(p.read_text(encoding="utf-8"))
 
 
+def field(row, key, fallback="Not recorded."):
+    value = str(row.get(key) or "").strip()
+    return value or fallback
+
+
 def fmt_finding(row):
     loc = f"{row.get('file')}:{row.get('line')}"
     evidence = row.get("evidence") or []
@@ -34,7 +39,11 @@ def fmt_finding(row):
         "- Evidence:",
         *(evidence_lines or ["  - No evidence recorded."]),
         f"- Verification: {verification.get('summary', '')}",
-        f"- Suggested fix direction: {row.get('suggested_fix_direction') or 'Not provided.'}",
+        f"- Provenance: {field(row, 'provenance')}",
+        f"- Best fix: {field(row, 'best_fix', row.get('suggested_fix_direction') or 'Not recorded.')}",
+        f"- Refactor: {field(row, 'refactor')}",
+        f"- Proof: {field(row, 'proof', verification.get('summary') or 'Not recorded.')}",
+        f"- Risk: {field(row, 'risk')}",
         "",
     ])
 
@@ -130,4 +139,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -17,6 +17,7 @@ Drop false positives.
 - Same contract break with producer and consumer evidence: one finding.
 - Same file and line but different symptoms: merge unless they are genuinely separate bugs.
 - Prefer the clearest title and strongest failure scenario.
+- Preserve the strongest provenance, best fix, refactor, proof, and risk details when merging duplicates.
 
 ## Severity Order
 
@@ -38,4 +39,3 @@ Rank by:
 - Main report: at most 20 unless the user requests all confirmed findings
 
 If there are no confirmed findings, say that clearly.
-

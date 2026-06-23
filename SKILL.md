@@ -61,7 +61,8 @@ Worktree lifecycle:
 8. A finding must cite exact `file:line`.
 9. A finding must include a concrete failure scenario.
 10. A finding must be checked by a separate verifier pass before it appears as Important or Nit.
-11. If a candidate cannot be verified, put it under `Needs manual review` or omit it.
+11. A confirmed finding must include provenance, best fix, refactor judgment, proof, and residual risk; use `N/A` or `unknown` only with a reason.
+12. If a candidate cannot be verified, put it under `Needs manual review` or omit it.
 
 ## Supporting Files
 
@@ -214,6 +215,14 @@ For GitHub PR targets, also write:
 - `.local-ultra-review/<session-id>/pr-context.json`
 - `.local-ultra-review/<session-id>/github-pr-comment.md`
 - `.local-ultra-review/<session-id>/github-pr-review-payload.json` when `post_mode` is `review`
+
+Each confirmed Important or Nit finding in the report and GitHub output must include:
+
+- provenance: introduced by, made visible by, carried forward by, or `N/A` / `unknown` with reason
+- best fix: the ownership-boundary fix after reading adjacent code
+- refactor: whether a larger refactor improves the bug class or widens risk
+- proof: tests, live repro, CI, source, dependency docs, or static/base-vs-head proof
+- risk: remaining uncertainty, rollout concern, compatibility issue, or test gap
 
 Render the GitHub summary with:
 
