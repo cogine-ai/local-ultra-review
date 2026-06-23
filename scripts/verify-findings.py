@@ -6,6 +6,7 @@ from pathlib import Path
 
 CONFIRMED_STATUSES = {"confirmed"}
 TERMINAL_STATUSES = {"confirmed", "false_positive", "pre_existing", "needs_manual_review"}
+REVIEW_DECISION_FIELDS = ["provenance", "best_fix", "refactor", "proof", "risk"]
 
 
 def load_jsonl(path):
@@ -69,6 +70,24 @@ def verifier_payload(candidate, status, notes):
     return {"summary": summary, "method": method, "notes": notes}
 
 
+def clean_string(value):
+    return str(value or "").strip()
+
+
+def carried_decision_fields(candidate):
+    verification = candidate.get("verification") if isinstance(candidate.get("verification"), dict) else {}
+    best_fix = clean_string(candidate.get("best_fix") or candidate.get("suggested_fix_direction"))
+    proof = clean_string(candidate.get("proof") or verification.get("summary") or candidate.get("verification_plan"))
+    return {
+        "provenance": clean_string(candidate.get("provenance")),
+        "best_fix": best_fix,
+        "refactor": clean_string(candidate.get("refactor")),
+        "proof": proof,
+        "risk": clean_string(candidate.get("risk")),
+        "suggested_fix_direction": clean_string(candidate.get("suggested_fix_direction") or best_fix),
+    }
+
+
 def verify_candidate(candidate, repo, changed_paths, static_confirm):
     cid = candidate.get("id") or candidate.get("candidate_id") or "unknown"
     base = {
@@ -81,7 +100,7 @@ def verify_candidate(candidate, repo, changed_paths, static_confirm):
         "introduced_by_diff": bool(candidate.get("introduced_by_diff")),
         "failure_scenario": candidate.get("failure_scenario", ""),
         "evidence": candidate.get("evidence", []),
-        "suggested_fix_direction": candidate.get("suggested_fix_direction", ""),
+        **carried_decision_fields(candidate),
     }
 
     notes = []
@@ -94,6 +113,9 @@ def verify_candidate(candidate, repo, changed_paths, static_confirm):
     missing = [key for key in required if candidate.get(key) in ("", None, [])]
     if missing:
         notes.append("missing required fields: " + ", ".join(missing))
+    missing_decision_fields = [key for key in REVIEW_DECISION_FIELDS if base.get(key) in ("", None, [])]
+    if missing_decision_fields:
+        notes.append("missing review decision fields: " + ", ".join(missing_decision_fields))
 
     path = candidate.get("file", "")
     line = candidate.get("line", 0)
@@ -109,8 +131,17 @@ def verify_candidate(candidate, repo, changed_paths, static_confirm):
 
     explicit = candidate_status(candidate)
     if explicit == "confirmed":
-        base["status"] = "confirmed"
-        base["verification"] = verifier_payload(candidate, explicit, notes)
+        if missing_decision_fields:
+            base["status"] = "needs_manual_review"
+            base["severity"] = "NeedsManualReview"
+            base["verification"] = {
+                "summary": "Candidate was explicitly confirmed but lacks required review decision fields.",
+                "method": "manual",
+                "notes": notes,
+            }
+        else:
+            base["status"] = "confirmed"
+            base["verification"] = verifier_payload(candidate, explicit, notes)
         return base
     if explicit in {"false_positive", "pre_existing", "needs_manual_review"}:
         base["status"] = explicit
@@ -133,6 +164,11 @@ def verify_candidate(candidate, repo, changed_paths, static_confirm):
     if missing:
         base["status"] = "needs_manual_review"
         base["verification"] = {"summary": "Candidate is missing required proof fields.", "method": "static", "notes": notes}
+        return base
+
+    if missing_decision_fields:
+        base["status"] = "needs_manual_review"
+        base["verification"] = {"summary": "Candidate is missing provenance, best fix, refactor, proof, or risk.", "method": "static", "notes": notes}
         return base
 
     if static_confirm:

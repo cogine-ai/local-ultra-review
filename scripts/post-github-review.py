@@ -115,21 +115,29 @@ def verification_summary(row):
     return clean_text(verification.get("summary") or row.get("failure_scenario"))
 
 
+def field_summary(row, key, fallback="Not recorded."):
+    return clean_text(row.get(key), fallback)
+
+
 def format_inline_comment(row):
     severity = row.get("severity", "Finding")
     title = clean_text(row.get("title"), "Untitled finding")
     scenario = clean_text(row.get("failure_scenario"))
     verification = verification_summary(row)
-    suggestion = clean_text(row.get("suggested_fix_direction"), "")
+    best_fix = clean_text(row.get("best_fix") or row.get("suggested_fix_direction"), "")
+    proof = clean_text(row.get("proof") or verification)
+    risk = field_summary(row, "risk")
     lines = [
         f"**{severity}: {title}**",
         "",
         f"**Issue:** {scenario}",
         "",
-        f"**Verification:** {verification}",
+        f"**Best fix:** {best_fix or 'Not recorded.'}",
+        "",
+        f"**Proof:** {proof}",
+        "",
+        f"**Risk:** {risk}",
     ]
-    if suggestion:
-        lines.extend(["", f"**Suggested fix:** {suggestion}"])
     if row.get("candidate_id"):
         lines.extend(["", f"<!-- local-ultra-review finding={row.get('candidate_id')} -->"])
     return "\n".join(lines)

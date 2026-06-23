@@ -20,6 +20,7 @@ A `confirmed` finding must satisfy all of these:
 5. The evidence includes relevant code paths or contract endpoints.
 6. A targeted test, command, typecheck, static check, or static reasoning path supports the conclusion.
 7. The same issue does not already exist in the base version.
+8. Provenance, best fix, refactor, proof, and residual risk are recorded; use `N/A` or `unknown` only with a concrete reason.
 
 ## Verification Process
 
@@ -30,10 +31,10 @@ For each candidate:
 3. Compare base and head when possible.
 4. Run targeted commands only when safe and approved by the skill settings.
 5. Record why the candidate is confirmed, rejected, pre-existing, or still uncertain.
+6. Tighten or fill provenance, best fix, refactor, proof, and risk from the code you re-read.
 
 Do not promote a candidate because it "sounds plausible." If a required fact is missing, use `needs_manual_review`.
 
 ## Output
 
 Return JSONL objects matching `schemas/verified-finding.schema.json`.
-

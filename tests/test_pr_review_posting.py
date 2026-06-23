@@ -106,6 +106,11 @@ class ReviewPayloadTests(unittest.TestCase):
                     "failure_scenario": "A user can request another tenant's report.",
                     "verification": {"summary": "The changed query no longer filters by tenant_id."},
                     "suggested_fix_direction": "Restore the tenant_id predicate.",
+                    "provenance": "introduced by this PR's query rewrite",
+                    "best_fix": "Restore the tenant_id predicate at the report ownership boundary.",
+                    "refactor": "No larger refactor needed; the invariant belongs in the query helper.",
+                    "proof": "Static comparison shows the tenant_id predicate was removed.",
+                    "risk": "Existing tenants can read cross-tenant reports until the predicate is restored.",
                 }
             ],
             "nits": [
@@ -117,6 +122,11 @@ class ReviewPayloadTests(unittest.TestCase):
                     "line": 99,
                     "failure_scenario": "A failed export can still appear successful.",
                     "verification": {"summary": "The line is outside the PR diff."},
+                    "provenance": "unknown; line is outside the current PR diff",
+                    "best_fix": "Return the failed export status from the error path.",
+                    "refactor": "N/A; the bug is local to status mapping.",
+                    "proof": "Static review shows the cited line is outside the PR diff.",
+                    "risk": "Needs a follow-up check because the line cannot be commented inline.",
                 }
             ],
             "pre_existing": [],
@@ -138,6 +148,8 @@ class ReviewPayloadTests(unittest.TestCase):
         self.assertEqual(payload["comments"][0]["line"], 42)
         self.assertEqual(payload["comments"][0]["side"], "RIGHT")
         self.assertIn("Missing tenant filter exposes reports", payload["comments"][0]["body"])
+        self.assertIn("Best fix", payload["comments"][0]["body"])
+        self.assertIn("Risk", payload["comments"][0]["body"])
         self.assertEqual(skipped[0]["line"], 99)
         self.assertIn("1 inline comment", payload["body"])
         self.assertIn("Could not place inline", payload["body"])
@@ -166,6 +178,11 @@ class ReviewPayloadTests(unittest.TestCase):
                                 "line": 7,
                                 "failure_scenario": "The new path crashes.",
                                 "verification": {"summary": "Confirmed by static check."},
+                                "provenance": "introduced by this PR",
+                                "best_fix": "Guard the new path before calling boom().",
+                                "refactor": "N/A; local guard is sufficient.",
+                                "proof": "Static check confirms the new call is unguarded.",
+                                "risk": "Runtime crash remains until the guard is added.",
                             }
                         ],
                         "nits": [],
