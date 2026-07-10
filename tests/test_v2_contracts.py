@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import hashlib
 import importlib.resources
 import os
 from pathlib import Path
@@ -83,6 +82,8 @@ def qualification_payload() -> dict:
         "schema_version": SCHEMA_VERSION,
         "record_kind": "diagnostic_evidence",
         "profile": "codex_native_guarded",
+        "worker_boundary": "guarded_unconfined",
+        "hard_worker_confinement": "not_provided",
         "cli_version": "0.144.0-alpha.4",
         "cli_binary_sha256": HEX_A,
         "launch_policy_sha256": HEX_B,
@@ -169,10 +170,15 @@ class CanonicalJsonTests(unittest.TestCase):
         left = {"z": [3, 2, 1], "accent": "café", "nested": {"b": 2, "a": 1}}
         right = {"nested": {"a": 1, "b": 2}, "accent": "café", "z": [3, 2, 1]}
 
-        expected = '{"accent":"café","nested":{"a":1,"b":2},"z":[3,2,1]}'.encode()
+        expected = '{"accent":"café","nested":{"a":1,"b":2},"z":[3,2,1]}\n'.encode()
         self.assertEqual(canonical_json_bytes(left), expected)
         self.assertEqual(canonical_json_bytes(left), canonical_json_bytes(right))
-        self.assertEqual(sha256_json(left), hashlib.sha256(expected).hexdigest())
+        self.assertTrue(canonical_json_bytes(left).endswith(b"}\n"))
+        self.assertFalse(canonical_json_bytes(left).endswith(b"\n\n"))
+        self.assertEqual(
+            sha256_json(left),
+            "886dcb58bd5e38016b9bee35612a1c31e8259c6c9c4261e15dac66150269874b",
+        )
 
     def test_non_json_values_raise_contract_error(self) -> None:
         with self.assertRaises(ContractError):
@@ -280,6 +286,35 @@ class QualificationContractTests(unittest.TestCase):
         no_oracle_blocker["live_dispatch_blockers"] = ["some_other_blocker"]
         with self.assertRaises(ContractError):
             validate_payload("qualification-record", no_oracle_blocker)
+
+    def test_diagnostic_record_requires_exact_worker_boundary(self) -> None:
+        schema = load_schema("qualification-record")
+        self.assertEqual(
+            schema["properties"]["worker_boundary"],
+            {"const": "guarded_unconfined"},
+        )
+        self.assertEqual(
+            schema["properties"]["hard_worker_confinement"],
+            {"const": "not_provided"},
+        )
+        self.assertIn("worker_boundary", schema["required"])
+        self.assertIn("hard_worker_confinement", schema["required"])
+
+        for field in ("worker_boundary", "hard_worker_confinement"):
+            missing = qualification_payload()
+            del missing[field]
+            with self.subTest(field=field, case="missing"), self.assertRaises(ContractError):
+                validate_payload("qualification-record", missing)
+
+        invalid_boundary = qualification_payload()
+        invalid_boundary["worker_boundary"] = "unconfined"
+        with self.assertRaises(ContractError):
+            validate_payload("qualification-record", invalid_boundary)
+
+        invalid_confinement = qualification_payload()
+        invalid_confinement["hard_worker_confinement"] = "provided"
+        with self.assertRaises(ContractError):
+            validate_payload("qualification-record", invalid_confinement)
 
     def test_exposures_must_be_sorted_unique_nonempty_strings(self) -> None:
         unsorted_payload = qualification_payload()

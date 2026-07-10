@@ -57,7 +57,7 @@ def canonical_json_bytes(value: object) -> bytes:
         )
     except (TypeError, ValueError) as error:
         raise ContractError(f"value is not valid canonical JSON: {error}") from error
-    return serialized.encode("utf-8")
+    return f"{serialized}\n".encode("utf-8")
 
 
 def sha256_json(value: object) -> str:

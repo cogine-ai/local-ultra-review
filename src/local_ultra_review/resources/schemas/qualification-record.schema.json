@@ -7,6 +7,8 @@
     "schema_version",
     "record_kind",
     "profile",
+    "worker_boundary",
+    "hard_worker_confinement",
     "cli_version",
     "cli_binary_sha256",
     "launch_policy_sha256",
@@ -36,6 +38,12 @@
     },
     "profile": {
       "const": "codex_native_guarded"
+    },
+    "worker_boundary": {
+      "const": "guarded_unconfined"
+    },
+    "hard_worker_confinement": {
+      "const": "not_provided"
     },
     "cli_version": {
       "type": "string",
