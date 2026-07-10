@@ -1,0 +1,233 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:local-ultra-review:v2:evaluation-completion",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "authority",
+    "authoritative_review",
+    "execution_backend",
+    "profile",
+    "release_ready",
+    "session_id",
+    "plan_integrity_hash",
+    "review_identity_hash",
+    "protocol_completeness",
+    "simulated_review_verdict",
+    "coverage",
+    "accounting",
+    "reviewer_artifact_hash",
+    "verifier_artifact_hashes",
+    "canonical_finding_hashes",
+    "manual_item_hashes",
+    "accepted_artifact_hashes",
+    "assurance_contract_under_test"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "2.0-evaluation-slice"
+    },
+    "authority": {
+      "const": "synthetic_evaluation"
+    },
+    "authoritative_review": {
+      "const": false
+    },
+    "execution_backend": {
+      "const": "fake_evaluation"
+    },
+    "profile": {
+      "const": "evaluation_slice_v2"
+    },
+    "release_ready": {
+      "const": false
+    },
+    "session_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "plan_integrity_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "review_identity_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "protocol_completeness": {
+      "const": "complete"
+    },
+    "simulated_review_verdict": {
+      "enum": ["clean", "findings", "manual_review_required"]
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["total_atoms", "reviewed_atoms", "manual_atoms"],
+      "properties": {
+        "total_atoms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "reviewed_atoms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "manual_atoms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "accounting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "raw_candidates",
+        "verifier_results",
+        "confirmed_findings",
+        "false_positive",
+        "pre_existing",
+        "needs_manual_review",
+        "adapter_manual_items"
+      ],
+      "properties": {
+        "raw_candidates": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "verifier_results": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "confirmed_findings": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "false_positive": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pre_existing": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "needs_manual_review": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "adapter_manual_items": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "reviewer_artifact_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "verifier_artifact_hashes": {
+      "$ref": "#/$defs/hashArray"
+    },
+    "canonical_finding_hashes": {
+      "$ref": "#/$defs/hashArray"
+    },
+    "manual_item_hashes": {
+      "$ref": "#/$defs/hashArray"
+    },
+    "accepted_artifact_hashes": {
+      "$ref": "#/$defs/hashArray"
+    },
+    "assurance_contract_under_test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "worker_profile",
+        "worker_boundary",
+        "hard_worker_confinement",
+        "input_discipline",
+        "packet_only_read",
+        "residual_tool_surface",
+        "residual_tool_inventory",
+        "accepted_tool_calls",
+        "telemetry_scope",
+        "worker_child_environment",
+        "filesystem_write_mitigation",
+        "nested_web_search",
+        "broader_network_denial",
+        "connector_github_denial",
+        "ambient_secret_non_access",
+        "context_lineage",
+        "backend_stateless_attestation",
+        "target_execution"
+      ],
+      "properties": {
+        "worker_profile": {
+          "const": "codex_native_guarded"
+        },
+        "worker_boundary": {
+          "const": "guarded_unconfined"
+        },
+        "hard_worker_confinement": {
+          "const": "not_provided"
+        },
+        "input_discipline": {
+          "const": "adapter_packet_minimized"
+        },
+        "packet_only_read": {
+          "const": "not_guaranteed"
+        },
+        "residual_tool_surface": {
+          "const": "unknown"
+        },
+        "residual_tool_inventory": {
+          "const": "unavailable"
+        },
+        "accepted_tool_calls": {
+          "const": "none_observed"
+        },
+        "telemetry_scope": {
+          "const": "observed_events_only"
+        },
+        "worker_child_environment": {
+          "enum": ["not_verified", "allowlist_preflight_passed"]
+        },
+        "filesystem_write_mitigation": {
+          "const": "read_only_preflight_passed"
+        },
+        "nested_web_search": {
+          "const": "disabled_and_observed_absent"
+        },
+        "broader_network_denial": {
+          "const": "not_guaranteed"
+        },
+        "connector_github_denial": {
+          "const": "not_guaranteed"
+        },
+        "ambient_secret_non_access": {
+          "const": "not_guaranteed"
+        },
+        "context_lineage": {
+          "const": "fresh_process_inferred"
+        },
+        "backend_stateless_attestation": {
+          "const": "unavailable"
+        },
+        "target_execution": {
+          "const": "not_requested"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "hashArray": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/sha256"
+      }
+    }
+  }
+}
