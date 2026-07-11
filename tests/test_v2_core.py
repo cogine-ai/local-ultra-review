@@ -1990,6 +1990,41 @@ class ArtifactStoreTests(unittest.TestCase):
         self.assertEqual(store.read_artifacts("target_packet"), [envelope])
         store.verify()
 
+    def test_sensitive_canonical_tamper_is_an_integrity_failure(self) -> None:
+        for surface in ("plan", "ledger", "artifact"):
+            with self.subTest(surface=surface):
+                temporary, store, session = self.make_store()
+                self.addCleanup(temporary.cleanup)
+                if surface == "plan":
+                    path = session / "plan.json"
+                    value = json.loads(path.read_bytes())
+                    value["secret"] = TOKEN
+                    path.write_bytes(canonical_json_bytes(value))
+                elif surface == "ledger":
+                    path = session / "ledger.jsonl"
+                    value = json.loads(path.read_bytes())
+                    value["payload"]["secret"] = TOKEN
+                    path.write_bytes(canonical_json_bytes(value))
+                else:
+                    envelope = store.write_artifact(
+                        "target_packet",
+                        strict_target_packet(),
+                        adapter_producer("adapter-target"),
+                    )
+                    path = (
+                        session
+                        / "artifacts"
+                        / "target_packet"
+                        / f'{envelope["envelope_hash"]}.json'
+                    )
+                    value = json.loads(path.read_bytes())
+                    value["secret"] = TOKEN
+                    path.write_bytes(canonical_json_bytes(value))
+
+                with self.assertRaises(IntegrityError) as raised:
+                    store.verify()
+                self.assertNotIn(TOKEN, str(raised.exception))
+
     def test_sink_rejection_writes_no_secret_or_secret_hash(self) -> None:
         temporary, store, session = self.make_store()
         self.addCleanup(temporary.cleanup)

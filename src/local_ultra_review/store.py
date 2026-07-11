@@ -34,7 +34,7 @@ from .completion_projection import (
     validate_role_task_record,
     validate_target_packet,
 )
-from .redaction import assert_safe_sink
+from .redaction import SensitiveMaterialError, assert_safe_sink
 
 
 class IntegrityError(RuntimeError):
@@ -706,6 +706,14 @@ class ArtifactStore:
         return files
 
     def verify(self) -> None:
+        """Verify canonical state and normalize unsafe persisted bytes as integrity loss."""
+
+        try:
+            self._verify_canonical_state()
+        except SensitiveMaterialError as error:
+            raise IntegrityError("canonical session contains unsafe material") from error
+
+    def _verify_canonical_state(self) -> None:
         if self.session_root.is_symlink() or not self.session_root.is_dir():
             raise IntegrityError("session root is missing")
         try:
