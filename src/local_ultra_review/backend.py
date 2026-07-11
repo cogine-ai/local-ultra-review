@@ -14,7 +14,6 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 from typing import Literal, Protocol
 
 from .contracts import (
@@ -37,81 +36,16 @@ _ALLOWED_PLACEHOLDERS = {
     b"{{PACKET_HASH}}",
     b"{{CANDIDATE_HASH}}",
 }
-_EVENT_MARKER_KEYS = {
-    "type",
-    "name",
-    "tool",
-    "tool_name",
-    "function",
-    "function_name",
-    "method",
+_USAGE_FIELDS = {
+    "cached_input_tokens",
+    "input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
 }
-_HARMLESS_EVENT_TYPES = {
-    "agent_message",
-    "item_completed",
-    "item_started",
-    "message",
-    "reasoning",
-    "thread_started",
-    "turn_completed",
-    "turn_started",
-    "usage",
-}
-_HARMLESS_ITEM_TYPES = {"agent_message", "reasoning"}
-_FORBIDDEN_EVENT_WORDS = {
-    "app",
-    "browser",
-    "call",
-    "collaboration",
-    "command",
-    "computer",
-    "exec",
-    "file",
-    "function",
-    "image",
-    "mcp",
-    "patch",
-    "plugin",
-    "remote",
-    "search",
-    "shell",
-    "tool",
-    "web",
-}
-_STRUCTURAL_TOOL_KEYS = {
-    "apply_patch",
-    "command",
-    "function",
-    "mcp",
-    "tool",
-    "tool_name",
-}
-_EXACT_TOOL_MARKERS = {
-    "apply_patch",
-    "browser_use",
-    "code_mode_host",
-    "collaboration",
-    "computer_use",
-    "exec_command",
-    "file_change",
-    "file_changed",
-    "file_edit",
-    "file_update",
-    "file_write",
-    "function_call",
-    "image_generation",
-    "mcp_call",
-    "remote_plugin",
-    "search_query",
-    "shell_tool",
-    "tool_call",
-    "unified_exec",
-    "view_image",
-    "web_search",
-    "web_search_call",
-    "web_search_query",
-    "write_file",
-}
+_ITEM_EVENT_TYPES = {"item.started", "item.completed"}
+_ITEM_CONTENT_TYPES = {"agent_message", "reasoning"}
+_DIRECT_TEXT_EVENT_TYPES = {"agent_message", "message", "reasoning"}
 _TASK_IDENTITY_SHAPE = re.compile(
     r"(?<![A-Za-z0-9_])(?:reviewer|verifier)-[A-Za-z0-9._:/-]+"
 )
@@ -270,84 +204,62 @@ class WorkerBackend(Protocol):
     def run(self, task: WorkerTask, attempt_dir: Path) -> WorkerAttempt: ...
 
 
-def _normalized_marker(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
-
-
-def _marker_is_tool_call(marker: str) -> bool:
-    if marker in _EXACT_TOOL_MARKERS:
-        return True
-    if _FORBIDDEN_EVENT_WORDS.intersection(marker.split("_")):
-        return True
+def _numeric_usage(value: object) -> bool:
     return (
-        marker.startswith(
-            (
-                "collaboration_",
-                "command_",
-                "file_change",
-                "file_write",
-                "function_",
-                "mcp_",
-                "search_query",
-                "tool_",
-                "web_search",
-                "write_file",
-            )
+        isinstance(value, Mapping)
+        and bool(value)
+        and set(value).issubset(_USAGE_FIELDS)
+        and all(
+            isinstance(count, int) and not isinstance(count, bool) and count >= 0
+            for count in value.values()
         )
-        or marker.endswith(("_command", "_function_call", "_mcp_call", "_tool_call"))
-        or "apply_patch" in marker
     )
 
 
-def _value_contains_event_marker(event: object) -> bool:
-    if isinstance(event, Mapping):
-        for key, value in event.items():
-            normalized_key = _normalized_marker(str(key))
-            if normalized_key in _STRUCTURAL_TOOL_KEYS or (
-                _marker_is_tool_call(normalized_key)
-                and normalized_key not in _EVENT_MARKER_KEYS
-            ):
-                return True
-            if (
-                normalized_key in _EVENT_MARKER_KEYS
-                and isinstance(value, str)
-                and _marker_is_tool_call(_normalized_marker(value))
-            ):
-                return True
-            if (
-                normalized_key == "type"
-                and isinstance(value, str)
-                and _normalized_marker(value)
-                not in (_HARMLESS_EVENT_TYPES | _HARMLESS_ITEM_TYPES)
-            ):
-                return True
-            if _value_contains_event_marker(value):
-                return True
-    elif isinstance(event, Sequence) and not isinstance(event, (str, bytes, bytearray)):
-        return any(_value_contains_event_marker(item) for item in event)
+def _event_matches_harmless_contract(event: object) -> bool:
+    if not isinstance(event, Mapping):
+        return False
+    event_type = event.get("type")
+    if not isinstance(event_type, str):
+        return False
+    keys = set(event)
+    if event_type == "thread.started":
+        return (
+            keys == {"type", "thread_id"}
+            and isinstance(event.get("thread_id"), str)
+            and bool(event["thread_id"].strip())
+        )
+    if event_type == "turn.started":
+        return keys == {"type"}
+    if event_type == "turn.completed":
+        if keys == {"type"}:
+            return True
+        return keys == {"type", "usage"} and _numeric_usage(event.get("usage"))
+    if event_type in _ITEM_EVENT_TYPES:
+        if keys != {"type", "item"}:
+            return False
+        item = event.get("item")
+        if not isinstance(item, Mapping) or set(item) not in (
+            {"type"},
+            {"type", "text"},
+        ):
+            return False
+        if item.get("type") not in _ITEM_CONTENT_TYPES:
+            return False
+        return "text" not in item or isinstance(item.get("text"), str)
+    if event_type in _DIRECT_TEXT_EVENT_TYPES:
+        if keys not in ({"type"}, {"type", "text"}):
+            return False
+        return "text" not in event or isinstance(event.get("text"), str)
+    if event_type == "usage":
+        return "type" in keys and _numeric_usage(
+            {key: value for key, value in event.items() if key != "type"}
+        )
     return False
 
 
 def _event_observes_tool_call(event: object) -> bool:
-    if not isinstance(event, Mapping):
-        return True
-    event_type = event.get("type")
-    if not isinstance(event_type, str):
-        return True
-    normalized_type = _normalized_marker(event_type)
-    if normalized_type not in _HARMLESS_EVENT_TYPES:
-        return True
-    if normalized_type in {"item_started", "item_completed"}:
-        item = event.get("item")
-        if not isinstance(item, Mapping):
-            return True
-        item_type = item.get("type")
-        if (
-            not isinstance(item_type, str)
-            or _normalized_marker(item_type) not in _HARMLESS_ITEM_TYPES
-        ):
-            return True
-    return _value_contains_event_marker(event)
+    return not _event_matches_harmless_contract(event)
 
 
 def _thread_id_occurrences(value: object) -> list[object]:
@@ -495,7 +407,12 @@ def _reject_generic_identity_shapes(value: object) -> None:
 
 
 def _reject_task_identity_feedback(
-    payload: Mapping[str, object], raw_events: object, task: WorkerTask
+    payload: Mapping[str, object],
+    raw_events: object,
+    task: WorkerTask,
+    *,
+    scenario_id: str,
+    process_launch_id: str,
 ) -> None:
     dedicated_fields = {"task_id", "packet_hash"}
     identities = [task.task_id, task.packet_hash]
@@ -507,7 +424,12 @@ def _reject_task_identity_feedback(
     non_identity_payload = {
         key: child for key, child in payload.items() if key not in dedicated_fields
     }
-    for value in (non_identity_payload, raw_events):
+    for value in (
+        scenario_id,
+        process_launch_id,
+        non_identity_payload,
+        raw_events,
+    ):
         for text in _walk_identity_strings(value):
             if any(identity in text for identity in identities):
                 raise WorkerProtocolError(
@@ -549,6 +471,7 @@ def _validate_scripted_attempt_before_hash(attempt: object) -> ScriptedAttempt:
         {key: child for key, child in payload.items() if key not in dedicated_fields}
     )
     _reject_generic_identity_shapes(attempt.raw_events)
+    _reject_generic_identity_shapes(attempt.process_launch_id)
     return attempt
 
 
@@ -582,15 +505,27 @@ def _accept_scripted_attempt(
     task: WorkerTask,
     attempt: ScriptedAttempt,
     *,
+    scenario_id: str,
     seen_thread_ids: set[str],
     seen_process_launch_ids: set[str],
 ) -> WorkerAttempt:
+    try:
+        assert_safe_sink(scenario_id)
+    except SensitiveMaterialError as error:
+        raise WorkerProtocolError("fake scenario contains unsafe sensitive material") from error
+    _reject_generic_identity_shapes(scenario_id)
     _validate_scripted_attempt_before_hash(attempt)
     _validate_task(task)
     unbound_payload = _json_without_duplicate_keys(attempt.last_message_template)
     if not isinstance(unbound_payload, dict):
         raise WorkerProtocolError("scripted last-message template must be one JSON object")
-    _reject_task_identity_feedback(unbound_payload, attempt.raw_events, task)
+    _reject_task_identity_feedback(
+        unbound_payload,
+        attempt.raw_events,
+        task,
+        scenario_id=scenario_id,
+        process_launch_id=attempt.process_launch_id,
+    )
     if attempt.expected_role != task.role:
         raise WorkerProtocolError("scripted attempt role mismatch")
     if attempt.timed_out:
@@ -621,7 +556,13 @@ def _accept_scripted_attempt(
         payload = _json_without_duplicate_keys(bound)
         if not isinstance(payload, dict):
             raise WorkerProtocolError("worker result must be one JSON object")
-        _reject_task_identity_feedback(payload, attempt.raw_events, task)
+        _reject_task_identity_feedback(
+            payload,
+            attempt.raw_events,
+            task,
+            scenario_id=scenario_id,
+            process_launch_id=attempt.process_launch_id,
+        )
         reject_worker_authority_fields(payload)
         validate_payload(task.output_schema_name, payload)
         assert_safe_sink(payload)
@@ -713,6 +654,7 @@ class FakeBackend:
         templates = []
         try:
             assert_safe_sink(self._scenario_id)
+            _reject_generic_identity_shapes(self._scenario_id)
             for attempt in self._attempts:
                 _validate_scripted_attempt_before_hash(attempt)
                 templates.append(
@@ -758,6 +700,7 @@ class FakeBackend:
         return _accept_scripted_attempt(
             task,
             attempt,
+            scenario_id=self._scenario_id,
             seen_thread_ids=self._seen_thread_ids,
             seen_process_launch_ids=self._seen_process_launch_ids,
         )
@@ -948,7 +891,7 @@ def _stat_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
-def _snapshot_executable(path: Path) -> tuple[tuple[int, ...], str]:
+def _hash_nofollow_executable_object(path: Path) -> str:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         raise OSError("no-follow executable inspection is unavailable")
@@ -971,94 +914,11 @@ def _snapshot_executable(path: Path) -> tuple[tuple[int, ...], str]:
             if not chunk:
                 break
             digest.update(chunk)
+        if _stat_identity(os.fstat(descriptor)) != _stat_identity(descriptor_metadata):
+            raise OSError("CLI file object changed while hashing")
     finally:
         os.close(descriptor)
-    return _stat_identity(path_metadata), digest.hexdigest()
-
-
-def _open_executable_source(
-    path: Path,
-) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
-    nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
-        raise OSError("no-follow executable inspection is unavailable")
-    parent_metadata = os.lstat(path.parent)
-    if not stat.S_ISDIR(parent_metadata.st_mode):
-        raise OSError("CLI binary parent is not a regular directory")
-    path_metadata = os.lstat(path)
-    if not stat.S_ISREG(path_metadata.st_mode):
-        raise OSError("CLI binary is not a regular file")
-    if not path_metadata.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
-        raise OSError("CLI binary is not executable")
-    descriptor = os.open(
-        path,
-        os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
-    )
-    descriptor_metadata = os.fstat(descriptor)
-    if _stat_identity(descriptor_metadata) != _stat_identity(path_metadata):
-        os.close(descriptor)
-        raise OSError("CLI binary changed before snapshotting")
-    return (
-        descriptor,
-        _stat_identity(path_metadata),
-        _stat_identity(parent_metadata),
-    )
-
-
-def _copy_executable_snapshot(
-    source_descriptor: int, snapshot_path: Path
-) -> tuple[tuple[int, ...], str]:
-    nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
-        raise OSError("no-follow executable snapshotting is unavailable")
-    snapshot_descriptor = os.open(
-        snapshot_path,
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | nofollow
-        | getattr(os, "O_CLOEXEC", 0),
-        0o500,
-    )
-    source_digest = hashlib.sha256()
-    try:
-        os.fchmod(snapshot_descriptor, 0o500)
-        os.lseek(source_descriptor, 0, os.SEEK_SET)
-        while True:
-            chunk = os.read(source_descriptor, 1024 * 1024)
-            if not chunk:
-                break
-            source_digest.update(chunk)
-            view = memoryview(chunk)
-            offset = 0
-            while offset < len(view):
-                written = os.write(snapshot_descriptor, view[offset:])
-                if written <= 0:
-                    raise OSError("CLI snapshot copy made no progress")
-                offset += written
-        os.fsync(snapshot_descriptor)
-    finally:
-        os.close(snapshot_descriptor)
-    snapshot_identity, snapshot_hash = _snapshot_executable(snapshot_path)
-    if snapshot_hash != source_digest.hexdigest():
-        raise OSError("CLI private snapshot hash mismatch")
-    return snapshot_identity, snapshot_hash
-
-
-def _original_executable_path_unchanged(
-    path: Path,
-    expected_path_identity: tuple[int, ...],
-    expected_parent_identity: tuple[int, ...],
-) -> bool:
-    try:
-        current_path = os.lstat(path)
-        current_parent = os.lstat(path.parent)
-    except OSError:
-        return False
-    return (
-        _stat_identity(current_path) == expected_path_identity
-        and _stat_identity(current_parent) == expected_parent_identity
-    )
+    return digest.hexdigest()
 
 
 def _utc_timestamp(value: str) -> datetime:
@@ -1100,7 +960,6 @@ class CodexCliBackend:
         self._cli_diagnostic_state = "unavailable"
         self._inspect_cli()
         self._diagnostic_record_sha256: str | None = None
-        self._qualification_payload: dict | None = None
         self._qualification_state = "record_unavailable"
         self._load_qualification_record()
 
@@ -1126,79 +985,14 @@ class CodexCliBackend:
         }
 
     def _inspect_cli(self) -> None:
-        source_descriptor: int | None = None
         try:
-            (
-                source_descriptor,
-                source_identity,
-                source_parent_identity,
-            ) = _open_executable_source(self._codex_path)
-            with tempfile.TemporaryDirectory(prefix="local-ultra-review-codex-version-") as root:
-                scratch = Path(root).resolve()
-                os.chmod(scratch, 0o700)
-                scratch_metadata = os.lstat(scratch)
-                if (
-                    not stat.S_ISDIR(scratch_metadata.st_mode)
-                    or scratch_metadata.st_uid != os.geteuid()
-                    or scratch_metadata.st_mode & 0o077
-                ):
-                    raise OSError("CLI private snapshot directory is unsafe")
-                snapshot_path = scratch / "codex-snapshot"
-                snapshot_identity, snapshot_hash = _copy_executable_snapshot(
-                    source_descriptor, snapshot_path
-                )
-                os.close(source_descriptor)
-                source_descriptor = None
-                self._cli_binary_sha256 = snapshot_hash
-                tmpdir = scratch / "tmp"
-                tmpdir.mkdir(mode=0o700)
-                completed = _run_process(
-                    [str(snapshot_path), "--version"],
-                    environment=self._child_environment(tmpdir),
-                    cwd=scratch,
-                    timeout_seconds=10,
-                )
-                try:
-                    snapshot_unchanged = (
-                        _stat_identity(os.lstat(snapshot_path)) == snapshot_identity
-                    )
-                except OSError:
-                    snapshot_unchanged = False
-                source_path_unchanged = _original_executable_path_unchanged(
-                    self._codex_path,
-                    source_identity,
-                    source_parent_identity,
-                )
-            if completed.returncode != 0:
-                if not snapshot_unchanged:
-                    self._cli_diagnostic_state = "binary_replaced_during_version_probe"
-                    return
-                if not source_path_unchanged:
-                    self._cli_diagnostic_state = "binary_path_changed_during_version_probe"
-                    return
-                self._cli_diagnostic_state = "version_probe_nonzero"
-                return
-            raw_version = completed.stdout if completed.stdout.strip() else completed.stderr
-            version = raw_version.decode("utf-8").strip()
-            if not version or "\n" in version:
-                self._cli_diagnostic_state = "version_probe_invalid"
-                return
-            assert_safe_sink(version)
-            self._cli_version = version
-            if not snapshot_unchanged:
-                self._cli_diagnostic_state = "binary_replaced_during_version_probe"
-                return
-            if not source_path_unchanged:
-                self._cli_diagnostic_state = "binary_path_changed_during_version_probe"
-                return
-            self._cli_diagnostic_state = "validated"
-        except subprocess.TimeoutExpired:
-            self._cli_diagnostic_state = "version_probe_timeout"
-        except (OSError, UnicodeDecodeError, SensitiveMaterialError):
-            self._cli_diagnostic_state = "version_probe_failed"
-        finally:
-            if source_descriptor is not None:
-                os.close(source_descriptor)
+            self._cli_binary_sha256 = _hash_nofollow_executable_object(
+                self._codex_path
+            )
+            self._cli_version = None
+            self._cli_diagnostic_state = "object_bound_version_probe_unavailable"
+        except OSError:
+            self._cli_diagnostic_state = "binary_inspection_failed"
 
     def _load_qualification_record(self) -> None:
         try:
@@ -1209,7 +1003,6 @@ class CodexCliBackend:
             if not isinstance(payload, dict):
                 raise ContractError("qualification record must be an object")
             validate_payload("qualification-record", payload)
-            self._qualification_payload = payload
         except (OSError, ContractError, SensitiveMaterialError, WorkerProtocolError):
             self._qualification_state = "invalid_record"
             return
@@ -1225,17 +1018,16 @@ class CodexCliBackend:
             self._qualification_state = "expired_record"
             return
         expected = {
-            "cli_version": self._cli_version,
             "cli_binary_sha256": self._cli_binary_sha256,
             "launch_policy_sha256": LAUNCH_POLICY_SHA256,
             "worker_environment_policy_sha256": WORKER_ENVIRONMENT_POLICY_SHA256,
         }
-        if self._cli_diagnostic_state != "validated" or any(
-            payload.get(key) != value for key, value in expected.items()
-        ):
+        if any(payload.get(key) != value for key, value in expected.items()):
             self._qualification_state = "diagnostic_mismatch"
             return
-        self._qualification_state = "valid_diagnostic"
+        self._qualification_state = (
+            "not_evaluable_without_object_bound_version_probe"
+        )
 
     def _qualification_blockers(self) -> list[str]:
         blocker_by_state = {
@@ -1243,6 +1035,9 @@ class CodexCliBackend:
             "invalid_record": "qualification_record_invalid",
             "expired_record": "qualification_record_expired",
             "diagnostic_mismatch": "qualification_record_mismatch",
+            "not_evaluable_without_object_bound_version_probe": (
+                "object_bound_version_probe_unavailable"
+            ),
         }
         blocker = blocker_by_state.get(self._qualification_state)
         return [blocker] if blocker else []
@@ -1250,10 +1045,11 @@ class CodexCliBackend:
     def readiness(self) -> dict:
         blockers = [
             "canonical_inventory_oracle_unavailable",
+            "object_bound_version_probe_unavailable",
             *self._qualification_blockers(),
         ]
-        if self._cli_diagnostic_state != "validated":
-            blockers.append("cli_diagnostic_unavailable")
+        if self._cli_diagnostic_state == "binary_inspection_failed":
+            blockers.append("cli_binary_inspection_failed")
         blockers = sorted(set(blockers))
         environment_preflight = self._environment_preflight or {
             "status": "not_run",
@@ -1264,7 +1060,7 @@ class CodexCliBackend:
         }
         return {
             "ready": False,
-            "diagnostic_ready": self._cli_diagnostic_state == "validated",
+            "diagnostic_ready": False,
             "profile": "codex_native_guarded",
             "worker_boundary": "guarded_unconfined",
             "hard_worker_confinement": "not_provided",
@@ -1273,32 +1069,24 @@ class CodexCliBackend:
             "residual_tool_surface": "unknown",
             "residual_tool_inventory": "unavailable",
             "qualification_state": self._qualification_state,
+            "cli_version": None,
+            "version_probe_executed": False,
+            "object_bound_executable_binding": "unavailable",
+            "cli_binary_identity_scope": "unexecuted_nofollow_file_object",
             "environment_preflight": environment_preflight,
             "live_dispatch_authorized": False,
             "live_dispatch_blockers": blockers,
         }
 
     def semantic_identity(self) -> dict:
-        exposures: list[str] = []
-        inventory_source = "unavailable"
-        exposures_hash: str | None = None
-        if (
-            self._qualification_state == "valid_diagnostic"
-            and self._qualification_payload is not None
-        ):
-            observed = self._qualification_payload.get("known_observed_exposures")
-            if isinstance(observed, list) and all(isinstance(item, str) for item in observed):
-                exposures = list(observed)
-                inventory_source = "worker_observed_only"
-                exposures_hash = sha256_json(exposures)
         inventory = {
             "inventory_scope": "known_observed_partial",
-            "inventory_source": inventory_source,
+            "inventory_source": "unavailable",
             "residual_tool_surface": "unknown",
             "residual_tool_inventory": "unavailable",
             "canonical_inventory_oracle": "unavailable",
-            "known_observed_exposures": exposures,
-            "known_observed_exposures_sha256": exposures_hash,
+            "known_observed_exposures": [],
+            "known_observed_exposures_sha256": None,
         }
         return {
             "backend": "codex_cli_guarded",
@@ -1308,6 +1096,9 @@ class CodexCliBackend:
             "cli_version": self._cli_version,
             "cli_binary_sha256": self._cli_binary_sha256,
             "cli_diagnostic_state": self._cli_diagnostic_state,
+            "version_probe_executed": False,
+            "object_bound_executable_binding": "unavailable",
+            "cli_binary_identity_scope": "unexecuted_nofollow_file_object",
             "launch_policy_sha256": LAUNCH_POLICY_SHA256,
             "worker_environment_policy_sha256": WORKER_ENVIRONMENT_POLICY_SHA256,
             "diagnostic_record_sha256": self._diagnostic_record_sha256,
@@ -1492,11 +1283,6 @@ class CodexCliBackend:
     def run(self, task: WorkerTask, attempt_dir: Path) -> WorkerAttempt:
         del task, attempt_dir
         readiness = self.readiness()
-        qualification = (
-            self._qualification_payload
-            if self._qualification_state == "valid_diagnostic"
-            else {}
-        )
         preflight_state = readiness["environment_preflight"]["status"]
         diagnostic = {
             "status": "blocked",
@@ -1512,16 +1298,18 @@ class CodexCliBackend:
             "worker_child_environment": (
                 "allowlist_preflight_passed" if preflight_state == "passed" else "not_verified"
             ),
-            "filesystem_write_mitigation": qualification.get(
-                "filesystem_write_mitigation", "not_verified"
-            ),
-            "nested_web_search": qualification.get("nested_web_search", "not_verified"),
+            "filesystem_write_mitigation": "not_verified",
+            "nested_web_search": "not_verified",
             "broader_network_denial": "not_guaranteed",
             "connector_github_denial": "not_guaranteed",
             "ambient_secret_non_access": "not_guaranteed",
             "backend_stateless_attestation": "unavailable",
             "target_execution": "not_requested",
             "qualification_state": self._qualification_state,
+            "cli_version": None,
+            "version_probe_executed": False,
+            "object_bound_executable_binding": "unavailable",
+            "cli_binary_identity_scope": "unexecuted_nofollow_file_object",
             "launch_policy_sha256": LAUNCH_POLICY_SHA256,
             "worker_environment_policy_sha256": WORKER_ENVIRONMENT_POLICY_SHA256,
             "canonical_inventory_oracle": "unavailable",
