@@ -309,6 +309,80 @@ class GitTargetTests(unittest.TestCase):
         self.assertEqual(first.safe_diff_hash, second.safe_diff_hash)
         self.assertNotIn(str(repo.root), json.dumps(build_review_packet(first)))
 
+    def test_ambient_diff_config_and_later_attributes_do_not_change_target(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        repo.write_text("app.py", "VALUE = 1\n")
+        base = repo.commit("base")
+        repo.write_text("app.py", "VALUE = 2\n")
+        requested_head = repo.commit("requested")
+        expected = seal_two_dot_target(repo.root, base, requested_head)
+
+        run(["git", "config", "diff.noprefix", "true"], repo.root)
+        run(["git", "config", "diff.algorithm", "histogram"], repo.root)
+        repo.write_text(".gitattributes", "app.py -diff\n")
+        repo.write_text("app.py", "VALUE = 3\n")
+        repo.commit("later attributes")
+
+        actual = seal_two_dot_target(repo.root, base, requested_head)
+        self.assertEqual(actual.safe_diff_hash, expected.safe_diff_hash)
+        self.assertEqual(actual.coverage_atoms, expected.coverage_atoms)
+        self.assertEqual(actual.manual_dispositions, expected.manual_dispositions)
+        self.assertEqual(actual.target_identity_hash, expected.target_identity_hash)
+
+    def test_submodule_ignore_all_cannot_hide_dirty_submodule(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        submodule_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(submodule_temporary.cleanup)
+        submodule = GitRepo(Path(submodule_temporary.name))
+        submodule.write_text("module.txt", "module\n")
+        submodule.commit("module base")
+        repo.write_text("app.py", "VALUE = 1\n")
+        base = repo.commit("base")
+        run(
+            [
+                "git",
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                str(submodule.root),
+                "vendor/sub",
+            ],
+            repo.root,
+        )
+        repo.write_text("app.py", "VALUE = 2\n")
+        head = repo.commit("head")
+        run(["git", "config", "submodule.vendor/sub.ignore", "all"], repo.root)
+        (repo.root / "vendor/sub/module.txt").write_text("dirty\n", encoding="utf-8")
+
+        with self.assertRaisesRegex(TargetError, "clean"):
+            seal_two_dot_target(repo.root, base, head)
+
+    def test_explicit_credential_store_paths_are_withheld(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        repo.write_text("app.py", "VALUE = 1\n")
+        base = repo.commit("base")
+        repo.write_text(".git-credentials", "https://user:passphrase@example.com\n")
+        repo.write_text(".aws/credentials", "[default]\naws_secret_access_key = plain credential\n")
+        head = repo.commit("credentials")
+
+        target = seal_two_dot_target(repo.root, base, head)
+        packet = json.dumps(build_review_packet(target), sort_keys=True)
+        self.assertNotIn("passphrase", packet)
+        self.assertNotIn("plain credential", packet)
+        self.assertEqual(
+            {
+                item["path"]
+                for item in target.manual_dispositions
+                if item["reason"] == "sensitive_path"
+            },
+            {".aws/credentials", ".git-credentials"},
+        )
+
 
 class RedactionTests(unittest.TestCase):
     def test_safe_sink_rejects_provider_token_assignment_and_private_key(self) -> None:
@@ -323,6 +397,33 @@ class RedactionTests(unittest.TestCase):
                     assert_safe_sink(value)
 
         assert_safe_sink({"token_state": "redacted", "message": "safe"})
+
+    def test_sink_scans_mapping_keys_and_quoted_secrets_with_spaces(self) -> None:
+        for value in (
+            {TOKEN: "ordinary value"},
+            'password = "correct horse battery, staple"',
+            {'password': "correct horse battery, staple"},
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(SensitiveMaterialError):
+                    assert_safe_sink(value)
+
+    def test_quoted_secret_with_spaces_is_redacted_from_packet(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        repo = GitRepo(Path(temporary.name))
+        repo.write_text("app.py", "VALUE = 1\n")
+        base = repo.commit("base")
+        repo.write_text("app.py", 'password = "correct horse battery, staple"\n')
+        head = repo.commit("secret")
+
+        target = seal_two_dot_target(repo.root, base, head)
+        packet = json.dumps(build_review_packet(target), sort_keys=True)
+        self.assertNotIn("correct horse battery", packet)
+        self.assertIn("[REDACTED:secret_assignment:", target.redacted_diff_text)
+        self.assertTrue(
+            any(item["reason"] == "sensitive_content_redacted" for item in target.manual_dispositions)
+        )
 
 
 def plan_for(session_root: Path) -> dict:
@@ -366,6 +467,45 @@ class ArtifactStoreTests(unittest.TestCase):
         store.verify()
         with self.assertRaises(IntegrityError):
             ArtifactStore.create(session, plan_for(session))
+
+    def test_directory_publication_never_replaces_existing_destination(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        source = root / "staging"
+        destination = root / "session"
+        source.mkdir()
+        (source / "source-marker").write_text("source", encoding="utf-8")
+        destination.mkdir()
+        (destination / "destination-marker").write_text("destination", encoding="utf-8")
+
+        with self.assertRaises(FileExistsError):
+            store_module._rename_directory_exclusive(source, destination)
+
+        self.assertTrue((source / "source-marker").is_file())
+        self.assertTrue((destination / "destination-marker").is_file())
+
+    def test_short_writes_are_completed_and_zero_write_fails_before_publish(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        session = root / "session"
+        real_write = os.write
+
+        def short_write(descriptor: int, data: bytes | bytearray | memoryview) -> int:
+            raw = bytes(data)
+            return real_write(descriptor, raw[: max(1, len(raw) // 3)])
+
+        with mock.patch.object(store_module.os, "write", side_effect=short_write):
+            store = ArtifactStore.create(session, plan_for(session))
+            store.write_artifact("reviewer_result", {"status": "completed"}, producer())
+        store.verify()
+
+        failed_session = root / "failed-session"
+        with mock.patch.object(store_module.os, "write", return_value=0):
+            with self.assertRaises(IntegrityError):
+                ArtifactStore.create(failed_session, plan_for(failed_session))
+        self.assertFalse(failed_session.exists())
 
     def test_artifact_is_content_addressed_readable_and_verified(self) -> None:
         temporary, store, session = self.make_store()
@@ -466,6 +606,56 @@ class ArtifactStoreTests(unittest.TestCase):
                     moved_directory = session / "artifacts" / "worker_result"
                     moved_directory.mkdir()
                     artifact_path.rename(moved_directory / artifact_path.name)
+                try:
+                    with self.assertRaises(IntegrityError):
+                        store.verify()
+                finally:
+                    temporary.cleanup()
+
+    def test_rehashed_artifact_still_requires_strict_matching_producer_inputs(self) -> None:
+        temporary, store, session = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        envelope = store.write_artifact(
+            "reviewer_result", {"status": "completed"}, producer()
+        )
+        old_path = (
+            session
+            / "artifacts"
+            / "reviewer_result"
+            / f'{envelope["envelope_hash"]}.json'
+        )
+        mutated = copy.deepcopy(envelope)
+        mutated["input_hashes"] = ["d" * 64]
+        core = {key: value for key, value in mutated.items() if key != "envelope_hash"}
+        mutated["envelope_hash"] = sha256_json(core)
+        new_path = old_path.with_name(f'{mutated["envelope_hash"]}.json')
+        new_path.write_bytes(canonical_json_bytes(mutated))
+        old_path.unlink()
+
+        ledger_path = session / "ledger.jsonl"
+        records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+        records[-1]["payload"]["envelope_hash"] = mutated["envelope_hash"]
+        records[-1]["payload_hash"] = sha256_json(records[-1]["payload"])
+        event_core = {
+            key: value for key, value in records[-1].items() if key != "event_hash"
+        }
+        records[-1]["event_hash"] = sha256_json(event_core)
+        ledger_path.write_bytes(b"".join(canonical_json_bytes(item) for item in records))
+
+        with self.assertRaises(IntegrityError):
+            store.verify()
+
+    def test_unexpected_root_file_directory_or_symlink_fails_verification(self) -> None:
+        for kind in ("file", "directory", "symlink"):
+            with self.subTest(kind=kind):
+                temporary, store, session = self.make_store()
+                unexpected = session / "unexpected"
+                if kind == "file":
+                    unexpected.write_text("extra", encoding="utf-8")
+                elif kind == "directory":
+                    unexpected.mkdir()
+                else:
+                    unexpected.symlink_to(session / "plan.json")
                 try:
                     with self.assertRaises(IntegrityError):
                         store.verify()

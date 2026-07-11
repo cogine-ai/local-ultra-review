@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
@@ -32,14 +33,51 @@ _HUNK = re.compile(rb"^@@\s+(-[^ ]+)\s+(\+[^ ]+)\s+@@", re.MULTILINE)
 _REGULAR_MODES = {"000000", "100644", "100755"}
 
 
-def _git(root: Path, args: list[str]) -> bytes:
+def _git(root: Path, args: list[str], *, attr_source: str | None = None) -> bytes:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+            "LC_ALL": "C",
+        }
+    )
+    environment.pop("GIT_EXTERNAL_DIFF", None)
+    environment.pop("GIT_DIFF_OPTS", None)
+    if attr_source is None:
+        environment.pop("GIT_ATTR_SOURCE", None)
+    else:
+        environment["GIT_ATTR_SOURCE"] = attr_source
+    command = [
+        "git",
+        "--no-optional-locks",
+        "-c",
+        "color.ui=false",
+        "-c",
+        "core.quotePath=true",
+        "-c",
+        f"core.attributesFile={os.devnull}",
+        "-c",
+        "diff.noprefix=false",
+        "-c",
+        "diff.mnemonicPrefix=false",
+        "-c",
+        "diff.algorithm=myers",
+        "-c",
+        "diff.renames=false",
+        *args,
+    ]
     try:
         completed = subprocess.run(
-            ["git", *args],
+            command,
             cwd=root,
             check=False,
             capture_output=True,
             text=False,
+            env=environment,
         )
     except OSError as error:
         raise TargetError(f"cannot run git: {error}") from error
@@ -154,7 +192,15 @@ def seal_two_dot_target(repo: Path, base: str, head: str) -> SealedTarget:
         raise TargetError("repository root is unavailable") from error
     if not root.is_dir():
         raise TargetError("repository root is unavailable")
-    status = _git(root, ["status", "--porcelain=v1", "--untracked-files=all"])
+    status = _git(
+        root,
+        [
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ],
+    )
     if status:
         raise TargetError("target checkout must be clean, including untracked and submodule state")
 
@@ -167,11 +213,39 @@ def seal_two_dot_target(repo: Path, base: str, head: str) -> SealedTarget:
         raise TargetError("base and head resolve to the same commit")
 
     range_arg = f"{base_sha}..{head_sha}"
-    raw_records = _parse_raw(_git(root, ["diff", "--raw", "-z", "--no-renames", range_arg, "--"]))
+    raw_records = _parse_raw(
+        _git(
+            root,
+            [
+                "diff",
+                "--raw",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                range_arg,
+                "--",
+            ],
+            attr_source=head_sha,
+        )
+    )
     if not raw_records:
         raise TargetError("target diff is empty")
     binary_by_path = _parse_numstat(
-        _git(root, ["diff", "--numstat", "-z", "--no-renames", range_arg, "--"])
+        _git(
+            root,
+            [
+                "diff",
+                "--numstat",
+                "-z",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                range_arg,
+                "--",
+            ],
+            attr_source=head_sha,
+        )
     )
     if set(binary_by_path) != {record["path"] for record in raw_records}:
         raise TargetError("raw and numstat changed-path manifests disagree")
@@ -196,6 +270,7 @@ def seal_two_dot_target(repo: Path, base: str, head: str) -> SealedTarget:
                 "--",
                 f":(literal){path}",
             ],
+            attr_source=head_sha,
         )
         if not raw_path_diff:
             record["special_reason"] = "unparseable_diff"

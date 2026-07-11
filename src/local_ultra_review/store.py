@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import ctypes
 from datetime import datetime, timezone
+import errno
 import json
 import os
 from pathlib import Path
 import re
+import sys
 import uuid
 
 from .contracts import SCHEMA_VERSION, canonical_json_bytes, sha256_json
@@ -44,15 +47,62 @@ def _fsync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
+def _write_all(descriptor: int, data: bytes) -> None:
+    view = memoryview(data)
+    offset = 0
+    while offset < len(view):
+        try:
+            written = os.write(descriptor, view[offset:])
+        except OSError as error:
+            raise IntegrityError(f"write failed: {error}") from error
+        if written <= 0:
+            raise IntegrityError("write made no forward progress")
+        offset += written
+
+
 def _write_new(path: Path, data: bytes) -> None:
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        with os.fdopen(descriptor, "wb", closefd=False) as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _write_all(descriptor, data)
+        os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _rename_directory_exclusive(source: Path, destination: Path) -> None:
+    """Atomically publish a directory without replacing any destination."""
+
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    libc = ctypes.CDLL(None, use_errno=True)
+    result: int
+    if sys.platform == "darwin" and hasattr(libc, "renamex_np"):
+        renamex = libc.renamex_np
+        renamex.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+        renamex.restype = ctypes.c_int
+        result = renamex(source_bytes, destination_bytes, 0x00000004)
+    elif sys.platform.startswith("linux") and hasattr(libc, "renameat2"):
+        renameat2 = libc.renameat2
+        renameat2.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        renameat2.restype = ctypes.c_int
+        result = renameat2(-100, source_bytes, -100, destination_bytes, 0x00000001)
+    elif os.name == "nt":
+        os.rename(source, destination)
+        return
+    else:
+        raise IntegrityError("atomic no-replace directory publication is unavailable")
+    if result == 0:
+        return
+    error_number = ctypes.get_errno()
+    if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+        raise FileExistsError(error_number, os.strerror(error_number), str(destination))
+    raise OSError(error_number, os.strerror(error_number), str(destination))
 
 
 def _write_atomic(path: Path, data: bytes) -> None:
@@ -120,6 +170,32 @@ def _validate_plan(plan: dict, session_root: Path) -> str:
     return provided_hash
 
 
+def _validate_producer(producer: object) -> list[str]:
+    if not isinstance(producer, dict):
+        raise IntegrityError("producer must be an object")
+    assert_safe_sink(producer)
+    required = {
+        "task_id",
+        "attempt_id",
+        "thread_id",
+        "process_launch_id",
+        "input_hashes",
+    }
+    if set(producer) != required:
+        raise IntegrityError("producer fields do not match contract")
+    for key in required - {"input_hashes"}:
+        if not isinstance(producer[key], str) or not producer[key]:
+            raise IntegrityError(f"invalid producer {key}")
+    input_hashes = producer["input_hashes"]
+    if (
+        not isinstance(input_hashes, list)
+        or input_hashes != sorted(set(input_hashes))
+        or any(not isinstance(value, str) or not _HASH.fullmatch(value) for value in input_hashes)
+    ):
+        raise IntegrityError("producer input hashes must be sorted unique SHA-256 values")
+    return list(input_hashes)
+
+
 class ArtifactStore:
     """Single-writer session store with a verified hash-chain ledger."""
 
@@ -163,7 +239,7 @@ class ArtifactStore:
             _fsync_directory(staging)
             if os.path.lexists(final):
                 raise IntegrityError("session root already exists")
-            os.rename(staging, final)
+            _rename_directory_exclusive(staging, final)
             _fsync_directory(final.parent)
         except Exception:
             if staging.exists():
@@ -278,8 +354,23 @@ class ArtifactStore:
         return files
 
     def verify(self) -> None:
-        if not self.session_root.is_dir():
+        if self.session_root.is_symlink() or not self.session_root.is_dir():
             raise IntegrityError("session root is missing")
+        try:
+            root_entries = {entry.name: entry for entry in self.session_root.iterdir()}
+        except OSError as error:
+            raise IntegrityError(f"cannot enumerate session root: {error}") from error
+        if set(root_entries) != {"plan.json", "ledger.jsonl", "artifacts"}:
+            raise IntegrityError("session root inventory does not match contract")
+        if (
+            root_entries["plan.json"].is_symlink()
+            or not root_entries["plan.json"].is_file()
+            or root_entries["ledger.jsonl"].is_symlink()
+            or not root_entries["ledger.jsonl"].is_file()
+            or root_entries["artifacts"].is_symlink()
+            or not root_entries["artifacts"].is_dir()
+        ):
+            raise IntegrityError("session root entry type does not match contract")
         plan = self._plan
         _validate_plan(plan, self.session_root)
         _records, committed = self._verify_ledger(plan)
@@ -311,6 +402,9 @@ class ArtifactStore:
                 raise IntegrityError("artifact envelope hash mismatch")
             if envelope.get("payload_hash") != sha256_json(envelope.get("payload")):
                 raise IntegrityError("artifact payload hash mismatch")
+            input_hashes = _validate_producer(envelope.get("producer"))
+            if envelope.get("input_hashes") != input_hashes:
+                raise IntegrityError("artifact producer/input hashes disagree")
             if (
                 envelope.get("schema_version") != SCHEMA_VERSION
                 or envelope.get("session_id") != plan["session_id"]
@@ -344,10 +438,8 @@ class ArtifactStore:
         record = _event(len(records), previous, event_type, deepcopy(payload))
         descriptor = os.open(self.session_root / "ledger.jsonl", os.O_WRONLY | os.O_APPEND)
         try:
-            with os.fdopen(descriptor, "ab", closefd=False) as handle:
-                handle.write(canonical_json_bytes(record))
-                handle.flush()
-                os.fsync(handle.fileno())
+            _write_all(descriptor, canonical_json_bytes(record))
+            os.fsync(descriptor)
         finally:
             os.close(descriptor)
         _fsync_directory(self.session_root)
@@ -363,29 +455,10 @@ class ArtifactStore:
         self.verify()
         if not isinstance(artifact_type, str) or not _ARTIFACT_TYPE.fullmatch(artifact_type):
             raise IntegrityError("invalid artifact type")
-        if not isinstance(payload, dict) or not isinstance(producer, dict):
+        if not isinstance(payload, dict):
             raise IntegrityError("payload and producer must be objects")
         assert_safe_sink(payload)
-        assert_safe_sink(producer)
-        required_producer = {
-            "task_id",
-            "attempt_id",
-            "thread_id",
-            "process_launch_id",
-            "input_hashes",
-        }
-        if set(producer) != required_producer:
-            raise IntegrityError("producer fields do not match contract")
-        for key in required_producer - {"input_hashes"}:
-            if not isinstance(producer[key], str) or not producer[key]:
-                raise IntegrityError(f"invalid producer {key}")
-        input_hashes = producer["input_hashes"]
-        if (
-            not isinstance(input_hashes, list)
-            or input_hashes != sorted(set(input_hashes))
-            or any(not isinstance(value, str) or not _HASH.fullmatch(value) for value in input_hashes)
-        ):
-            raise IntegrityError("producer input hashes must be sorted unique SHA-256 values")
+        input_hashes = _validate_producer(producer)
         plan = self._plan
         core = {
             "artifact_type": artifact_type,
