@@ -46,6 +46,38 @@ _EVENT_MARKER_KEYS = {
     "function_name",
     "method",
 }
+_HARMLESS_EVENT_TYPES = {
+    "agent_message",
+    "item_completed",
+    "item_started",
+    "message",
+    "reasoning",
+    "thread_started",
+    "turn_completed",
+    "turn_started",
+    "usage",
+}
+_HARMLESS_ITEM_TYPES = {"agent_message", "reasoning"}
+_FORBIDDEN_EVENT_WORDS = {
+    "app",
+    "browser",
+    "call",
+    "collaboration",
+    "command",
+    "computer",
+    "exec",
+    "file",
+    "function",
+    "image",
+    "mcp",
+    "patch",
+    "plugin",
+    "remote",
+    "search",
+    "shell",
+    "tool",
+    "web",
+}
 _STRUCTURAL_TOOL_KEYS = {
     "apply_patch",
     "command",
@@ -80,6 +112,10 @@ _EXACT_TOOL_MARKERS = {
     "web_search_query",
     "write_file",
 }
+_TASK_IDENTITY_SHAPE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:reviewer|verifier)-[A-Za-z0-9._:/-]+"
+)
+_HASH_IDENTITY_SHAPE = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
 
 DISABLED_FEATURES = (
     "shell_tool",
@@ -241,6 +277,8 @@ def _normalized_marker(value: str) -> str:
 def _marker_is_tool_call(marker: str) -> bool:
     if marker in _EXACT_TOOL_MARKERS:
         return True
+    if _FORBIDDEN_EVENT_WORDS.intersection(marker.split("_")):
+        return True
     return (
         marker.startswith(
             (
@@ -261,7 +299,7 @@ def _marker_is_tool_call(marker: str) -> bool:
     )
 
 
-def _event_observes_tool_call(event: object) -> bool:
+def _value_contains_event_marker(event: object) -> bool:
     if isinstance(event, Mapping):
         for key, value in event.items():
             normalized_key = _normalized_marker(str(key))
@@ -276,11 +314,40 @@ def _event_observes_tool_call(event: object) -> bool:
                 and _marker_is_tool_call(_normalized_marker(value))
             ):
                 return True
-            if _event_observes_tool_call(value):
+            if (
+                normalized_key == "type"
+                and isinstance(value, str)
+                and _normalized_marker(value)
+                not in (_HARMLESS_EVENT_TYPES | _HARMLESS_ITEM_TYPES)
+            ):
+                return True
+            if _value_contains_event_marker(value):
                 return True
     elif isinstance(event, Sequence) and not isinstance(event, (str, bytes, bytearray)):
-        return any(_event_observes_tool_call(item) for item in event)
+        return any(_value_contains_event_marker(item) for item in event)
     return False
+
+
+def _event_observes_tool_call(event: object) -> bool:
+    if not isinstance(event, Mapping):
+        return True
+    event_type = event.get("type")
+    if not isinstance(event_type, str):
+        return True
+    normalized_type = _normalized_marker(event_type)
+    if normalized_type not in _HARMLESS_EVENT_TYPES:
+        return True
+    if normalized_type in {"item_started", "item_completed"}:
+        item = event.get("item")
+        if not isinstance(item, Mapping):
+            return True
+        item_type = item.get("type")
+        if (
+            not isinstance(item_type, str)
+            or _normalized_marker(item_type) not in _HARMLESS_ITEM_TYPES
+        ):
+            return True
+    return _value_contains_event_marker(event)
 
 
 def _thread_id_occurrences(value: object) -> list[object]:
@@ -335,8 +402,11 @@ def _validate_task(task: WorkerTask) -> None:
     if not isinstance(task.packet, dict):
         raise WorkerProtocolError("worker packet must be an object")
     try:
+        assert_safe_sink(task.task_id)
+        assert_safe_sink(task.packet_hash)
         assert_safe_sink(task.packet)
         assert_safe_sink(task.prompt_text)
+        assert_safe_sink(task.output_schema_name)
         computed_packet_hash = sha256_json(task.packet)
     except (ContractError, SensitiveMaterialError) as error:
         raise WorkerProtocolError("worker task is not safe canonical input") from error
@@ -374,7 +444,7 @@ def _bind_template(template: bytes, task: WorkerTask) -> bytes:
     return bound
 
 
-def _validate_unbound_template(template: bytes, role: str) -> None:
+def _validate_unbound_template(template: bytes, role: str) -> dict:
     placeholders = set(_PLACEHOLDER.findall(template))
     unknown = placeholders - _ALLOWED_PLACEHOLDERS
     if unknown:
@@ -398,6 +468,51 @@ def _validate_unbound_template(template: bytes, role: str) -> None:
             raise WorkerProtocolError(
                 f"scripted attempt {field} must use its unbound adapter placeholder"
             )
+    return payload
+
+
+def _walk_identity_strings(value: object):
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if isinstance(key, str):
+                yield key
+            yield from _walk_identity_strings(child)
+    elif isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        for child in value:
+            yield from _walk_identity_strings(child)
+    elif isinstance(value, str):
+        yield value
+
+
+def _reject_generic_identity_shapes(value: object) -> None:
+    for text in _walk_identity_strings(value):
+        if text in {"{{TASK_ID}}", "{{PACKET_HASH}}", "{{CANDIDATE_HASH}}"}:
+            continue
+        if _TASK_IDENTITY_SHAPE.search(text) or _HASH_IDENTITY_SHAPE.search(text):
+            raise WorkerProtocolError(
+                "scripted attempt embeds a task or packet identity outside its placeholder"
+            )
+
+
+def _reject_task_identity_feedback(
+    payload: Mapping[str, object], raw_events: object, task: WorkerTask
+) -> None:
+    dedicated_fields = {"task_id", "packet_hash"}
+    identities = [task.task_id, task.packet_hash]
+    if task.role == "verifier":
+        dedicated_fields.add("candidate_hash")
+        candidate_hash = task.packet.get("candidate_hash")
+        if isinstance(candidate_hash, str) and candidate_hash:
+            identities.append(candidate_hash)
+    non_identity_payload = {
+        key: child for key, child in payload.items() if key not in dedicated_fields
+    }
+    for value in (non_identity_payload, raw_events):
+        for text in _walk_identity_strings(value):
+            if any(identity in text for identity in identities):
+                raise WorkerProtocolError(
+                    "scripted attempt feeds the active task identity into non-identity evidence"
+                )
 
 
 def _validate_scripted_attempt_before_hash(attempt: object) -> ScriptedAttempt:
@@ -424,7 +539,16 @@ def _validate_scripted_attempt_before_hash(attempt: object) -> ScriptedAttempt:
         raise WorkerProtocolError("scripted attempt return code is invalid")
     if not isinstance(attempt.timed_out, bool):
         raise WorkerProtocolError("scripted attempt timeout evidence is invalid")
-    _validate_unbound_template(attempt.last_message_template, attempt.expected_role)
+    payload = _validate_unbound_template(
+        attempt.last_message_template, attempt.expected_role
+    )
+    dedicated_fields = {"task_id", "packet_hash"}
+    if attempt.expected_role == "verifier":
+        dedicated_fields.add("candidate_hash")
+    _reject_generic_identity_shapes(
+        {key: child for key, child in payload.items() if key not in dedicated_fields}
+    )
+    _reject_generic_identity_shapes(attempt.raw_events)
     return attempt
 
 
@@ -463,6 +587,10 @@ def _accept_scripted_attempt(
 ) -> WorkerAttempt:
     _validate_scripted_attempt_before_hash(attempt)
     _validate_task(task)
+    unbound_payload = _json_without_duplicate_keys(attempt.last_message_template)
+    if not isinstance(unbound_payload, dict):
+        raise WorkerProtocolError("scripted last-message template must be one JSON object")
+    _reject_task_identity_feedback(unbound_payload, attempt.raw_events, task)
     if attempt.expected_role != task.role:
         raise WorkerProtocolError("scripted attempt role mismatch")
     if attempt.timed_out:
@@ -493,6 +621,7 @@ def _accept_scripted_attempt(
         payload = _json_without_duplicate_keys(bound)
         if not isinstance(payload, dict):
             raise WorkerProtocolError("worker result must be one JSON object")
+        _reject_task_identity_feedback(payload, attempt.raw_events, task)
         reject_worker_authority_fields(payload)
         validate_payload(task.output_schema_name, payload)
         assert_safe_sink(payload)
@@ -847,6 +976,91 @@ def _snapshot_executable(path: Path) -> tuple[tuple[int, ...], str]:
     return _stat_identity(path_metadata), digest.hexdigest()
 
 
+def _open_executable_source(
+    path: Path,
+) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("no-follow executable inspection is unavailable")
+    parent_metadata = os.lstat(path.parent)
+    if not stat.S_ISDIR(parent_metadata.st_mode):
+        raise OSError("CLI binary parent is not a regular directory")
+    path_metadata = os.lstat(path)
+    if not stat.S_ISREG(path_metadata.st_mode):
+        raise OSError("CLI binary is not a regular file")
+    if not path_metadata.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+        raise OSError("CLI binary is not executable")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+    )
+    descriptor_metadata = os.fstat(descriptor)
+    if _stat_identity(descriptor_metadata) != _stat_identity(path_metadata):
+        os.close(descriptor)
+        raise OSError("CLI binary changed before snapshotting")
+    return (
+        descriptor,
+        _stat_identity(path_metadata),
+        _stat_identity(parent_metadata),
+    )
+
+
+def _copy_executable_snapshot(
+    source_descriptor: int, snapshot_path: Path
+) -> tuple[tuple[int, ...], str]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("no-follow executable snapshotting is unavailable")
+    snapshot_descriptor = os.open(
+        snapshot_path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | nofollow
+        | getattr(os, "O_CLOEXEC", 0),
+        0o500,
+    )
+    source_digest = hashlib.sha256()
+    try:
+        os.fchmod(snapshot_descriptor, 0o500)
+        os.lseek(source_descriptor, 0, os.SEEK_SET)
+        while True:
+            chunk = os.read(source_descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            source_digest.update(chunk)
+            view = memoryview(chunk)
+            offset = 0
+            while offset < len(view):
+                written = os.write(snapshot_descriptor, view[offset:])
+                if written <= 0:
+                    raise OSError("CLI snapshot copy made no progress")
+                offset += written
+        os.fsync(snapshot_descriptor)
+    finally:
+        os.close(snapshot_descriptor)
+    snapshot_identity, snapshot_hash = _snapshot_executable(snapshot_path)
+    if snapshot_hash != source_digest.hexdigest():
+        raise OSError("CLI private snapshot hash mismatch")
+    return snapshot_identity, snapshot_hash
+
+
+def _original_executable_path_unchanged(
+    path: Path,
+    expected_path_identity: tuple[int, ...],
+    expected_parent_identity: tuple[int, ...],
+) -> bool:
+    try:
+        current_path = os.lstat(path)
+        current_parent = os.lstat(path.parent)
+    except OSError:
+        return False
+    return (
+        _stat_identity(current_path) == expected_path_identity
+        and _stat_identity(current_parent) == expected_parent_identity
+    )
+
+
 def _utc_timestamp(value: str) -> datetime:
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
@@ -912,24 +1126,56 @@ class CodexCliBackend:
         }
 
     def _inspect_cli(self) -> None:
+        source_descriptor: int | None = None
         try:
-            before_identity, before_hash = _snapshot_executable(self._codex_path)
-            self._cli_binary_sha256 = before_hash
+            (
+                source_descriptor,
+                source_identity,
+                source_parent_identity,
+            ) = _open_executable_source(self._codex_path)
             with tempfile.TemporaryDirectory(prefix="local-ultra-review-codex-version-") as root:
                 scratch = Path(root).resolve()
+                os.chmod(scratch, 0o700)
+                scratch_metadata = os.lstat(scratch)
+                if (
+                    not stat.S_ISDIR(scratch_metadata.st_mode)
+                    or scratch_metadata.st_uid != os.geteuid()
+                    or scratch_metadata.st_mode & 0o077
+                ):
+                    raise OSError("CLI private snapshot directory is unsafe")
+                snapshot_path = scratch / "codex-snapshot"
+                snapshot_identity, snapshot_hash = _copy_executable_snapshot(
+                    source_descriptor, snapshot_path
+                )
+                os.close(source_descriptor)
+                source_descriptor = None
+                self._cli_binary_sha256 = snapshot_hash
                 tmpdir = scratch / "tmp"
                 tmpdir.mkdir(mode=0o700)
                 completed = _run_process(
-                    [str(self._codex_path), "--version"],
+                    [str(snapshot_path), "--version"],
                     environment=self._child_environment(tmpdir),
                     cwd=scratch,
                     timeout_seconds=10,
                 )
-            after_identity, after_hash = _snapshot_executable(self._codex_path)
-            if after_identity != before_identity or after_hash != before_hash:
-                self._cli_diagnostic_state = "binary_replaced_during_version_probe"
-                return
+                try:
+                    snapshot_unchanged = (
+                        _stat_identity(os.lstat(snapshot_path)) == snapshot_identity
+                    )
+                except OSError:
+                    snapshot_unchanged = False
+                source_path_unchanged = _original_executable_path_unchanged(
+                    self._codex_path,
+                    source_identity,
+                    source_parent_identity,
+                )
             if completed.returncode != 0:
+                if not snapshot_unchanged:
+                    self._cli_diagnostic_state = "binary_replaced_during_version_probe"
+                    return
+                if not source_path_unchanged:
+                    self._cli_diagnostic_state = "binary_path_changed_during_version_probe"
+                    return
                 self._cli_diagnostic_state = "version_probe_nonzero"
                 return
             raw_version = completed.stdout if completed.stdout.strip() else completed.stderr
@@ -939,11 +1185,20 @@ class CodexCliBackend:
                 return
             assert_safe_sink(version)
             self._cli_version = version
+            if not snapshot_unchanged:
+                self._cli_diagnostic_state = "binary_replaced_during_version_probe"
+                return
+            if not source_path_unchanged:
+                self._cli_diagnostic_state = "binary_path_changed_during_version_probe"
+                return
             self._cli_diagnostic_state = "validated"
         except subprocess.TimeoutExpired:
             self._cli_diagnostic_state = "version_probe_timeout"
         except (OSError, UnicodeDecodeError, SensitiveMaterialError):
             self._cli_diagnostic_state = "version_probe_failed"
+        finally:
+            if source_descriptor is not None:
+                os.close(source_descriptor)
 
     def _load_qualification_record(self) -> None:
         try:

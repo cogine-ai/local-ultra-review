@@ -15,6 +15,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from local_ultra_review import backend as backend_module  # noqa: E402
 from local_ultra_review.backend import (  # noqa: E402
     CodexCliBackend,
     DISABLED_FEATURES,
@@ -136,8 +137,10 @@ def scripted_attempt(
 class FakeCodex:
     def __init__(self, root: Path, *, replace_on_version: bool = False) -> None:
         self.path = root / "fake-codex"
-        self.version_environment_path = root / "version-environment.json"
-        self.semantic_launch_path = root / "semantic-launched"
+        capture_dir = root / "captures"
+        capture_dir.mkdir()
+        self.version_environment_path = capture_dir / "version-environment.json"
+        self.semantic_launch_path = capture_dir / "semantic-launched"
         source = f"""#!/usr/bin/env python3
 import json
 import os
@@ -292,6 +295,124 @@ class FakeBackendTests(unittest.TestCase):
                     with self.assertRaises(WorkerProtocolError):
                         backend.run(task, Path(temporary.name))
                 hash_json.assert_not_called()
+
+    def test_unbound_identity_shape_is_rejected_everywhere_before_semantic_hash(self) -> None:
+        reviewer = reviewer_task()
+        verifier = verifier_task()
+        reviewer_templates = (
+            reviewer_payload_template(
+                coverage={
+                    "reviewed_atom_ids": ["atom-1"],
+                    "notes": f"hidden {reviewer.task_id}",
+                }
+            ),
+            reviewer_payload_template(
+                coverage={
+                    "reviewed_atom_ids": ["atom-1"],
+                    "notes": f"hidden {reviewer.packet_hash}",
+                }
+            ),
+        )
+        verifier_templates = (
+            verifier_payload_template().replace(
+                b'"proof":[',
+                f'"proof":["hidden {verifier.packet_hash}",'.encode(),
+            ),
+            verifier_payload_template().replace(
+                b'"proof":[',
+                f'"proof":["hidden {HEX_B}",'.encode(),
+            ),
+        )
+        attempts = [scripted_attempt(template=template) for template in reviewer_templates]
+        attempts.extend(
+            scripted_attempt(role="verifier", template=template)
+            for template in verifier_templates
+        )
+        attempts.append(
+            scripted_attempt(
+                events=(
+                    {
+                        "type": "thread.started",
+                        "thread_id": "thread-1",
+                        "note": reviewer.task_id,
+                    },
+                )
+            )
+        )
+        for attempt in attempts:
+            backend = FakeBackend(scenario_id="fixture", attempts=[attempt])
+            with self.subTest(attempt=attempt), mock.patch(
+                "local_ultra_review.backend.sha256_json"
+            ) as hash_json:
+                with self.assertRaises(WorkerProtocolError):
+                    backend.semantic_identity()
+                hash_json.assert_not_called()
+
+    def test_run_rejects_opaque_task_identity_hidden_outside_dedicated_field(self) -> None:
+        packet = reviewer_packet()
+        task = WorkerTask(
+            task_id="opaque-task-identity",
+            role="reviewer",
+            packet=packet,
+            packet_hash=sha256_json(packet),
+            prompt_text="Review the sealed packet.",
+            output_schema_name="reviewer-result",
+            timeout_seconds=30,
+        )
+        template = reviewer_payload_template(
+            coverage={
+                "reviewed_atom_ids": ["atom-1"],
+                "notes": f"hidden {task.task_id}",
+            }
+        )
+        backend = FakeBackend(
+            scenario_id="fixture", attempts=[scripted_attempt(template=template)]
+        )
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+
+        with mock.patch("local_ultra_review.backend.validate_payload") as validate:
+            with self.assertRaises(WorkerProtocolError):
+                backend.run(task, Path(temporary.name))
+
+        validate.assert_not_called()
+
+    def test_run_rejects_identity_placeholders_outside_dedicated_fields_after_binding(self) -> None:
+        reviewer = reviewer_task()
+        verifier = verifier_task()
+        cases = (
+            (
+                reviewer,
+                scripted_attempt(
+                    template=reviewer_payload_template(
+                        coverage={
+                            "reviewed_atom_ids": ["atom-1"],
+                            "notes": "hidden {{TASK_ID}}",
+                        }
+                    )
+                ),
+            ),
+            (
+                verifier,
+                scripted_attempt(
+                    role="verifier",
+                    template=verifier_payload_template().replace(
+                        b'"proof":[',
+                        b'"proof":["hidden {{CANDIDATE_HASH}}",',
+                    ),
+                ),
+            ),
+        )
+        for task, attempt in cases:
+            temporary = tempfile.TemporaryDirectory()
+            self.addCleanup(temporary.cleanup)
+            backend = FakeBackend(scenario_id="fixture", attempts=[attempt])
+            with self.subTest(role=task.role), mock.patch(
+                "local_ultra_review.backend.validate_payload"
+            ) as validate:
+                with self.assertRaises(WorkerProtocolError):
+                    backend.run(task, Path(temporary.name))
+                validate.assert_not_called()
 
     def test_readiness_is_synthetic_only_and_has_no_live_authority(self) -> None:
         readiness = FakeBackend(scenario_id="fixture", attempts=[]).readiness()
@@ -470,6 +591,17 @@ class FakeBackendTests(unittest.TestCase):
             {"type": "item.completed", "item": {"type": "web_search"}},
             {"type": "item.completed", "item": {"type": "web_search_call"}},
             {"type": "item.completed", "item": {"type": "search_query"}},
+            {"type": "tool"},
+            {"type": "command"},
+            {"type": "function"},
+            {"type": "mcp"},
+            {"type": "file_edit_call"},
+            {"type": "web_fetch"},
+            {"type": "custom_unknown_event", "payload": {"safe": True}},
+            {
+                "type": "turn.completed",
+                "payload": {"type": "custom_unknown_nested_event"},
+            },
         )
         for marker in markers:
             events = (
@@ -478,6 +610,26 @@ class FakeBackendTests(unittest.TestCase):
             )
             with self.subTest(marker=marker), self.assertRaises(WorkerProtocolError):
                 self.run_attempt(scripted_attempt(events=events))
+
+    def test_explicit_harmless_lifecycle_message_and_reasoning_events_are_accepted(self) -> None:
+        events = (
+            {"type": "thread.started", "thread_id": "thread-harmless"},
+            {"type": "turn.started"},
+            {
+                "type": "item.completed",
+                "item": {"type": "reasoning", "text": "Bounded reasoning."},
+            },
+            {
+                "type": "item.completed",
+                "item": {"type": "agent_message", "text": "Structured result follows."},
+            },
+            {"type": "turn.completed", "usage": {"input_tokens": 1}},
+        )
+
+        result = self.run_attempt(scripted_attempt(events=events))
+
+        self.assertEqual(result.manifest["observed_event_count"], 5)
+        self.assertEqual(result.manifest["observed_tool_call_count"], 0)
 
 
 class CodexCliBackendTests(unittest.TestCase):
@@ -643,6 +795,71 @@ class CodexCliBackendTests(unittest.TestCase):
         )
         self.assertEqual(identity["qualification_state"], "diagnostic_mismatch")
         self.assertFalse(backend.readiness()["live_dispatch_authorized"])
+
+    def test_version_probe_uses_private_snapshot_and_detects_path_aba(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        fake_codex = FakeCodex(root)
+        expected_hash = hashlib.sha256(fake_codex.path.read_bytes()).hexdigest()
+        record = write_qualification(root, fake_codex)
+        alternate = root / "fake-codex-b"
+        alternate.write_text(
+            "#!/bin/sh\nprintf 'codex-cli 8.8.8\\n'\n", encoding="utf-8"
+        )
+        alternate.chmod(0o700)
+        held_original = root / "fake-codex-a-held"
+        original_run = backend_module._run_process
+        observed_argv: list[str] = []
+
+        def aba_run(
+            argv,
+            *,
+            environment,
+            cwd,
+            stdin=None,
+            timeout_seconds,
+        ):
+            observed_argv[:] = list(argv)
+            snapshot_metadata = os.lstat(argv[0])
+            snapshot_parent_metadata = os.lstat(Path(argv[0]).parent)
+            self.assertTrue(stat.S_ISREG(snapshot_metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(snapshot_metadata.st_mode), 0o500)
+            self.assertTrue(stat.S_ISDIR(snapshot_parent_metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(snapshot_parent_metadata.st_mode), 0o700)
+            os.replace(fake_codex.path, held_original)
+            os.replace(alternate, fake_codex.path)
+            try:
+                return original_run(
+                    argv,
+                    environment=environment,
+                    cwd=cwd,
+                    stdin=stdin,
+                    timeout_seconds=timeout_seconds,
+                )
+            finally:
+                os.replace(fake_codex.path, alternate)
+                os.replace(held_original, fake_codex.path)
+
+        with mock.patch("local_ultra_review.backend._run_process", side_effect=aba_run):
+            backend = CodexCliBackend(
+                codex_path=fake_codex.path,
+                model="sealed-model-id",
+                qualification_record=record,
+                parent_environment=parent_environment(),
+            )
+
+        identity = backend.semantic_identity()
+        self.assertNotEqual(Path(observed_argv[0]), fake_codex.path)
+        self.assertFalse(Path(observed_argv[0]).exists())
+        self.assertNotIn(str(Path(observed_argv[0])), json.dumps(identity))
+        self.assertEqual(identity["cli_binary_sha256"], expected_hash)
+        self.assertEqual(identity["cli_version"], "codex-cli 9.9.9")
+        self.assertEqual(
+            identity["cli_diagnostic_state"],
+            "binary_path_changed_during_version_probe",
+        )
+        self.assertEqual(identity["qualification_state"], "diagnostic_mismatch")
 
     def test_preflight_trusted_canary_proves_descendant_inheritance_without_values(self) -> None:
         _temporary, fake_codex, _record, backend = self.make_backend()
