@@ -1,0 +1,821 @@
+# Codex-native Guarded V2 Evaluation Slice Implementation Plan
+
+> **For Codex:** REQUIRED SUB-SKILL: Use `superpowers:subagent-driven-development` to implement this plan task-by-task. Use `superpowers:test-driven-development` for every behavior change. Do not skip task review or the final whole-branch review.
+
+**Goal:** Build a narrow, evaluation-only V2 path that cannot turn missing semantic work into a clean review, while truthfully describing the selected Codex worker as guarded and unconfined.
+
+**Architecture:** A new Python package owns an explicit two-dot Git target, immutable content-addressed artifacts, a hash-chained event ledger, strict reviewer/verifier schemas, one correctness reviewer, one procedurally separate verifier per candidate instance, and a deterministic completion gate. A fake backend makes the complete protocol testable. A Codex CLI adapter can inspect an unexecuted CLI file object, run an independent host-owned environment canary, and build the intended launch specification, but it does not execute an unbound CLI version probe and always blocks live semantic dispatch. V1 remains untouched.
+
+**Tech Stack:** Python 3.11+, standard library, `jsonschema>=4.20,<5`, `unittest`, Git CLI, optional bundled Codex CLI for an opt-in host smoke.
+
+---
+
+## Global Constraints
+
+These bind every task and every task review.
+
+1. The selected worker machine value is exactly `codex_native_guarded`; its display value is `Codex-native guarded worker (no hard confinement)`.
+2. Every accepted synthetic evaluation records these values inside `assurance_contract_under_test`; every live diagnostic records the same current limitations as diagnostic state:
+   - `worker_profile=codex_native_guarded` and `worker_profile_display=Codex-native guarded worker (no hard confinement)`
+   - `worker_boundary=guarded_unconfined`
+   - `hard_worker_confinement=not_provided`
+   - `packet_only_read=not_guaranteed`
+   - `residual_tool_surface=unknown`
+   - `residual_tool_inventory=unavailable`
+   - `accepted_tool_calls=none_observed` only for accepted synthetic attempts after zero observed **tool-call** events; a pre-dispatch live diagnostic or all-manual zero-dispatch evaluation uses `not_applicable_no_dispatch`
+   - `telemetry_scope=observed_events_only` for accepted synthetic attempts and `not_applicable_no_dispatch` for all-manual/pre-dispatch states
+   - a post-Store incomplete diagnostic uses `accepted_tool_calls=not_available_incomplete`, `telemetry_scope=not_available_incomplete`, and `context_lineage=not_available_incomplete`; it cannot convert missing evidence into a no-dispatch claim
+   - accepted fake evaluations always use `worker_child_environment=not_verified`, `filesystem_write_mitigation=not_verified`, and `nested_web_search=not_verified`; they cannot borrow a separate Codex diagnostic/preflight
+   - a blocked Codex diagnostic may separately report `worker_child_environment=allowlist_preflight_passed` after the host-owned canary passes, but this cannot overcome the inventory or object-bound-version blockers
+   - `backend_stateless_attestation=unavailable`
+   - `target_execution=not_requested`
+3. Never call the selected worker `controlled`, `isolated`, `confined`, `sandboxed`, `packet-only`, `no-tools`, `no-network`, or `attested` without an explicit negation/limitation. Target-command assurance is a separate future concern.
+4. The exact complete-result banner is reserved for a future authoritative live result:
+
+   `Review process complete under the Codex-native guarded worker profile. Hard worker confinement was not provided. “Clean” means no confirmed findings under the completed review contract; it is not a worker-security claim.`
+
+   Diagnostic output replaces `Review process complete` with `Review process incomplete` or `Review process blocked` and retains the rest of the limitation. Synthetic evaluation output must not emit this banner at all.
+5. Worker assurance is orthogonal to `completeness` and `verdict`. A complete guarded result may be `clean`, `findings`, or `manual_review_required`; a failed task is `incomplete/not_available`, never an empty result.
+6. Scope is exactly one clean tracked two-dot target: explicit `--base`, explicit `--head`, both resolved once to full SHAs, one correctness reviewer, and one new process/thread verifier per candidate.
+7. Defer dirty/staged/unstaged/untracked overlays, PR/GitHub behavior, target-code execution, resume, multiple reviewer lenses, adjudication, semantic dedupe, publication, V1 compatibility, and production skill promotion.
+8. Do not modify `SKILL.md`, `README.md`, `agents/openai.yaml`, existing `config/`, existing `scripts/`, existing root/V1 schemas/prompts/templates/examples, or existing V1 tests in this slice. V2 package resources created on this branch may be tightened by reviewed contract-reconciliation tasks.
+9. Do not use `--ask-for-approval`; it is not a supported `codex exec` flag on the qualified CLI. Do not invent `store=false`, parent-lineage attestation, or complete tool telemetry.
+10. The hypothetical Codex launch posture uses only flags proven present: `--ephemeral`, `--ignore-user-config`, `--ignore-rules`, `--skip-git-repo-check`, `--strict-config`, `-s read-only`, `-C`, `--output-schema`, `--json`, `--output-last-message`, `-c 'web_search="disabled"'`, an explicit model, and the proven feature disables.
+11. Known-observed worker introspection is not a canonical inventory. This slice has no host-owned oracle that can enumerate every effective host, nested, connector, or GitHub capability, so `CodexCliBackend.run()` must block before the semantic subprocess even if a JSON record claims completeness. A data record alone can never self-authorize live dispatch.
+12. Implement a host-owned synthetic environment preflight through the same process-construction helper: begin from an empty child environment, add only a sealed allowlist, inject fake secrets only into the adapter parent, spawn a trusted canary plus descendant, and prove the raw parent/descendant key sets and allowlisted values exactly match the adapter expectation. Any runtime-added key or value drift fails the canary; persisted evidence contains only key names and value-match booleans, never values or their digests. This evidence is not model-authored and is not borrowed from the target-command sandbox. Even a passing environment preflight does not overcome the missing inventory oracle in this slice.
+13. A worker-authored capability, lineage, tool inventory, or assurance field is rejected. Trusted run manifests are adapter-authored.
+14. Fake event evidence is accepted only through an exact harmless structural contract for lifecycle, message/reasoning, and numeric usage records. Every unknown type, extra structural key, or unexpected nested object/array rejects the attempt. Free text may mention tool-like words without becoming tool evidence. The rejection does not claim access was prevented or undone.
+15. Strict schemas use Draft 2020-12 and `additionalProperties: false` at every object boundary. Blank, fenced, partial, malformed, or schema-invalid output rejects the entire task.
+16. The reviewer proposes candidates only; it cannot assign a terminal disposition. Each raw candidate instance receives exactly one verifier result from a distinct task ID, process launch ID, and observed thread ID. Exact duplicates remain separate through verification and carry a deterministic duplicate ordinal.
+17. All canonical JSON is UTF-8, sorted keys, compact separators, and a final newline. Hashes are lowercase SHA-256 over canonical bytes.
+18. Artifact writes use staging, fsync, and atomic rename. The event ledger is adapter-only, append+fsync, and hash-chained. Hash or ledger corruption blocks gating and rendering.
+19. This slice produces no canonical code-review report. Every synthetic evaluation says `profile=evaluation_slice_v2`, `release_ready=false`, and `authoritative_review=false`. A diagnostic report must not contain `clean`, `Pass`, `no issues`, or `No confirmed findings` as a verdict claim.
+20. Use `subprocess` with argv arrays and `shell=False`. No network, external writes, GitHub operations, target commands, or repository mutation are part of this slice.
+21. The fake backend is a synthetic protocol test harness, not a semantic reviewer. It can produce only non-authoritative evaluation artifacts. It must never create canonical `report.md`, emit the complete-review banner, or claim the target is clean.
+22. Every changed path belongs to exactly one complete partition: reviewer-covered atoms or adapter-owned manual dispositions. Binary, submodule, sensitive-path, materially redacted, and otherwise unreviewable content can never disappear from the partition or permit a clean simulated verdict.
+23. Known-sensitive material is classified and redacted before packet persistence. Worker output and every accepted sink are scanned before writing; unsafe output is rejected/quarantined without persisting the raw value. This is sink containment, not ambient worker secrecy.
+
+## Deferred Work
+
+- Target permission-profile runner and its live preflight.
+- Dirty/untracked overlays and local working-tree review.
+- PR resolution, GitHub payloads, grants, and publication.
+- Deep/max coverage, impact mapping, multiple lenses, adjudication, and semantic dedupe.
+- Resume/recovery across interrupted sessions.
+- `SKILL.md`, README, agent metadata, and installed-skill promotion.
+- Paired V1/V2 longitudinal scoring and release acceptance.
+
+## Task 1: Add the V2 package, strict contracts, and prompts
+
+**Files:**
+
+- Create: `pyproject.toml`
+- Create: `src/local_ultra_review/__init__.py`
+- Create: `src/local_ultra_review/contracts.py`
+- Create: `src/local_ultra_review/resources/__init__.py`
+- Create: `src/local_ultra_review/resources/schemas/reviewer-result.schema.json`
+- Create: `src/local_ultra_review/resources/schemas/verifier-result.schema.json`
+- Create: `src/local_ultra_review/resources/schemas/qualification-record.schema.json`
+- Create: `src/local_ultra_review/resources/schemas/evaluation-completion.schema.json`
+- Create: `src/local_ultra_review/resources/prompts/reviewer-correctness.md`
+- Create: `src/local_ultra_review/resources/prompts/verifier.md`
+- Create: `tests/test_v2_contracts.py`
+
+### Required interfaces
+
+`pyproject.toml`:
+
+- Python `>=3.11`.
+- Only runtime dependency: `jsonschema>=4.20,<5`.
+- `src` package layout.
+- Console script: `local-ultra-review-v2 = local_ultra_review.orchestrator:main` (the module arrives in Task 4).
+- Package JSON/Markdown resources in wheels and editable installs; load them only through `importlib.resources`.
+
+`contracts.py`:
+
+```python
+SCHEMA_VERSION = "2.0-evaluation-slice"
+
+class ContractError(ValueError): ...
+
+def canonical_json_bytes(value: object) -> bytes: ...
+def sha256_json(value: object) -> str: ...
+def load_schema(name: str) -> dict: ...
+def validate_payload(schema_name: str, value: object) -> None: ...
+def reject_worker_authority_fields(value: object) -> None: ...
+```
+
+- Schema/prompt lookup uses `importlib.resources.files("local_ultra_review.resources")`, never the caller's current directory.
+- `reject_worker_authority_fields` recursively rejects these worker-supplied keys anywhere: `assurance`, `capability`, `capabilities`, `worker_profile`, `worker_boundary`, `hard_worker_confinement`, `context_lineage`, `parent_context_id`, `residual_tool_surface`, `tool_inventory`, `tools`, `telemetry_scope`.
+
+Reviewer payload:
+
+```json
+{
+  "schema_version": "2.0-evaluation-slice",
+  "task_id": "reviewer-...",
+  "packet_hash": "64 lowercase hex",
+  "status": "completed",
+  "coverage": {
+    "reviewed_atom_ids": ["atom-..."],
+    "notes": "nonempty"
+  },
+  "candidates": [
+    {
+      "severity": "Important",
+      "file": "relative/path.py",
+      "line": 12,
+      "title": "concise",
+      "failure_scenario": "concrete",
+      "evidence": ["specific evidence"],
+      "why_diff": "causality"
+    }
+  ]
+}
+```
+
+- Candidate properties `status`, `verification`, `disposition`, `confirmed`, and `final_severity` are forbidden by strict schema.
+- A completed reviewer envelope with `candidates=[]` is valid only when coverage is nonempty and later matches the sealed atom set.
+
+Verifier payload:
+
+```json
+{
+  "schema_version": "2.0-evaluation-slice",
+  "task_id": "verifier-...",
+  "packet_hash": "64 lowercase hex",
+  "candidate_hash": "64 lowercase hex",
+  "status": "completed",
+  "disposition": "confirmed",
+  "final_severity": "Important",
+  "provenance": "introduced by ...",
+  "best_fix": "ownership-boundary fix",
+  "refactor_judgment": "bounded judgment",
+  "proof": ["specific proof"],
+  "residual_risk": "remaining uncertainty"
+}
+```
+
+- Dispositions: `confirmed`, `false_positive`, `pre_existing`, `needs_manual_review`.
+- `final_severity` is required and `Important|Nit` only for `confirmed`; it must be absent for all other dispositions.
+
+Qualification/diagnostic record fields are strict and exact: `record_kind=diagnostic_evidence`, `profile=codex_native_guarded`, CLI version and three policy/binary SHA-256 values, `residual_tool_surface=unknown`, `residual_tool_inventory=unavailable`, `canonical_inventory_oracle=unavailable`, `inventory_scope=known_observed_partial`, `inventory_source=worker_observed_only`, sorted unique known-observed exposures, observation method, RFC3339 UTC qualification/expiry timestamps, guarded mitigation/preflight states, `telemetry_scope=observed_events_only`, `live_dispatch_authorized=false`, and a unique blocker list containing `canonical_inventory_oracle_unavailable`. The current adapter cannot object-bind the record's CLI version, so even a matching record remains non-evaluable and cannot supply exposures. A data record never authorizes live dispatch.
+
+The evaluation-completion schema is explicitly non-authoritative. It uses `authority=synthetic_evaluation`, `authoritative_review=false`, `execution_backend=fake_evaluation`, `protocol_completeness=complete`, and `simulated_review_verdict=clean|findings|manual_review_required`. Its guarded-profile fields are named `assurance_contract_under_test`, not `assurance`. It cannot satisfy a canonical review-result schema and cannot be rendered as `report.md`.
+
+### TDD sequence
+
+1. Write tests for canonical JSON stability, strict additional-property rejection, terminal candidate-field rejection, confirmed/non-confirmed verifier conditionals, recursive worker-authority rejection, qualification limitations, and the non-authoritative evaluation-completion constants.
+2. Run `python -m unittest tests.test_v2_contracts -v`; capture the expected import/schema RED.
+3. Add only the package/contracts/packaged schemas/prompts required for GREEN. Build a wheel into a temporary directory, install it into a temporary venv, and prove schema/prompt lookup works outside the checkout.
+4. Re-run the focused test, then `python -m unittest discover -s tests -v`.
+5. Commit: `Build strict V2 review contracts`.
+
+## Task 2: Seal the Git target and immutable artifact history
+
+**Files:**
+
+- Create: `src/local_ultra_review/git_target.py`
+- Create: `src/local_ultra_review/redaction.py`
+- Create: `src/local_ultra_review/store.py`
+- Create: `tests/test_v2_core.py`
+
+### Required interfaces
+
+`git_target.py`:
+
+```python
+@dataclass(frozen=True)
+class SealedTarget:
+    repository_root: Path
+    base_sha: str
+    head_sha: str
+    redacted_diff_text: str
+    safe_diff_hash: str
+    changed_paths: tuple[str, ...]
+    coverage_atoms: tuple[dict, ...]
+    manual_dispositions: tuple[dict, ...]
+    target_identity_hash: str
+
+def seal_two_dot_target(repo: Path, base: str, head: str) -> SealedTarget: ...
+def build_review_packet(target: SealedTarget) -> dict: ...
+```
+
+- Resolve both refs with `git rev-parse --verify <ref>^{commit}` exactly once.
+- Reject a non-repository, equal SHAs, dirty index/worktree, untracked files, submodule dirt in the checkout, empty diff, absolute/escaping paths, and undecodable path metadata. Do not silently reject or omit an otherwise valid mixed binary/special diff: classify it into a manual partition.
+- Use `git diff --raw -z --no-renames <base_sha>..<head_sha --`, `git diff --numstat -z --no-renames ...`, and `git diff --no-ext-diff --no-textconv --no-renames ...`. Parse delete/add as separate paths; never enable heuristic rename detection.
+- Resolve and invoke an absolute system Git from the adapter baseline `PATH`, scrub inherited `GIT_*` configuration, and force `core.fsmonitor=false`, `core.untrackedCache=false`, a null hooks path, and a null global attributes file. Repository-local executables, fsmonitor commands, hooks, and diff drivers must not run while sealing the target. Ignore target-controlled attributes in the isolated object view, and classify any NUL-bearing blob as binary even if committed attributes request text diffing.
+- Every raw changed path creates one deterministic path-metadata atom containing status and old/new modes. Every textual hunk creates one additional hunk atom. Therefore mode-only and empty-file changes still have an atom. A regular-file `100644`/`100755` mode-only change receives the adapter-owned `mode_only_change` manual disposition; it cannot be delegated to the synthetic reviewer or yield simulated clean.
+- Binary, submodule, sensitive-path, unparseable, mode-only, or materially redacted atoms receive adapter-owned manual dispositions. Reviewer-covered and manual atom sets are disjoint and their exact union is every atom. A mixed text+binary target can continue only as `manual_review_required`, never simulated clean.
+- `target_identity_hash` includes repository identity, base/head SHAs, the **redacted** safe-diff hash, changed-path metadata, every atom, every redaction/manual disposition, and redaction-ruleset hash. It excludes session path, wall clock, session ID, worker/model/backend inputs, raw-diff hash, blob IDs for sensitive paths, and raw sensitive bytes. The fixed commit SHAs seal the original Git objects without persisting a standalone secret-derived digest. Task 4 builds the broader `review_identity_hash`.
+- The packet contains fixed SHAs, only the redacted/withheld diff representation, changed-path metadata, reviewable atoms, manual dispositions, profile, and an untrusted-content warning. It contains no local repository path or raw sensitive value.
+
+`redaction.py`:
+
+```python
+class SensitiveMaterialError(ValueError): ...
+
+@dataclass(frozen=True)
+class RedactionResult:
+    safe_diff_text: str
+    manual_dispositions: tuple[dict, ...]
+    ruleset_hash: str
+
+def classify_and_redact_diff(raw_diff: bytes, path_records: tuple[dict, ...]) -> RedactionResult: ...
+def assert_safe_sink(value: object) -> None: ...
+```
+
+- High-confidence detectors cover private-key blocks, classic and fine-grained GitHub tokens, other common provider/token prefixes, and compound secret/password/token/API-key assignments with non-placeholder values (including keys such as `AWS_SECRET_ACCESS_KEY` and `STRIPE_SECRET_KEY`). Sensitive path classes include `.env*`, private-key/certificate-key files, credential/token stores, and local database files.
+- A sensitive path is represented only by safe path metadata, reason code, and a withheld-content marker. For an inline secret, replace the value with a deterministic location/ordinal marker that is not derived from the secret value, and mark the affected hunk manual. Never persist the raw diff, a raw matched value, blob ID, or standalone digest of sensitive bytes.
+- `assert_safe_sink` scans packets, plan/artifact/event payloads, accepted worker payloads, evaluation reports, diagnostics, and materialized views before any write. Unsafe worker output is rejected in memory; any diagnostic uses a reason code/hash only.
+- Sink containment tests use synthetic provider-shaped canaries and assert their bytes and standalone canary-derived hashes are absent from packet, plan, ledger, artifact, event, report, and recovery output. Do not infer ambient non-access.
+
+`store.py`:
+
+```python
+class IntegrityError(RuntimeError): ...
+
+class ArtifactStore:
+    @classmethod
+    def create(cls, session_root: Path, plan: dict) -> "ArtifactStore": ...
+    def write_artifact(self, artifact_type: str, payload: dict, producer: dict) -> dict: ...
+    def append_event(self, event_type: str, payload: dict) -> dict: ...
+    def verify(self) -> None: ...
+    def read_artifacts(self, artifact_type: str) -> list[dict]: ...
+```
+
+- Create a staging directory beside the final session directory, write canonical `plan.json`, fsync file and directory, write genesis event, and atomically promote. Existing final session directory is an error.
+- Plan has `plan_integrity_hash` over all plan fields except itself. It includes session ID/root/time. Task 4 supplies a review identity that combines the target identity with all semantic worker inputs.
+- Artifact envelope is adapter-authored and includes artifact/schema/session/plan/review identity, producer task/attempt/thread/process IDs, input hashes, payload hash, timestamp, and envelope hash.
+- Artifact filename is content-addressed and immutable; collision with different bytes is an integrity error. Every planned payload passes `assert_safe_sink` before staging.
+- Ledger records `sequence`, previous hash, event type, payload hash, timestamp, and event hash. Verify the full chain and all artifact/plan hashes on every gate/render read.
+
+### TDD sequence
+
+1. Add tests creating three-commit temporary repos: requested head is commit 2 while repository HEAD is commit 3; assert only commit 2 is sealed.
+2. Add tests for dirty/untracked rejection; `--no-renames` delete/add behavior; path and hunk atom stability; mixed text+binary; mode-only; empty-file; symlink/submodule; sensitive-path and inline-secret redaction; exact reviewed/manual partition; path-free/sensitive-free packets; target identity stability; atomic exclusive creation; content-addressed artifacts; sink-scan rejection; and plan/ledger/artifact tamper failure.
+3. Run `python -m unittest tests.test_v2_core -v`; capture RED.
+4. Implement minimal Git and store behavior; no worker logic.
+5. Run focused and full suites.
+6. Commit: `Seal V2 targets and artifacts`.
+
+## Task 3: Implement fake and guarded Codex worker backends
+
+**Files:**
+
+- Create: `src/local_ultra_review/backend.py`
+- Create: `tests/test_v2_backend.py`
+
+### Required interfaces
+
+```python
+@dataclass(frozen=True)
+class WorkerTask:
+    task_id: str
+    role: Literal["reviewer", "verifier"]
+    packet: dict
+    packet_hash: str
+    prompt_text: str
+    output_schema_name: str
+    timeout_seconds: int
+
+@dataclass(frozen=True)
+class ScriptedAttempt:
+    expected_role: Literal["reviewer", "verifier"]
+    raw_events: tuple[dict, ...]
+    last_message_template: bytes
+    process_launch_id: str
+    return_code: int = 0
+    timed_out: bool = False
+
+@dataclass(frozen=True)
+class WorkerAttempt:
+    payload: dict
+    thread_id: str
+    process_launch_id: str
+    manifest: dict
+
+class WorkerProtocolError(RuntimeError): ...
+class WorkerUnavailable(RuntimeError): ...
+
+class WorkerBackend(Protocol):
+    def readiness(self) -> dict: ...
+    def semantic_identity(self) -> dict: ...
+    def run(self, task: WorkerTask, attempt_dir: Path) -> WorkerAttempt: ...
+
+class FakeBackend:
+    def __init__(self, *, scenario_id: str, attempts: Sequence[ScriptedAttempt]): ...
+    def readiness(self) -> dict: ...
+    def semantic_identity(self) -> dict: ...
+    def run(self, task: WorkerTask, attempt_dir: Path) -> WorkerAttempt: ...
+
+class CodexCliBackend:
+    def __init__(self, *, codex_path: Path, model: str, qualification_record: Path,
+                 parent_environment: Mapping[str, str] | None = None): ...
+    def readiness(self) -> dict: ...
+    def semantic_identity(self) -> dict: ...
+    def build_launch_spec(self, task: WorkerTask, attempt_dir: Path) -> dict: ...
+    def preflight_worker_environment(self, scratch_dir: Path) -> dict: ...
+    def run(self, task: WorkerTask, attempt_dir: Path) -> WorkerAttempt: ...
+```
+
+### Guarded backend contract
+
+- Stream the executable through a held `O_NOFOLLOW` regular-file descriptor and record its hash as `cli_binary_identity_scope=unexecuted_nofollow_file_object`. This host has no qualified object-bound execution primitive, so do not execute `codex --version`: record `cli_version=null`, `version_probe_executed=false`, `object_bound_executable_binding=unavailable`, and `cli_diagnostic_state=object_bound_version_probe_unavailable`.
+- Validate the adapter-owned record, expiry, binary hash, and policy hashes when independently possible, but never let it become `valid_diagnostic` without an object-bound version probe. A matching record becomes `not_evaluable_without_object_bound_version_probe`; invalid, expired, or independently provable binary/policy mismatch states remain distinct. Known-observed exposures and their hash remain unavailable in every current state.
+- Child environment keys are exactly the available subset of `PATH`, `HOME`, `CODEX_HOME`, `LANG`, `LC_ALL`, `TERM`, plus adapter-set `TMPDIR`. Remove every other parent variable. Manifest records key names/hash, never values. Tests inject `LOCAL_ULTRA_REVIEW_FAKE_SECRET=EVAL_ONLY_...` and prove it does not reach the fake CLI.
+- `build_launch_spec()` creates the exact hypothetical semantic argv, stdin, and scrubbed environment, but `run()` raises `WorkerUnavailable` with a structured blocked diagnostic before launching it. No record supplied to this slice can turn that gate on.
+- `preflight_worker_environment()` may launch only a trusted synthetic canary through the shared process-construction helper. It starts from an empty child environment, validates parent-secret exclusion and descendant inheritance, and records host-owned evidence. It is not a semantic invocation.
+- Required argv, in stable order:
+  - `codex exec --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --strict-config`
+  - `-s read-only`
+  - `-c web_search="disabled"`
+  - each of these exact disables: `shell_tool`, `unified_exec`, `code_mode_host`, `apps`, `browser_use`, `browser_use_external`, `browser_use_full_cdp_access`, `computer_use`, `plugins`, `remote_plugin`, `image_generation`, `multi_agent`, `goals`, `workspace_dependencies`, `tool_suggest`, `tool_call_mcp_elicitation`
+  - `-C <attempt packet directory>`
+  - `--model <sealed model>`
+  - `--output-schema <task schema>`
+  - `--json --output-last-message <attempt scratch/result.json> -`
+- Do not add `--ask-for-approval`, target-command permission profiles, or network claims.
+- `last_message_template` may contain only the adapter-defined placeholders `{{TASK_ID}}`, `{{PACKET_HASH}}`, `{{CANDIDATE_HASH}}`, and the public whole-node reviewer coverage sentinel `{{REVIEWED_ATOM_IDS}}`. The coverage sentinel is legal exactly once only as the complete `coverage.reviewed_atom_ids` value of a reviewer template; it binds structurally to the sealed target packet's exact nonempty, unique `atom-<sha256>` array. `FakeBackend` binds all placeholders after review identity/task creation and before result validation. Any literal sealed atom ID, unknown/unresolved marker, wrong role/path, substring, duplicate, or escaped sentinel rejects before semantic hashing.
+- The shared fake-attempt acceptance path consumes `ScriptedAttempt`, checks the expected role, timeout, return code, and launch evidence, binds the task-specific placeholders, requires exactly one nonempty thread ID and a schema-valid raw payload, and accepts events only through the exact harmless structural contract. Its manifest always says `telemetry_scope=observed_events_only`.
+- Before the fake semantic hash, reject task/hash identity shapes from `scenario_id`, `process_launch_id`, raw events, and every non-dedicated payload field. The sole exception is the exact reviewer coverage sentinel at its dedicated whole-node path; literal sealed atom IDs remain forbidden in unbound templates. Before acceptance, deeply reject the active task/packet/candidate values from those same locations, including opaque task IDs. Only dedicated top-level identity fields and structurally bound reviewer coverage may acquire sealed identities.
+- Reject blank/fenced/partial/malformed output, packet/task mismatch, worker authority fields, unsafe sensitive bytes, missing/repeated thread IDs, timeout/nonzero status, or any observed tool call in fake protocol evaluations.
+- Adapter-authored fake manifests contain task/attempt/packet hashes, process launch ID, synthetic thread ID, observed event count, observed tool-call count, all conservative assurance limitations, `authority=synthetic_evaluation`, `execution_backend=fake_evaluation`, and `target_execution=not_requested`.
+- `FakeBackend.semantic_identity()` includes backend/protocol version, scenario ID, expected role sequence, and a canonical hash of the **unbound attempt templates** (including literal identity and reviewer-coverage sentinel tokens). It excludes actual task/packet/candidate/atom IDs, which do not exist yet; the same unbound scenario identity is therefore target-independent. The hash of each structurally bound attempt is recorded later in its adapter manifest and persisted result wrapper/envelope, not mislabelled as an input hash or fed back into review identity. `CodexCliBackend.semantic_identity()` includes adapter version, model, the unexecuted file-object hash/scope, explicit unavailable version-binding state, launch/environment policy hashes, diagnostic-record hash, unavailable inventory, and qualification state. Task 4 includes only the selected backend's semantic identity in review identity.
+- `FakeBackend.readiness()` returns a synthetic-only ready state with no live authority. `CodexCliBackend.readiness()` includes the independent environment-preflight result but always returns diagnostic/live dispatch blocked by both `canonical_inventory_oracle_unavailable` and `object_bound_version_probe_unavailable`.
+
+`FakeBackend` is test/evaluation-only. It still runs the same schema, identity, authority-field, secret-sink, and observed-tool gates, but no `WorkerAttempt` it returns can acquire live authority.
+
+### TDD sequence
+
+1. Test every live Codex path blocks with zero semantic subprocess calls, including a syntactically valid record that claims a complete inventory.
+2. Test exact hypothetical argv and feature disables, absence of unsupported flags, no-follow file-object hashing, zero CLI/version subprocess calls, parent-secret stripping, empty-base child environment, trusted canary descendant inheritance, environment-policy hash matching, and explicit unavailable version-binding fields.
+3. Test valid structurally bound reviewer coverage, target-independent unbound identity, target-dependent bound attempt hashes, blank/fenced/malformed result, worker authority forgery, missing/duplicate thread, timeout/nonzero exit, literal atom/placeholder/identity feedback through every fake metadata surface, invalid sealed coverage sources, and exact harmless event-structure acceptance/rejection.
+4. Run `python -m unittest tests.test_v2_backend -v`; capture RED.
+5. Implement the shared acceptance path, fake backend, then guarded CLI adapter.
+6. Run focused and full suites.
+7. Commit: `Add guarded V2 worker backends`.
+
+## Task 3.5: Reconcile semantic-plan, completion, and artifact-producer contracts
+
+This reviewed prerequisite supersedes any conflicting Task 1/2 contract shape. It is required before orchestration because the first draft could not bind plan semantics to review identity, represent an all-manual target, distinguish duplicate candidate instances, or persist adapter-authored artifacts without fake worker evidence.
+
+**Files:**
+
+- Modify: `src/local_ultra_review/contracts.py`
+- Modify: `src/local_ultra_review/backend.py`
+- Modify: `src/local_ultra_review/resources/schemas/evaluation-completion.schema.json`
+- Modify: `src/local_ultra_review/redaction.py`
+- Modify: `src/local_ultra_review/store.py`
+- Create: `src/local_ultra_review/completion_projection.py`
+- Modify: `tests/test_v2_backend.py`
+- Modify: `tests/test_v2_contracts.py`
+- Modify: `tests/test_v2_core.py`
+
+### Semantic plan and review identity
+
+- Add one required `semantic_plan` object and one required top-level
+  `target_packet_payload_hash` to the strict stored plan. The packet hash is the
+  SHA-256 of the exact session-independent target packet and is included in
+  `plan_integrity_hash`; Store creation therefore happens only after the packet is
+  built. Keep session ID/root/time outside the semantic plan.
+- `semantic_plan` has exact keys and validation for: `profile=evaluation_slice_v2`, `authority=synthetic_evaluation`, `execution_backend=fake_evaluation`, `release_ready=false`, `roles=["correctness"]`, explicit model, schema contracts, prompt contracts, redaction contract, fake readiness, fake semantic identity, orchestration-contract version, and run-manifest version.
+- Expose single-source public metadata APIs/constants; do not import private versions or duplicate strings in the orchestrator. Exact resource metadata is:
+  - schemas: exactly `reviewer-result`, `verifier-result`, and `evaluation-completion`, each with `schema_version` and SHA-256 over canonical loaded JSON;
+  - prompts: exactly `reviewer-correctness` and `verifier`, each with an explicit public version and SHA-256 over the packaged raw bytes;
+  - redaction: public version and existing ruleset hash;
+  - backend: public `RUN_MANIFEST_VERSION`, written identically into Fake semantic identity and every adapter manifest. The semantic-plan value must equal both sources.
+- Fake readiness inside a successful plan must exactly be the synthetic-only ready constants plus pristine consumption state. Fake semantic identity has exact fields for backend/version, protocol version, run-manifest version, scenario ID, total attempt count, expected role sequence, and unbound-template hash; no mutable current index or session field is allowed.
+- Compute and validate exactly:
+
+  ```python
+  review_identity_hash = sha256_json({
+      "target_identity_hash": target_identity_hash,
+      "semantic_plan": semantic_plan,
+  })
+  ```
+
+  Changing semantic inputs without recomputing review identity must fail even if `plan_integrity_hash` is recomputed. Session ID/root/time and the separately anchored exact target-packet payload hash affect plan integrity but do not change this approved review-identity formula. Store requires the first target envelope payload hash to equal the plan anchor on both write and verification.
+- A successful synthetic plan contains only Fake readiness/identity; blocked Codex diagnostic state is never mixed into it. Task 4's semantic-plan builder must reject a backend identity model that differs from the request before Store creation.
+
+### Fake scenario snapshot and consumption
+
+- Deep-copy/freeze every scripted attempt at Fake construction so later caller mutation cannot change events/templates after semantic identity is computed.
+- Expose a read-only consumption state with total, consumed, and remaining attempt counts. Fake readiness/semantic identity is valid for orchestration only while pristine; a partially consumed or reused backend is blocked before target seal/Store creation.
+- Semantic identity includes total attempt count, expected role sequence, and the same public run-manifest version used by accepted manifests.
+- A successful run must end with `consumed_attempts == expected reviewer dispatches + raw candidate verifier dispatches == total_attempts`. All-manual requires total/consumed/remaining all zero. Missing, skipped, or leftover scripts make the evaluation incomplete.
+
+### Completion accounting
+
+- Add `reviewer_execution_state=completed|not_applicable_no_reviewable_atoms`, `worker_dispatch_state=synthetic_attempts_accepted|not_applicable_no_reviewable_atoms`, and nullable `reviewer_artifact_hash`. Enforce both branches as bidirectional invariants:
+
+  ```text
+  reviewer_execution_state=completed
+    iff reviewed_atoms > 0
+    iff reviewer_artifact_hash is SHA-256
+    iff worker_dispatch_state=synthetic_attempts_accepted
+
+  reviewer_execution_state=not_applicable_no_reviewable_atoms
+    iff reviewed_atoms=0
+    iff manual_atoms=total_atoms
+    iff reviewer_artifact_hash=null
+    iff worker_dispatch_state=not_applicable_no_reviewable_atoms
+  ```
+
+- The all-manual branch requires zero raw candidates, verifiers, every verifier disposition, canonical findings, and accepted worker hashes. It requires `adapter_manual_items >= 1` and exact manual-item hashes for adapter **dispositions**; one disposition may cover multiple atoms, so disposition count is not atom count.
+- The completed branch requires the reviewer result envelope hash in accepted hashes and exact reviewer/verifier accounting. Split raw confirmed dispositions from merged output and enforce:
+
+  ```text
+  raw_candidates == verifier_results
+  raw_candidates == confirmed_candidate_dispositions
+                    + false_positive + pre_existing + needs_manual_review
+  len(canonical_finding_hashes) == canonical_findings
+  confirmed_candidate_dispositions == 0 iff canonical_findings == 0
+  confirmed_candidate_dispositions > 0
+    implies 1 <= canonical_findings <= confirmed_candidate_dispositions
+  ```
+
+  Every confirmed instance belongs to exactly one canonical root-cause group; non-confirmed dispositions belong to none. `canonical_findings` equals the group count.
+- Verdict equations are exact: `clean` requires zero confirmed dispositions and zero manual items; `findings` requires at least one canonical finding and zero manual items; `manual_review_required` requires at least one adapter or verifier manual item.
+- Each canonical finding hash covers the root-cause payload, merged final severity, sorted confirmed instance references including verifier result envelope hashes, and deterministic sorted/unique merges of proof, provenance, best-fix, refactor-judgment, and residual-risk values. It cannot hash only the severity-free root key.
+- Manual hashes are an exact sorted domain-separated set:
+
+  ```text
+  len(manual_item_hashes) == adapter_manual_items + needs_manual_review
+  ```
+
+  An adapter manual-item hash binds the complete manual disposition. A verifier manual-item hash binds candidate hash, duplicate ordinal, and verifier result envelope hash, so duplicate needs-manual instances remain distinct. Arbitrary, duplicate, missing, or cross-domain hashes reject completion.
+- `accepted_artifact_hashes` is exactly the reviewer/verifier **result envelope hashes**. It excludes packets, adapter artifacts, completion itself, reports, and diagnostics; all-manual uses an empty list.
+- Define two exact assurance tuples. Every persisted accepted reviewer/verifier manifest must exactly match the synthetic-attempt tuple; any missing, different, or more optimistic value makes the run incomplete. Both contain the exact worker machine/display pair. The synthetic-attempt tuple uses `accepted_tool_calls=none_observed`, `telemetry_scope=observed_events_only`, and `context_lineage=fresh_process_inferred`. The all-manual tuple instead uses `not_applicable_no_dispatch` for all three. Both fix worker environment, filesystem-write mitigation, and nested web search to `not_verified`; neither may borrow Codex preflight or launch-policy evidence.
+
+### Artifact producers
+
+- Replace the worker-only producer object with a strict tagged union:
+  - `producer_kind=worker_attempt` plus task ID, attempt hash, thread ID, process-launch ID, and sorted unique input hashes;
+  - `producer_kind=adapter_operation` plus a nonempty stable operation ID and sorted unique input hashes.
+- Adapter packets, completion, and diagnostics use `adapter_operation`; reviewer/verifier results use `worker_attempt`. Sentinel thread/process values are forbidden.
+- Reviewer/verifier result artifact payloads have the exact wrapper `{result, adapter_manifest}`. The envelope hash therefore binds both worker output and adapter evidence.
+- Store owns artifact-type/producer enforcement for the slice's exact registry. Adapter types are `target_packet`, `reviewer_packet`, `verifier_packet`, `evaluation_completion`, `diagnostic`, `evaluation_report`, and `diagnostic_report`; worker types are only `reviewer_result` and `verifier_result`. For worker result artifacts it cross-checks producer, wrapper manifest, result, task/packet/attempt/thread/process fields, run-manifest version, assurance tuple, and input hashes. Worker `input_hashes` are exactly the sorted task and packet hashes; bound attempt/output hash remains manifest evidence, not an input. Adapter artifact types reject worker producers and worker result types reject adapter producers.
+- Store independently validates every diagnostic payload against the shared post-Store contract. Its producer operation is exactly `adapter-evaluation-diagnostic`, its inputs are exactly the sorted envelope hashes of every preceding semantic artifact, and its single phase-bound reason must match the actual lifecycle position represented by that prefix (target-only, pending reviewer/verifier, coverage failure, or fully matched completion gate). Missing, foreign, partial, or stage-inconsistent prefixes reject both write and readback.
+- Completion gating occurs only after `store.verify()`, then re-reads persisted reviewer/verifier wrappers from the Store and derives assurance, counts, groups, and accepted hashes from those canonical artifacts. It may not trust the in-memory `WorkerAttempt`. Manifest omission, mismatch, wrong producer kind, or post-persistence tampering fails closed.
+
+### Independent-review corrections
+
+The first Task 3.5 implementation was independently rejected before Task 4. These
+corrections are part of Task 3.5 acceptance and supersede any looser wording above.
+
+- Add required `verifier_disposition_records`, one exact record for every raw
+  verifier result: candidate hash, zero-based duplicate ordinal, verifier result
+  envelope hash, actual disposition, and `final_severity` (`Important|Nit` iff
+  confirmed, otherwise explicit `null`). Records are sorted by candidate hash,
+  ordinal, and envelope hash; candidate/ordinal pairs and envelope hashes are
+  globally unique; ordinals for each candidate hash are exactly `0..n-1`.
+- Counts for all four dispositions are exact projections of those records. No
+  verifier may remain in an untyped bucket. Confirmed/manual references must be
+  exact projections of the corresponding disposition records.
+- Add a pure `completion_projection` module shared by Store and Task 4. It owns
+  candidate hashing, deterministic reviewer/verifier task IDs, strict task-packet
+  records, and derivation of the complete completion payload from persisted target,
+  packet, and worker-result envelopes. Store compares a submitted completion byte-
+  semantically with this re-derived payload; Task 4 must not hand-assemble it.
+- Persist one strict target packet before any semantic work. Persist each complete
+  role task record before dispatch; the record binds task ID, role, packet and packet
+  hash, packaged prompt text, output schema, timeout, and recomputed task hash. Every
+  accepted worker result must resolve to exactly one matching role packet/task
+  record. Missing, orphan, extra, or cross-role packets/results reject completion.
+- The strict stored plan also carries `target_packet_payload_hash`, computed before
+  Store creation. The unique first target envelope must match this anchor exactly;
+  normalized/rehashed packet-only tampering therefore cannot retain the sealed plan.
+- Derive coverage and adapter manual records only from the unique persisted target
+  packet. Derive candidate hashes and ordinals from the persisted reviewer candidate
+  array. Derive every verifier disposition, canonical group, merged proof/fix/risk,
+  and Important retention only from persisted verifier wrappers. Completion producer
+  inputs are exactly all semantic source envelope hashes; accepted artifact hashes
+  remain exactly worker result envelope hashes.
+- `canonical_finding_records` and `manual_item_records` are sorted by their embedded
+  hashes. Reversing either array must fail, so one semantic outcome has one canonical
+  completion representation.
+- Store enforces artifact lifecycle from ledger order in both writes and `verify()`:
+  a success path has one completion followed by at most one evaluation report; a
+  failure path has one diagnostic followed by at most one diagnostic report; reports
+  require their terminal source; success and failure terminals are mutually exclusive;
+  no packet/result/semantic artifact follows either terminal.
+- The Fake/manifest/producer evidence validators reject the complete normalized
+  `not_applicable*` sentinel family, including `not_applicable_no_dispatch`, for task,
+  thread, and process evidence. The frozen Fake snapshot rejects `|=` mutation.
+- A pre-dispatch Codex diagnostic records
+  `telemetry_scope=not_applicable_no_dispatch`. CLI binary identity scope is
+  `unexecuted_nofollow_file_object` only after a successful held-file-object hash;
+  inspection failure reports `unavailable` in readiness, semantic identity, and the
+  blocked diagnostic.
+
+### Second re-review corrections
+
+- Required-evidence sentinel recognition has one public contract helper shared by
+  backend and Store. It applies Unicode NFKC normalization, `casefold()`, removes
+  every non-alphanumeric character, rejects the exact collapsed sentinel vocabulary,
+  and rejects every collapsed value beginning `notapplicable`. Delimiter-free forms
+  such as `NotApplicableNoDispatch` and `notapplicable_no_dispatch` therefore fail in
+  Fake readiness/run, persisted manifests, and matched Store producers.
+- A strict target packet contains exactly one `path_metadata` atom per changed path.
+  Duplicate metadata atoms reject before any overwrite; every metadata atom exactly
+  equals its `changed_path_metadata` record. Every `text_hunk` header is a nonempty
+  normalized numeric Git range of the form
+  `@@ -<start>[,<count>] +<start>[,<count>] @@`. Validation does not attempt to parse
+  or reconstruct the complete redacted diff.
+- Public completion-projection builders and validators explicitly validate plan,
+  mapping, and exact envelope shapes before field access. Representative malformed
+  caller input raises `ContractError`; the API does not broadly catch `KeyError` or
+  `AttributeError`, so internal programming faults remain visible.
+
+### TDD sequence
+
+1. Test exact semantic-plan fields/constants, exact resource-hash algorithms, public manifest metadata, review-identity binding, and session-field exclusion.
+2. Test Fake deep snapshot/pristine state, partially consumed/reused rejection, total/consumed/remaining accounting, and extra/unused attempts.
+3. Mutation-test every completed/all-manual iff, nullable reviewer hash, zero dispatch/accepted hashes, disposition-vs-atom accounting, domain-separated adapter/verifier manual hashes (including duplicate needs-manual and mixed sources), exact assurance tuples, and rejection of cross-spliced states.
+4. Test complete raw/canonical equations, one-group-per-confirmed-instance membership, deterministic merged proof/provenance/fix/risk fields, Important retention, verdict equations, and canonical hash coverage.
+5. Test both producer variants and exact artifact-type registry; reject missing/extra wrapper/manifest fields, fake sentinels, secret metadata, wrong producer kind, producer/manifest/result mismatch, input-hash mismatch, and persisted tampering.
+6. Mutation-test the independent-review corrections: confirmed Important cannot be
+   rewritten as false-positive, pre-existing, Nit, or clean; duplicate ordinals and
+   result-envelope cross-splices fail; missing/orphan packets fail; adapter manual
+   records bind the target packet; record order is canonical; and success/failure
+   terminal paths are exclusive and single-report.
+7. Run focused backend/contract/core tests and capture RED, implement the smallest contract extension, run the full suite, and commit `Reconcile V2 orchestration contracts`.
+8. Generate a review package and obtain an independent backend/contract/store review before Task 4. Fix every Critical/Important finding and repeat the review before proceeding.
+
+## Task 4: Orchestrate reviewer and fresh verifier accounting
+
+**Files:**
+
+- Create: `src/local_ultra_review/orchestrator.py`
+- Create: `tests/test_v2_orchestrator.py`
+
+### Required interfaces
+
+```python
+@dataclass(frozen=True)
+class EvaluationRequest:
+    repo: Path
+    base: str
+    head: str
+    model: str
+    session_root: Path
+
+@dataclass(frozen=True)
+class EvaluationOutcome:
+    evaluation_completion: dict | None
+    diagnostic: dict | None
+    recovery_reason_codes: tuple[str, ...]
+    evaluation_report_path: Path | None
+    diagnostic_path: Path | None
+    recovery_diagnostic_path: Path | None
+
+def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOutcome: ...
+```
+
+### Task 4 diagnostic contract
+
+Task 4 owns a public `evaluation-diagnostic-v1` validator and two exact,
+non-authoritative payload variants. Neither variant contains
+`simulated_review_verdict`, finding/candidate counts, exception text, or target-result
+claims.
+
+- A `pre_session_blocked` diagnostic has exact fields for schema/diagnostic version,
+  `status=blocked`, `authority=non_authoritative_diagnostic`, false authority/release
+  booleans, `failure_phase=backend_readiness|backend_binding`, sorted allowlisted
+  reason codes, four false phase-state booleans, and one deep-copied, safe, validated
+  exact Fake-or-Codex readiness snapshot. It has no session/review/target identity.
+- A `post_store_incomplete` diagnostic has exact fields for schema/diagnostic version,
+  `status=incomplete`, `profile=evaluation_slice_v2`,
+  `authority=non_authoritative_diagnostic`, false authority/release/completion state,
+  `protocol_completeness=incomplete`, `result_state=not_available`,
+  `target_execution=not_requested`, a bounded failure phase, sorted allowlisted reason
+  codes, and the exact conservative guarded limitation state. Its artifact envelope,
+  not the payload, binds session and review identity.
+- Post-Store reason codes are phase-bound, not merely globally allowlisted:
+  reviewer/verifier dispatch accepts only unavailable/exhausted dispatch reasons;
+  reviewer acceptance additionally owns coverage failure; verifier acceptance owns
+  only attempt/semantic rejection; and the completion gate owns only leftover,
+  accounting-mismatch, or projection-rejection reasons. Impossible phase/reason
+  pairs are invalid diagnostics.
+- `EvaluationOutcome` is an exclusive three-way result: canonical completion,
+  diagnostic, or a nonempty sorted unique integrity-recovery code tuple. Task 4 always
+  leaves all materialized path fields `None`.
+
+Public diagnostic/outcome validation checks element types before uniqueness/sorting,
+so malformed unhashable arrays fail as `ValueError`; malformed backend readiness is
+then normalized to `WorkerProtocolError` at the orchestration boundary. A Codex
+qualification state of `not_evaluable_without_object_bound_version_probe` is valid
+only with `cli_binary_identity_scope=unexecuted_nofollow_file_object`.
+
+Normal worker/schema/coverage/attempt-accounting failures are mapped to stable reason
+codes and never include exception text. A post-Store normal failure first verifies the
+Store, writes one diagnostic whose producer inputs are exactly every successfully
+committed semantic-prefix envelope hash, verifies again, and returns canonical
+readback. Store verification/readback failure or any artifact/terminal commit whose
+durability is uncertain returns only a stable integrity code and performs no further
+Store read, write, or hash. A target-packet commit failure cannot write a diagnostic
+as the first artifact.
+
+The ready orchestration path capability-checks a callable `consumption_state()`; the
+live `WorkerBackend` protocol is not widened. A missing synthetic consumption oracle
+blocks before target seal/Store. Request/backend model mismatch is likewise a
+pre-session diagnostic. Invalid request/target inputs remain input errors for Task 6
+rather than fabricated evaluation outcomes.
+
+Model and consumption capabilities are checked for static presence before access:
+true absence maps to the stable pre-session binding diagnostic, while an
+`AttributeError` raised inside a present descriptor is a programming failure and
+propagates. At the final consumption gate, only known oracle contract failures
+(`WorkerUnavailable` or `WorkerProtocolError`, alongside the existing validation
+failures) map to `scripted_attempt_accounting_mismatch`; unrelated runtime or
+attribute failures propagate.
+
+- `evaluate` is the only phase-transition owner: backend readiness -> model/consumption binding -> one semantic-identity capture -> seal target -> create semantic plan/store -> packet -> reviewer -> verifier(s) -> synthetic evaluation gate. It must not call V1 scripts.
+- A backend with `readiness.ready != true` performs no target seal, Store creation, semantic invocation, semantic plan, review identity, or completion. Task 4 returns only a strict non-authoritative pre-session diagnostic object; it materializes no external file. A blocked Codex diagnostic includes `ready=false`, `diagnostic_ready=false`, `cli_version=null`, `version_probe_executed=false`, `object_bound_executable_binding=unavailable`, `live_dispatch_authorized=false`, `semantic_subprocess_launched=false`, and no synthetic verdict. A matching record has exactly the inventory-oracle and object-bound-version blockers; independently invalid/expired/mismatched records may add their corresponding qualification blocker. A passing environment canary changes none of these fixed states/blockers.
+- Codex environment-preflight evidence is stored as a private deep copy. Both `preflight_worker_environment()` and every `readiness()` call return fresh deep copies, so caller mutation cannot rewrite later readiness or evaluation truth.
+- For a ready pristine Fake backend, reject any request/backend model or consumption-capability mismatch, then capture and validate `semantic_identity()` exactly once **before target sealing**. This preserves the truthful pre-session `backend_semantic_identity_invalid` branch (`target_sealed=false`). Its reviewer template contains only the public whole-node `{{REVIEWED_ATOM_IDS}}` sentinel, never literal sealed atom IDs. After target sealing, build and validate the exact Task 3.5 semantic plan from the already-captured readiness/identity snapshots, then derive review identity from target identity plus the complete semantic plan. No task ID is derived before this identity exists. Worker packets exclude session ID/path/time and plan-integrity hash.
+- Reviewer task ID is a stable hash of review identity plus role. Reviewer packet hash binds the complete packet. At Fake run time the reviewer coverage sentinel binds structurally from that packet to the exact sealed **reviewable** atom array; the accepted result must equal the array exactly, with no missing, unknown, reordered, or literal-unbound atoms.
+- More precisely, reviewer coverage must equal the reviewable atom set exactly, while adapter manual dispositions must equal the manual atom set exactly. The two sets must be disjoint and their union must equal every changed-path/hunk atom.
+- Before hashing or persistence, each candidate is schema-valid, worker-authority-free, safe-sink scanned, and bound to a reviewable atom in the sealed target. A text candidate line must fall inside the normalized `+new` range of a reviewable hunk; a zero-count deletion hunk uses the representable anchor `max(1, new_start)`; a metadata-only reviewable path uses line `1`; outside, manual-only, and out-of-range locations reject the reviewer result. Candidate hash covers the strict candidate payload. Give each repeated candidate hash a zero-based `duplicate_ordinal`; a verifier task/packet is created for every raw instance. Its task ID is a stable hash of review identity, candidate hash, duplicate ordinal, and `verifier`.
+- Reviewer and verifier must have distinct task IDs, process launch IDs, and thread IDs. Verifier threads must also be pairwise distinct. Reuse/missing evidence rejects the affected result and makes the run incomplete.
+- Each raw candidate has exactly one terminal verifier disposition. Raw candidate, verifier, and raw terminal-disposition counts reconcile exactly; merged canonical-finding count is tracked separately.
+- Exact duplicate candidates may merge only after every instance is verified. The canonical root-cause key is the canonical candidate payload with `severity` omitted; no semantic/model dedupe is allowed. Raw confirmed dispositions remain counted separately from merged canonical findings, and final severity is monotonic (`Important` wins).
+- If the sealed reviewable atom set is empty, do not synthesize an empty reviewer payload. Create the Store, persist the adapter-authored `target_packet` with manual dispositions, dispatch no worker, and produce only the schema-valid all-manual synthetic completion defined in Task 3.5.
+- Material redaction/manual content, uncovered atom, worker failure, schema error, observed tool call, thread/process reuse, pending candidate, or integrity failure can never become a simulated clean verdict.
+- Worker-authored finding/evidence strings are target-domain data, not adapter assurance. Render them only in provenance-labelled `synthetic_*` inline fields under a prominent untrusted-worker-text disclaimer; escape line/control characters so data cannot leave that field. Adapter claim scanning ignores only those exact structured values and continues to reject false-clean or hard-assurance claims in adapter-owned prose/assurance. Model, scenario, task, process, and thread identities that are validated but not rendered are not scanned as report claims. The complete canonical evaluation report is rendered and validated before committing `evaluation_completion`, so deterministic renderer rejection cannot leave a terminal completion without its report path.
+- A successful fake run creates a schema-valid `evaluation_completion` with `authority=synthetic_evaluation`, `authoritative_review=false`, `protocol_completeness=complete`, and a `simulated_review_verdict`. It is an orchestration evaluation, not a code-review completion.
+- A normal failure after session creation calls `store.verify()` first, then writes a sanitized adapter-authored diagnostic artifact and returns its strict payload; it writes no completion or materialized view. Already committed immutable packets/results remain. An integrity failure writes nothing through the damaged Store, hashes no damaged content, and returns only stable `recovery_reason_codes` in memory.
+- Gate calls `store.verify()`, re-reads canonical worker result wrappers, reconciles expected reviewer/verifier dispatch count, and **before constructing completion** requires `total_attempts == consumed_attempts == expected_attempts` with `remaining_attempts == 0` (all-manual requires all four values zero). No `backend.run()` call is allowed after this check. Only then may it derive completion from persisted wrappers plus adapter-owned target/manual state, record exact accepted result envelope hashes, validate/commit completion through an adapter producer, and verify the Store again. No code path in this slice can create a canonical live-review completion.
+
+### TDD sequence
+
+1. Test a valid empty fake reviewer result with exact reviewable coverage and no manual atoms produces `protocol_completeness=complete`, `simulated_review_verdict=clean`, and `authoritative_review=false`—never a canonical review result. Separately test an all-manual target dispatches no reviewer/verifier and completes only as synthetic manual-review-required.
+2. Preserve Fake's earlier fail-closed scenario prevalidation: malformed/partial JSON,
+   observed-tool events, and hard-coded identity misuse produce a pre-session
+   `fake_backend_scenario_invalid` diagnostic with no Store. Test a schema-valid
+   prompt-only/missing-fields attempt and cross-attempt thread/process reuse as
+   post-Store `worker_attempt_rejected`; use a deliberately nonconforming backend
+   wrapper to exercise orchestrator-side packet/result mismatch rejection. Partial or
+   unknown coverage, a candidate without verifier, and every post-Store acceptance
+   failure remain incomplete/not-available.
+3. Test one confirmed candidate flows with all proof fields; false positive and pre-existing are accounted but not findings; adapter/manual or verifier needs-manual yields simulated manual-review-required.
+4. Test repeated candidate instances receive distinct ordinal-bound verifier task/packet IDs, all are verified before order-independent canonical merge, every confirmed instance appears once with sorted persisted verifier references/proof fields, and Important severity wins without collapsing raw disposition counts.
+5. Test candidate/verifier/raw-disposition/canonical-finding counts, exact domain-separated adapter/verifier manual hashes, and accepted result envelope hashes reconcile; packet/completion/report hashes are excluded; tampering between worker and gate blocks.
+6. Test blocked Codex exact readiness short-circuits before target seal/Store and returns only a non-authoritative pre-session diagnostic object. Test normal post-Store diagnostic artifact versus in-memory integrity recovery reason codes separately; Task 4 creates no materialized diagnostic/recovery path.
+7. Test reused/partially consumed Fake backends block before Store, model mismatch blocks before Store, and missing/extra scripted attempts make post-Store evaluation incomplete. Leftover/unused scripts must produce a normal diagnostic artifact and leave **no** `evaluation_completion` artifact.
+8. Run `python -m unittest tests.test_v2_orchestrator -v`; capture RED.
+9. Implement the minimal orchestration/gate path.
+10. Run focused and full suites.
+11. Commit: `Gate V2 reviewer and verifier work`.
+
+## Task 5: Render non-authoritative reports without adapter-owned false-clean claims
+
+**Files:**
+
+- Create: `src/local_ultra_review/render.py`
+- Modify: `src/local_ultra_review/orchestrator.py`
+- Modify: `src/local_ultra_review/store.py`
+- Extend: `tests/test_v2_orchestrator.py`
+- Extend: `tests/test_v2_core.py`
+
+### Required interfaces
+
+```python
+def render_evaluation_report(*, plan: dict, completion: dict, artifacts: list[dict]) -> str: ...
+def render_diagnostic_report(*, plan: dict | None, state: str, reasons: list[str],
+                             assurance_state: dict) -> str: ...
+def write_recovery_diagnostic(*, sibling_path: Path, reason_codes: list[str]) -> Path: ...
+```
+
+- `artifacts` in `render_evaluation_report` is exactly the canonical Store readback of
+  accepted `reviewer_result` and `verifier_result` envelopes (empty for an all-manual
+  completion). The renderer verifies each envelope and requires its exact hash set to
+  equal `completion.accepted_artifact_hashes`; it never consumes in-memory attempts.
+- Evaluation rendering is allowed only after store verification and a schema-valid synthetic evaluation-completion artifact.
+- Task 5 is the sole owner of materialized diagnostic/recovery files. It consumes Task 4's structured pre-session diagnostic, canonical post-Store diagnostic artifact, or in-memory integrity reason codes; Task 4 contains no duplicate external-file writer.
+- The first heading and front matter say **Synthetic protocol evaluation — not a code-review result**, `authority=synthetic_evaluation`, `authoritative_review=false`, `profile=evaluation_slice_v2`, and `release_ready=false`. It states that even a simulated `clean` fixture makes no claim that the target is clean.
+- The exact complete-review banner is forbidden in fake/evaluation output. `evaluation-report.md` may show `simulated_review_verdict`, confirmed fixture findings, and manual fixture items only when every label remains explicitly synthetic.
+- Diagnostic rendering states the actual incomplete/blocked state, reason codes, and current guarded limitations (`residual_tool_surface=unknown`, `worker_child_environment=not_verified`). It must not contain false-clean phrases as outcome claims.
+- Renderer rejects missing/mismatched synthetic authority, adapter-owned selected-profile positive hard claims, completion/artifact hash mismatch, unsafe sensitive bytes, missing worker-text provenance markers, or any attempt to materialize fake output as `report.md`. Target-domain worker quotes remain visibly synthetic/untrusted rather than being interpreted as adapter claims.
+- A canonical report artifact has the exact payload
+  `{report_contract_version, document_kind, media_type, content_sha256, content}`.
+  `document_kind` must match `evaluation_report` or `diagnostic_report`, `media_type`
+  is fixed to UTF-8 Markdown, and `content_sha256` is the SHA-256 of the exact UTF-8
+  materialized bytes. Store verification validates this payload contract and then
+  deterministically re-renders the expected bytes from the canonical terminal plus
+  canonical reviewer/verifier envelopes; payload equality is exact. Truthful fixed
+  markers and visible Markdown/HTML-equivalent claim normalization are defense in
+  depth, not the authority boundary. An arbitrary adapter-authored dictionary is not
+  a valid report artifact.
+- For evaluation and normal post-Store diagnostic rendering, first persist rendered bytes as a content-addressed `evaluation_report` or `diagnostic_report` artifact and commit its ledger event. Verify the Store, then atomically materialize the non-authoritative view as a sibling `evaluation-report.md` or `diagnostic.md` **outside** the canonical session directory; the Store root continues to contain only `plan.json`, `ledger.jsonl`, and `artifacts/`.
+- A pre-session blocked diagnostic has no Store by design. Validate the strict Task 4 diagnostic object, then atomically materialize a sibling `diagnostic.md` marked non-authoritative/pre-session with no target or result claim. A materialized view is never the authority.
+- `write_recovery_diagnostic` is used only after integrity failure, writes outside the session directory with staging+fsync+atomic rename, contains only stable reason codes (no unsafe-payload digest), makes no target/result claims, and labels itself non-authoritative because canonical state could not be verified.
+- Materialization has one implementation-owned path. It accepts only the exact sibling
+  basenames `evaluation-report.md`, `diagnostic.md`, or `recovery-diagnostic.md`, so
+  `report.md` is structurally unreachable. It walks/creates the absolute parent one
+  no-follow component at a time, retains the final directory descriptor, and uses
+  `dir_fd` operations for the mode-0600 staging file, destination stat, atomic replace,
+  parent fsync, and nonblocking no-follow readback. Parent inode identity is checked
+  before publication and after readback.
+  Replacing a prior materialized view is allowed because the view is explicitly
+  non-authoritative; a symlink/non-regular destination or any failed/uncertain write
+  raises a sanitized materialization error and never returns a path.
+- `EvaluationOutcome` remains an exclusive three-way channel, and Task 5 makes its
+  paths exact: completion has only an absolute `evaluation-report.md`, diagnostic has
+  only an absolute `diagnostic.md`, and integrity recovery has only an absolute
+  `recovery-diagnostic.md`. No public Task 5 outcome may claim a channel while leaving
+  its corresponding materialized path absent.
+
+### TDD sequence
+
+1. Add snapshot-like assertions for synthetic clean/findings/manual fixture evaluations, normal incomplete/blocked diagnostics, and integrity recovery diagnostics.
+2. Prove fake output can never create `report.md`, the exact complete-review banner, `authoritative_review=true`, or an unqualified adapter claim that the target is clean. Prove prompt-only, failed worker, bad adapter authority/assurance wording, missing worker-text provenance, manual item, unsafe output, and tampered inputs fail closed; prove target-domain claim-like phrases remain quoted data.
+3. Assert every evaluation report has `release_ready=false`, `authority=synthetic_evaluation`, a prominent non-review disclaimer, and separate `target_execution=not_requested` inside `assurance_contract_under_test`. All-manual rendering must say no worker was dispatched; it may not say zero tool calls were observed.
+4. Run the focused orchestrator tests; capture RED.
+5. Implement rendering and wire it after the gate.
+6. Run focused and full suites.
+7. Commit: `Render truthful guarded V2 reports`.
+
+## Task 6: Add the evaluation CLI and end-to-end proof
+
+**Files:**
+
+- Modify: `src/local_ultra_review/orchestrator.py`
+- Modify: `src/local_ultra_review/backend.py`
+- Modify: `src/local_ultra_review/render.py`
+- Modify: `src/local_ultra_review/git_target.py`
+- Extend: `tests/test_v2_core.py`
+- Create: `tests/test_v2_e2e.py`
+- Create: `tests/test_v2_live.py`
+
+### CLI
+
+```text
+local-ultra-review-v2 evaluate \
+  --repo <path> \
+  --base <ref> \
+  --head <ref> \
+  --model <explicit-model-id> \
+  --session-root <new-path> \
+  --codex-path <path> \
+  --qualification-record <adapter-owned-diagnostic-json>
+```
+
+- Every listed argument is required. There is no implicit HEAD/default branch/model/session. The current Codex path exits with a blocked diagnostic before semantic dispatch because the complete host inventory oracle is unavailable.
+- Only subcommand is `evaluate`. Reject overlay, PR, posting, check, resume, mode, and network flags rather than ignoring them.
+- Exit codes: `0` synthetic protocol evaluation completed (not a review verdict), `2` input/contract error before session, `3` incomplete/blocked diagnostic, `4` integrity invariant failure.
+- Print only the absolute `evaluation-report.md`, `diagnostic.md`, or sibling recovery-diagnostic path plus a one-line authority/status label; semantic details live in artifacts.
+
+### End-to-end tests
+
+1. Temporary two-commit repo plus `FakeBackend`, valid empty reviewer envelope: synthetic protocol completion with simulated clean fixture, prominent non-review disclaimer, no complete-review banner, no `report.md`, and all hashes verified.
+2. Seeded regression plus fake reviewer and fresh verifier: one synthetic confirmed Important fixture finding appears with all proof fields and remains non-authoritative.
+3. V1 false-clean shape: backend only prepares a prompt/no result. Assert exit/status incomplete, only `diagnostic.md`, no `report.md`, no target-clean claim.
+4. Mixed text+binary, mode-only, sensitive path, inline provider-shaped secret, observed tool event, malformed output, reused thread, candidate without verifier, manual item, and artifact tamper each produce their exact reviewed/manual/incomplete/integrity outcome. Assert canary bytes are absent from every surviving file.
+5. CLI argument and exit-code tests prove the Codex adapter returns blocked/diagnostic with zero fake semantic executable calls; separately test the trusted environment canary and exact hypothetical flags.
+6. `tests/test_v2_live.py` is an opt-in **diagnostic-only** test when `LOCAL_ULTRA_REVIEW_RUN_LIVE_CODEX_DIAGNOSTIC=1` and explicit paths/model/record are supplied. It verifies the unexecuted no-follow file-object hash, `version_probe_executed=false`, both fixed blockers, optional independent environment preflight, and zero semantic requests. It must never execute `codex --version` or issue a live semantic request in this slice.
+7. TDD order is mandatory: write all Task 6 CLI/E2E/install tests first; run `python -m unittest tests.test_v2_e2e -v` and capture the expected RED; implement the CLI/materialized-view/install support; then rerun focused GREEN and the full suite.
+8. Build a wheel to a temporary directory and also exercise an editable install, each in a fresh temporary venv with `uv`; change cwd outside the checkout and prove the console command and packaged schemas/prompts resolve in both modes. Then run:
+
+   ```bash
+   python -m unittest tests.test_v2_e2e -v
+   python -m unittest discover -s tests -v
+   /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 \
+     /Users/kiedis/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
+   ```
+
+   The V2 suite must pass. The final validator is expected to remain RED because V1 `SKILL.md` metadata promotion is explicitly deferred; record the exact failure as known deferred work, not as a V2 test failure.
+9. Confirm `git diff 18b3dff..HEAD -- SKILL.md README.md agents/openai.yaml config scripts prompts schemas` is empty; all new V2 resources live under the package.
+10. Commit: `Prove the guarded V2 evaluation slice`.
+
+## Final Verification and Review
+
+After all seven task reviews (including Task 3.5) approve:
+
+1. Run the entire isolated-environment suite with Python 3.11+ and `jsonschema>=4.20,<5`.
+2. Run an opt-in fake-Codex smoke exercising exact hypothetical argv/environment materialization without executing a semantic command or version probe.
+3. Run only the live Codex **diagnostic** smoke when explicitly enabled. Expected result is `blocked/not_available` with zero semantic dispatch because the canonical inventory oracle is not implemented; do not weaken the gate.
+4. Verify no existing V1 file changed and no output/session artifact is tracked.
+5. Use `superpowers:requesting-code-review` for a whole-branch review of merge-base through HEAD. Fix every Critical/Important finding and re-review.
+6. Use `superpowers:finishing-a-development-branch` to present the completed evaluation slice. Do not merge, publish, install, or promote it without separate user authorization.
+
+## Slice Acceptance
+
+The slice is complete only when:
+
+- deterministic prompt-only/no-result input cannot render a synthetic success or any target-clean claim;
+- valid structured empty fake review plus exact coverage can complete the synthetic protocol evaluation, but creates only `evaluation-report.md`, never the complete-review banner or canonical `report.md`;
+- every candidate has one procedurally separate verifier or the run is incomplete;
+- every duplicate candidate instance has a distinct ordinal-bound verifier identity, while raw dispositions and merged canonical findings reconcile separately;
+- every accepted worker result persists its adapter manifest in the canonical wrapper, Store verification reconciles producer/manifest/result evidence, and completion is re-derived from persisted artifacts rather than in-memory attempts;
+- the Fake scenario is pristine at plan seal and consumes exactly the reviewer plus verifier attempt count with no leftover script;
+- every changed path/hunk belongs to the exact reviewed/manual partition; binary, mode-only, sensitive, and redacted material cannot disappear or yield a simulated clean result;
+- an all-manual target dispatches no worker, records no accepted worker hash, and completes only as a non-authoritative manual-review-required protocol evaluation;
+- known-sensitive canary bytes are absent from every accepted packet, event, artifact, report, diagnostic, recovery output, and materialized view;
+- observed tool events, schema/identity/integrity failures, and qualification/env-policy drift fail closed;
+- the fake backend proves the complete protocol end to end;
+- semantic plan and target identity are cryptographically bound to review identity, while session path/time/ID affect only plan integrity;
+- the guarded CLI backend hashes only an unexecuted no-follow file object, explicitly reports that object-bound version execution is unavailable, and blocks every live semantic dispatch in this slice, including when a record merely claims completeness;
+- V1 is byte-for-byte unchanged; and
+- every fake result is explicitly `authority=synthetic_evaluation`, `authoritative_review=false`, `evaluation_slice_v2`, and `release_ready=false`, not a promoted Local Ultra Review V2 release or a code-review verdict.

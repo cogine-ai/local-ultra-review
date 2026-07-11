@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:local-ultra-review:v2:reviewer-result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task_id",
+    "packet_hash",
+    "status",
+    "coverage",
+    "candidates"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "2.0-evaluation-slice"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^reviewer-.+"
+    },
+    "packet_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "status": {
+      "const": "completed"
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reviewed_atom_ids", "notes"],
+      "properties": {
+        "reviewed_atom_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^atom-.+"
+          }
+        },
+        "notes": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "severity",
+          "file",
+          "line",
+          "title",
+          "failure_scenario",
+          "evidence",
+          "why_diff"
+        ],
+        "properties": {
+          "severity": {
+            "enum": ["Important", "Nit"]
+          },
+          "file": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "failure_scenario": {
+            "type": "string",
+            "minLength": 1
+          },
+          "evidence": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "why_diff": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}
