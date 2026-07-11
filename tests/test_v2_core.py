@@ -2131,9 +2131,12 @@ class ArtifactStoreTests(unittest.TestCase):
             strict_target_packet(),
             adapter_producer("adapter-target-packet"),
         )
+        target_only_diagnostic = strict_post_store_diagnostic()
+        target_only_diagnostic["failure_phase"] = "reviewer_acceptance"
+        target_only_diagnostic["reason_codes"] = ["semantic_contract_rejected"]
         diagnostic = store.write_artifact(
             "diagnostic",
-            strict_post_store_diagnostic(),
+            target_only_diagnostic,
             adapter_producer(
                 "adapter-evaluation-diagnostic",
                 [target["envelope_hash"]],
@@ -2190,6 +2193,79 @@ class ArtifactStoreTests(unittest.TestCase):
             )
         self.assertEqual(store.read_artifacts("reviewer_result"), [])
 
+    def test_diagnostic_phase_must_match_the_actual_semantic_prefix(self) -> None:
+        def diagnostic(phase: str, reason: str) -> dict:
+            payload = strict_post_store_diagnostic()
+            payload["failure_phase"] = phase
+            payload["reason_codes"] = [reason]
+            return payload
+
+        target_only_temp, target_only, _session = self.make_store(total_attempts=1)
+        self.addCleanup(target_only_temp.cleanup)
+        target = target_only.write_artifact(
+            "target_packet",
+            strict_target_packet(),
+            adapter_producer("adapter-target-packet"),
+        )
+        with self.assertRaisesRegex(IntegrityError, "lifecycle stage"):
+            target_only.write_artifact(
+                "diagnostic",
+                diagnostic("completion_gate", "scripted_attempts_leftover"),
+                adapter_producer(
+                    "adapter-evaluation-diagnostic",
+                    [target["envelope_hash"]],
+                ),
+            )
+
+        pending_temp, pending, _session = self.make_store(total_attempts=1)
+        self.addCleanup(pending_temp.cleanup)
+        pending_target = pending.write_artifact(
+            "target_packet",
+            strict_target_packet(),
+            adapter_producer("adapter-target-packet"),
+        )
+        reviewer_record = build_reviewer_task_record(
+            plan=pending._plan,
+            target_packet=pending_target["payload"],
+            target_packet_payload_hash=pending_target["payload_hash"],
+            timeout_seconds=30,
+        )
+        reviewer_packet = pending.write_artifact(
+            "reviewer_packet",
+            reviewer_record,
+            adapter_producer("adapter-reviewer-packet"),
+        )
+        with self.assertRaisesRegex(IntegrityError, "lifecycle stage"):
+            pending.write_artifact(
+                "diagnostic",
+                diagnostic("completion_gate", "completion_projection_rejected"),
+                adapter_producer(
+                    "adapter-evaluation-diagnostic",
+                    [
+                        pending_target["envelope_hash"],
+                        reviewer_packet["envelope_hash"],
+                    ],
+                ),
+            )
+
+        matched_temp, matched, _session = self.make_store(total_attempts=1)
+        self.addCleanup(matched_temp.cleanup)
+        sources = write_store_evidence(matched, candidates=[], dispositions=[])
+        matched_prefix = [
+            envelope["envelope_hash"]
+            for group in sources
+            for envelope in ((group,) if isinstance(group, dict) else group)
+        ]
+        with self.assertRaisesRegex(IntegrityError, "lifecycle stage"):
+            matched.write_artifact(
+                "diagnostic",
+                diagnostic("reviewer_dispatch", "worker_unavailable"),
+                adapter_producer(
+                    "adapter-evaluation-diagnostic",
+                    matched_prefix,
+                ),
+            )
+
     def test_worker_producer_union_rejects_adapter_and_sentinel_evidence(self) -> None:
         with self.assertRaises(IntegrityError):
             store_module._validate_artifact_contract(
@@ -2245,6 +2321,9 @@ class ArtifactStoreTests(unittest.TestCase):
             lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("authority", "canonical_review"),
             lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("execution_backend", "codex_exec"),
             lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("accepted_tool_calls", "not_applicable_no_dispatch"),
+            lambda wrapper, producer_value: wrapper["result"]["coverage"].__setitem__(
+                "notes", "No issues in the sibling path."
+            ),
             lambda wrapper, producer_value: producer_value.__setitem__("input_hashes", ["d" * 64]),
         )
         for index, mutate in enumerate(mutations):

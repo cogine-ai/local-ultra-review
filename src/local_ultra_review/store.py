@@ -43,6 +43,7 @@ from .render import (
     render_diagnostic_report,
     render_evaluation_report,
     validate_report_artifact_payload,
+    validate_worker_render_content,
 )
 
 
@@ -319,7 +320,8 @@ def _validate_artifact_contract(
     try:
         validate_payload(schema_name, result)
         validate_run_manifest(manifest)
-    except (ContractError, WorkerProtocolError) as error:
+        validate_worker_render_content(result)
+    except (ContractError, RenderError, WorkerProtocolError) as error:
         raise IntegrityError(f"worker result wrapper contract failed: {error}") from error
     if not isinstance(result, dict) or not isinstance(manifest, dict):
         raise IntegrityError("worker result and manifest must be objects")
@@ -379,6 +381,86 @@ def _validate_result_task_lineage(
         if value in seen_execution[field]:
             raise IntegrityError(f"duplicate worker {field} across accepted results")
         seen_execution[field].add(value)
+
+
+def _validate_diagnostic_lifecycle_stage(
+    diagnostic: dict,
+    *,
+    target_packet: dict,
+    reviewer_packets: list[dict],
+    reviewer_result: dict | None,
+    pending: tuple[str, dict] | None,
+    verifier_instances: list[tuple[dict, str, int]],
+    verifier_index: int,
+) -> None:
+    """Require a diagnostic phase/reason to match the actual semantic prefix."""
+
+    reasons = diagnostic["reason_codes"]
+    reason = reasons[0] if len(reasons) == 1 else None
+    phase = diagnostic["failure_phase"]
+    dispatch_reasons = {"worker_unavailable", "scripted_attempts_exhausted"}
+    completion_reasons = {
+        "scripted_attempts_leftover",
+        "scripted_attempt_accounting_mismatch",
+        "completion_projection_rejected",
+    }
+
+    valid = False
+    if not target_packet["reviewable_atom_ids"]:
+        valid = (
+            not reviewer_packets
+            and reviewer_result is None
+            and pending is None
+            and not verifier_instances
+            and verifier_index == 0
+            and phase == "completion_gate"
+            and reason in completion_reasons
+        )
+    elif not reviewer_packets:
+        valid = (
+            reviewer_result is None
+            and pending is None
+            and phase == "reviewer_acceptance"
+            and reason == "semantic_contract_rejected"
+        )
+    elif reviewer_result is None:
+        valid = pending is not None and pending[0] == "reviewer" and (
+            (phase == "reviewer_dispatch" and reason in dispatch_reasons)
+            or (
+                phase == "reviewer_acceptance"
+                and reason
+                in {"worker_attempt_rejected", "semantic_contract_rejected"}
+            )
+        )
+    else:
+        coverage_matches = (
+            reviewer_result["coverage"]["reviewed_atom_ids"]
+            == target_packet["reviewable_atom_ids"]
+        )
+        if not coverage_matches:
+            valid = (
+                pending is None
+                and phase == "reviewer_acceptance"
+                and reason == "coverage_accounting_failed"
+            )
+        elif pending is not None:
+            valid = pending[0] == "verifier" and (
+                (phase == "verifier_dispatch" and reason in dispatch_reasons)
+                or (
+                    phase == "verifier_acceptance"
+                    and reason == "worker_attempt_rejected"
+                )
+            )
+        elif verifier_index < len(verifier_instances):
+            valid = (
+                phase == "verifier_acceptance"
+                and reason == "semantic_contract_rejected"
+            )
+        elif verifier_index == len(verifier_instances):
+            valid = phase == "completion_gate" and reason in completion_reasons
+
+    if not valid:
+        raise IntegrityError("diagnostic phase/reason does not match lifecycle stage")
 
 
 def _validate_session_sequence(plan: dict, envelopes: list[dict]) -> None:
@@ -473,6 +555,15 @@ def _validate_session_sequence(plan: dict, envelopes: list[dict]) -> None:
                 raise IntegrityError(
                     "diagnostic must bind every preceding semantic envelope exactly"
                 )
+            _validate_diagnostic_lifecycle_stage(
+                envelope["payload"],
+                target_packet=target_packet,
+                reviewer_packets=reviewer_packets,
+                reviewer_result=reviewer_result,
+                pending=pending,
+                verifier_instances=verifier_instances,
+                verifier_index=verifier_index,
+            )
             terminal = (artifact_type, envelope)
             continue
         if artifact_type == "evaluation_completion":
@@ -561,6 +652,8 @@ def _validate_session_sequence(plan: dict, envelopes: list[dict]) -> None:
         if artifact_type == "verifier_packet":
             if (
                 reviewer_result is None
+                or reviewer_result["coverage"]["reviewed_atom_ids"]
+                != target_packet["reviewable_atom_ids"]
                 or pending is not None
                 or verifier_index >= len(verifier_instances)
             ):

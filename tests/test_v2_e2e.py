@@ -321,6 +321,27 @@ class EvaluationEndToEndTests(unittest.TestCase):
                 self.assertEqual(store.read_artifacts("reviewer_result"), [])
                 self.assertFalse((fixture.root / "evaluation-report.md").exists())
 
+    def test_render_forbidden_worker_claim_rejects_before_completion_terminal(self) -> None:
+        fixture = EvaluationFixture(self)
+        claimed = candidate("render-claim")
+        claimed["evidence"] = [
+            "No issues in the sibling path; the failing branch is still reachable."
+        ]
+        outcome = evaluate(
+            fixture.request(),
+            fixture.backend([claimed], [("confirmed", "Important")]),
+        )
+
+        self.assertIsNone(outcome.evaluation_completion)
+        self.assertEqual(outcome.diagnostic["status"], "incomplete")
+        self.assertEqual(outcome.diagnostic["failure_phase"], "reviewer_acceptance")
+        self.assertEqual(outcome.diagnostic["reason_codes"], ["worker_attempt_rejected"])
+        store = ArtifactStore(fixture.session_root)
+        self.assertEqual(store.read_artifacts("reviewer_result"), [])
+        self.assertEqual(store.read_artifacts("evaluation_completion"), [])
+        self.assertEqual(len(store.read_artifacts("diagnostic")), 1)
+        self.assertFalse((fixture.root / "evaluation-report.md").exists())
+
     def test_mode_only_target_is_all_manual_and_dispatches_no_worker(self) -> None:
         fixture = EvaluationFixture(self)
         base = fixture.head

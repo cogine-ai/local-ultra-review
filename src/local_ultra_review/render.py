@@ -294,6 +294,13 @@ def _reject_claim_text(value: object) -> None:
             _raise_render("input contains a forbidden review or assurance claim")
 
 
+def validate_worker_render_content(value: object) -> None:
+    """Reject worker-authored text that cannot enter a truthful report."""
+
+    _safe(value, "worker render content")
+    _reject_claim_text(value)
+
+
 def _inline(value: object) -> str:
     text = str(value).replace("\r", "\\r").replace("\n", "\\n")
     longest = max((len(match.group(0)) for match in re.finditer(r"`+", text)), default=0)

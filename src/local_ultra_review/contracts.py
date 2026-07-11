@@ -330,7 +330,7 @@ def validate_post_store_diagnostic(value: object) -> None:
     reasons = value.get("reason_codes")
     if (
         not isinstance(reasons, list)
-        or not reasons
+        or len(reasons) != 1
         or any(not isinstance(reason, str) for reason in reasons)
         or reasons != sorted(set(reasons))
         or any(

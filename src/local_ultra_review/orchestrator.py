@@ -67,6 +67,7 @@ from .render import (
     materialize_non_authoritative_view,
     render_diagnostic_report,
     render_evaluation_report,
+    validate_worker_render_content,
     write_recovery_diagnostic,
 )
 from .store import ArtifactStore, IntegrityError
@@ -1167,6 +1168,17 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
                 semantic_prefix_hashes=semantic_prefix_hashes,
             )
         try:
+            validate_worker_render_content(reviewer_wrapper["result"])
+        except (KeyError, TypeError, RenderError):
+            return _normal_failure(
+                store,
+                plan=plan,
+                session_root=session_root,
+                phase="reviewer_acceptance",
+                reason_codes=["worker_attempt_rejected"],
+                semantic_prefix_hashes=semantic_prefix_hashes,
+            )
+        try:
             for candidate_payload in reviewer_wrapper["result"]["candidates"]:
                 validate_review_candidate_target(candidate_payload, target_packet)
         except (KeyError, TypeError, ContractError):
@@ -1289,6 +1301,17 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
                     semantic_prefix_hashes=semantic_prefix_hashes,
                 )
             except (WorkerProtocolError, ContractError, SensitiveMaterialError):
+                return _normal_failure(
+                    store,
+                    plan=plan,
+                    session_root=session_root,
+                    phase="verifier_acceptance",
+                    reason_codes=["worker_attempt_rejected"],
+                    semantic_prefix_hashes=semantic_prefix_hashes,
+                )
+            try:
+                validate_worker_render_content(verifier_wrapper["result"])
+            except (KeyError, TypeError, RenderError):
                 return _normal_failure(
                     store,
                     plan=plan,
