@@ -31,7 +31,8 @@ from .redaction import SensitiveMaterialError, assert_safe_sink
 
 
 PROTOCOL_VERSION = "v2-worker-protocol-1"
-FAKE_BACKEND_VERSION = "fake-backend-1"
+FAKE_BACKEND_VERSION = "fake-backend-2"
+REVIEWED_ATOM_IDS_PLACEHOLDER = "{{REVIEWED_ATOM_IDS}}"
 RUN_MANIFEST_VERSION = "run-manifest-v1"
 _CODEX_ADAPTER_VERSION = "codex-cli-guarded-1"
 _PLACEHOLDER = re.compile(rb"\{\{[^{}]*\}\}")
@@ -39,7 +40,9 @@ _ALLOWED_PLACEHOLDERS = {
     b"{{TASK_ID}}",
     b"{{PACKET_HASH}}",
     b"{{CANDIDATE_HASH}}",
+    REVIEWED_ATOM_IDS_PLACEHOLDER.encode("ascii"),
 }
+_STRICT_ATOM_ID = re.compile(r"atom-[0-9a-f]{64}")
 _USAGE_FIELDS = {
     "cached_input_tokens",
     "input_tokens",
@@ -386,27 +389,100 @@ def _validate_task(task: WorkerTask) -> None:
 
 
 def _bind_template(template: bytes, task: WorkerTask) -> bytes:
-    placeholders = set(_PLACEHOLDER.findall(template))
-    unknown = placeholders - _ALLOWED_PLACEHOLDERS
-    if unknown:
-        raise WorkerProtocolError("scripted attempt contains an unknown placeholder")
-
-    bindings = {
-        b"{{TASK_ID}}": task.task_id.encode("utf-8"),
-        b"{{PACKET_HASH}}": task.packet_hash.encode("ascii"),
-    }
-    if b"{{CANDIDATE_HASH}}" in placeholders:
+    payload = deepcopy(_validate_unbound_template(template, task.role))
+    payload["task_id"] = task.task_id
+    payload["packet_hash"] = task.packet_hash
+    if task.role == "verifier":
         candidate_hash = task.packet.get("candidate_hash")
-        if task.role != "verifier" or not isinstance(candidate_hash, str):
+        if not isinstance(candidate_hash, str):
             raise WorkerProtocolError("candidate placeholder has no sealed verifier binding")
-        bindings[b"{{CANDIDATE_HASH}}"] = candidate_hash.encode("ascii")
+        payload["candidate_hash"] = candidate_hash
+    elif _reviewed_atom_placeholder_is_bound_at_coverage(payload):
+        coverage = payload["coverage"]
+        assert isinstance(coverage, dict)
+        coverage["reviewed_atom_ids"] = _sealed_reviewer_atom_ids(task)
 
-    bound = template
-    for placeholder, replacement in bindings.items():
-        bound = bound.replace(placeholder, replacement)
-    if b"{{" in bound or b"}}" in bound:
-        raise WorkerProtocolError("scripted attempt contains an unresolved placeholder")
-    return bound
+    for text in _walk_identity_strings(payload):
+        if "{{" in text or "}}" in text:
+            raise WorkerProtocolError("scripted attempt contains an unresolved placeholder")
+    try:
+        return canonical_json_bytes(payload)
+    except ContractError as error:
+        raise WorkerProtocolError("scripted attempt binding is not canonical JSON") from error
+
+
+def _sealed_reviewer_atom_ids(task: WorkerTask) -> list[str]:
+    target_packet = task.packet.get("target_packet")
+    if not isinstance(target_packet, Mapping):
+        raise WorkerProtocolError("reviewer task has no sealed target packet")
+    atom_ids = target_packet.get("reviewable_atom_ids")
+    if (
+        not isinstance(atom_ids, list)
+        or not atom_ids
+        or any(
+            not isinstance(atom_id, str)
+            or _STRICT_ATOM_ID.fullmatch(atom_id) is None
+            for atom_id in atom_ids
+        )
+        or len(set(atom_ids)) != len(atom_ids)
+    ):
+        raise WorkerProtocolError("reviewer task has invalid sealed atom IDs")
+    return list(atom_ids)
+
+
+def _reviewed_atom_placeholder_is_bound_at_coverage(payload: object) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    coverage = payload.get("coverage")
+    return (
+        isinstance(coverage, Mapping)
+        and coverage.get("reviewed_atom_ids") == REVIEWED_ATOM_IDS_PLACEHOLDER
+    )
+
+
+def _validate_reviewed_atom_placeholder(
+    template: bytes, payload: Mapping[str, object], role: str
+) -> None:
+    marker_seen = False
+    decoded_occurrences = 0
+    for text in _walk_identity_strings(payload):
+        if "REVIEWED_ATOM_IDS" in text:
+            marker_seen = True
+        decoded_occurrences += text.count(REVIEWED_ATOM_IDS_PLACEHOLDER)
+    raw_occurrences = template.count(REVIEWED_ATOM_IDS_PLACEHOLDER.encode("ascii"))
+    if not marker_seen and raw_occurrences == 0:
+        return
+    if (
+        role != "reviewer"
+        or decoded_occurrences != 1
+        or raw_occurrences != 1
+        or not _reviewed_atom_placeholder_is_bound_at_coverage(payload)
+    ):
+        raise WorkerProtocolError(
+            "reviewed atom placeholder must be one literal whole reviewer coverage node"
+        )
+
+
+def _without_reviewed_atom_placeholder(payload: Mapping[str, object]) -> dict:
+    value = deepcopy(dict(payload))
+    if _reviewed_atom_placeholder_is_bound_at_coverage(value):
+        coverage = value["coverage"]
+        assert isinstance(coverage, dict)
+        coverage["reviewed_atom_ids"] = []
+    return value
+
+
+def _validate_no_unresolved_decoded_placeholder(
+    payload: Mapping[str, object], role: str
+) -> None:
+    allowed_values = {"{{TASK_ID}}", "{{PACKET_HASH}}"}
+    if role == "verifier":
+        allowed_values.add("{{CANDIDATE_HASH}}")
+    if role == "reviewer":
+        allowed_values.add(REVIEWED_ATOM_IDS_PLACEHOLDER)
+    for text in _walk_identity_strings(payload):
+        if ("{{" in text or "}}" in text) and text not in allowed_values:
+            raise WorkerProtocolError("scripted attempt contains an unresolved placeholder")
 
 
 def _validate_unbound_template(template: bytes, role: str) -> dict:
@@ -433,6 +509,8 @@ def _validate_unbound_template(template: bytes, role: str) -> dict:
             raise WorkerProtocolError(
                 f"scripted attempt {field} must use its unbound adapter placeholder"
             )
+    _validate_reviewed_atom_placeholder(template, payload, role)
+    _validate_no_unresolved_decoded_placeholder(payload, role)
     return payload
 
 
@@ -453,6 +531,10 @@ def _reject_generic_identity_shapes(value: object) -> None:
     for text in _walk_identity_strings(value):
         if text in {"{{TASK_ID}}", "{{PACKET_HASH}}", "{{CANDIDATE_HASH}}"}:
             continue
+        if "REVIEWED_ATOM_IDS" in text:
+            raise WorkerProtocolError(
+                "scripted attempt embeds reviewed atom binding material outside coverage"
+            )
         if _TASK_IDENTITY_SHAPE.search(text) or _HASH_IDENTITY_SHAPE.search(text):
             raise WorkerProtocolError(
                 "scripted attempt embeds a task or packet identity outside its placeholder"
@@ -534,7 +616,9 @@ def _validate_scripted_attempt_before_hash(attempt: object) -> ScriptedAttempt:
     if attempt.expected_role == "verifier":
         dedicated_fields.add("candidate_hash")
     _reject_generic_identity_shapes(
-        {key: child for key, child in payload.items() if key not in dedicated_fields}
+        _without_reviewed_atom_placeholder(
+            {key: child for key, child in payload.items() if key not in dedicated_fields}
+        )
     )
     _reject_generic_identity_shapes(attempt.raw_events)
     _reject_generic_identity_shapes(attempt.process_launch_id)

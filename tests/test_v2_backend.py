@@ -23,6 +23,7 @@ from local_ultra_review.backend import (  # noqa: E402
     FakeBackend,
     LAUNCH_POLICY_SHA256,
     PROTOCOL_VERSION,
+    REVIEWED_ATOM_IDS_PLACEHOLDER,
     RUN_MANIFEST_VERSION,
     ScriptedAttempt,
     WORKER_ENVIRONMENT_POLICY_SHA256,
@@ -42,15 +43,27 @@ from local_ultra_review.contracts import (  # noqa: E402
 
 HEX_A = "a" * 64
 HEX_B = "b" * 64
+ATOM_A = f"atom-{HEX_A}"
+ATOM_B = f"atom-{HEX_B}"
 TOKEN = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 
-def reviewer_packet() -> dict:
-    return {"reviewable_atom_ids": ["atom-1"], "sealed": True}
+def reviewer_packet(atom_ids: object = None) -> dict:
+    if atom_ids is None:
+        atom_ids = [ATOM_A]
+    return {
+        "target_packet": {"reviewable_atom_ids": atom_ids},
+        "sealed": True,
+    }
 
 
-def reviewer_task(*, task_id: str = "reviewer-correctness-1") -> WorkerTask:
-    packet = reviewer_packet()
+def reviewer_task(
+    *,
+    task_id: str = "reviewer-correctness-1",
+    atom_ids: object = None,
+    packet: dict | None = None,
+) -> WorkerTask:
+    packet = reviewer_packet(atom_ids) if packet is None else packet
     return WorkerTask(
         task_id=task_id,
         role="reviewer",
@@ -69,7 +82,7 @@ def reviewer_payload_template(**updates: object) -> bytes:
         "packet_hash": "{{PACKET_HASH}}",
         "status": "completed",
         "coverage": {
-            "reviewed_atom_ids": ["atom-1"],
+            "reviewed_atom_ids": REVIEWED_ATOM_IDS_PLACEHOLDER,
             "notes": "Reviewed the sealed atom.",
         },
         "candidates": [],
@@ -248,6 +261,226 @@ class FakeBackendTests(unittest.TestCase):
             {key: reviewer.manifest[key] for key in SYNTHETIC_ATTEMPT_ASSURANCE},
             SYNTHETIC_ATTEMPT_ASSURANCE,
         )
+
+    def test_reviewer_atom_placeholder_binds_exact_sealed_order_structurally(self) -> None:
+        task = reviewer_task(atom_ids=[ATOM_B, ATOM_A])
+        attempt = scripted_attempt()
+
+        result = self.run_attempt(attempt, task)
+
+        self.assertEqual(
+            result.payload["coverage"]["reviewed_atom_ids"],
+            [ATOM_B, ATOM_A],
+        )
+        self.assertNotIn(
+            REVIEWED_ATOM_IDS_PLACEHOLDER,
+            json.dumps(result.payload, sort_keys=True),
+        )
+        self.assertIn(REVIEWED_ATOM_IDS_PLACEHOLDER.encode(), attempt.last_message_template)
+        self.assertNotIn(ATOM_A.encode(), attempt.last_message_template)
+        self.assertNotIn(ATOM_B.encode(), attempt.last_message_template)
+
+    def test_unbound_identity_is_target_independent_but_bound_attempt_hash_is_not(self) -> None:
+        attempt = scripted_attempt()
+        first = FakeBackend(scenario_id="dynamic-atoms", attempts=[attempt])
+        second = FakeBackend(scenario_id="dynamic-atoms", attempts=[attempt])
+        first_identity = first.semantic_identity()
+        second_identity = second.semantic_identity()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+
+        first_result = first.run(
+            reviewer_task(atom_ids=[ATOM_A]), Path(temporary.name) / "first"
+        )
+        second_result = second.run(
+            reviewer_task(atom_ids=[ATOM_B]), Path(temporary.name) / "second"
+        )
+
+        self.assertEqual(first_identity, second_identity)
+        self.assertEqual(
+            first_result.payload["coverage"]["reviewed_atom_ids"], [ATOM_A]
+        )
+        self.assertEqual(
+            second_result.payload["coverage"]["reviewed_atom_ids"], [ATOM_B]
+        )
+        self.assertNotEqual(
+            first_result.manifest["attempt_hash"],
+            second_result.manifest["attempt_hash"],
+        )
+
+    def test_literal_sealed_atom_in_template_rejects_before_any_hash(self) -> None:
+        template = reviewer_payload_template(
+            coverage={
+                "reviewed_atom_ids": [ATOM_A],
+                "notes": "A sealed atom must not enter the unbound template.",
+            }
+        )
+        attempt = scripted_attempt(template=template)
+        task = reviewer_task()
+
+        for phase in ("identity", "run"):
+            backend = FakeBackend(scenario_id="literal-atom", attempts=[attempt])
+            with self.subTest(phase=phase), mock.patch(
+                "local_ultra_review.backend.sha256_json"
+            ) as hash_json:
+                with self.assertRaises(WorkerProtocolError):
+                    if phase == "identity":
+                        backend.semantic_identity()
+                    else:
+                        backend.run(task, Path(tempfile.mkdtemp()))
+                hash_json.assert_not_called()
+
+    def test_atom_placeholder_rejects_wrong_role_path_count_substring_and_escaping(self) -> None:
+        wrong_path = reviewer_payload_template(
+            coverage={
+                "reviewed_atom_ids": ["atom-not-sealed"],
+                "notes": REVIEWED_ATOM_IDS_PLACEHOLDER,
+            }
+        )
+        verifier = verifier_payload_template().replace(
+            b'"proof":[',
+            f'"proof":["{REVIEWED_ATOM_IDS_PLACEHOLDER}",'.encode(),
+        )
+        duplicate = reviewer_payload_template(
+            coverage={
+                "reviewed_atom_ids": REVIEWED_ATOM_IDS_PLACEHOLDER,
+                "notes": REVIEWED_ATOM_IDS_PLACEHOLDER,
+            }
+        )
+        substring = reviewer_payload_template(
+            coverage={
+                "reviewed_atom_ids": f"prefix {REVIEWED_ATOM_IDS_PLACEHOLDER}",
+                "notes": "Not a whole-node placeholder.",
+            }
+        )
+        unresolved = reviewer_payload_template(
+            coverage={
+                "reviewed_atom_ids": "{{REVIEWED_ATOM_IDS",
+                "notes": "Missing a closing delimiter.",
+            }
+        )
+        escaped = reviewer_payload_template().replace(
+            REVIEWED_ATOM_IDS_PLACEHOLDER.encode(),
+            b"\\u007b\\u007bREVIEWED_ATOM_IDS\\u007d\\u007d",
+        )
+        cases = (
+            ("wrong-path", scripted_attempt(template=wrong_path)),
+            (
+                "verifier",
+                scripted_attempt(role="verifier", template=verifier),
+            ),
+            ("duplicate", scripted_attempt(template=duplicate)),
+            ("substring", scripted_attempt(template=substring)),
+            ("unresolved", scripted_attempt(template=unresolved)),
+            ("escaped", scripted_attempt(template=escaped)),
+        )
+
+        for name, attempt in cases:
+            backend = FakeBackend(scenario_id=f"bad-placeholder-{name}", attempts=[attempt])
+            with self.subTest(name=name), mock.patch(
+                "local_ultra_review.backend.sha256_json"
+            ) as hash_json:
+                with self.assertRaises(WorkerProtocolError):
+                    backend.semantic_identity()
+                hash_json.assert_not_called()
+
+    def test_atom_placeholder_rejects_invalid_sealed_source_shapes(self) -> None:
+        packets = (
+            {},
+            {"target_packet": []},
+            {"target_packet": {}},
+            {"target_packet": {"reviewable_atom_ids": ATOM_A}},
+            {"target_packet": {"reviewable_atom_ids": []}},
+            {"target_packet": {"reviewable_atom_ids": [ATOM_A, ATOM_A]}},
+            {"target_packet": {"reviewable_atom_ids": ["atom-not-sealed"]}},
+        )
+
+        for packet in packets:
+            task = reviewer_task(packet=packet)
+            backend = FakeBackend(
+                scenario_id="invalid-atom-source", attempts=[scripted_attempt()]
+            )
+            with self.subTest(packet=packet), self.assertRaises(WorkerProtocolError):
+                backend.run(task, Path(tempfile.mkdtemp()))
+
+    def test_atom_placeholder_and_hash_cannot_hide_in_other_evidence(self) -> None:
+        sentinel = REVIEWED_ATOM_IDS_PLACEHOLDER
+        templates = (
+            reviewer_payload_template(
+                coverage={
+                    "reviewed_atom_ids": ["atom-not-sealed"],
+                    "notes": f"hidden {sentinel}",
+                }
+            ),
+            reviewer_payload_template(
+                coverage={
+                    "reviewed_atom_ids": ["atom-not-sealed"],
+                    "notes": f"hidden {ATOM_A}",
+                }
+            ),
+            reviewer_payload_template(
+                coverage={
+                    "reviewed_atom_ids": ["atom-not-sealed"],
+                    "notes": "Candidate evidence is malformed on purpose.",
+                },
+                candidates=[{"title": f"hidden {sentinel}"}],
+            ),
+            reviewer_payload_template(
+                coverage={
+                    "reviewed_atom_ids": ["atom-not-sealed"],
+                    "notes": "Candidate evidence is malformed on purpose.",
+                },
+                candidates=[{"title": f"hidden {ATOM_A}"}],
+            ),
+        )
+        backends = [
+            FakeBackend(scenario_id="metadata", attempts=[scripted_attempt(template=value)])
+            for value in templates
+        ]
+        backends.extend(
+            (
+                FakeBackend(scenario_id=f"hidden {sentinel}", attempts=[]),
+                FakeBackend(scenario_id=f"hidden {ATOM_A}", attempts=[]),
+                FakeBackend(
+                    scenario_id="metadata",
+                    attempts=[scripted_attempt(process_launch_id=f"hidden {sentinel}")],
+                ),
+                FakeBackend(
+                    scenario_id="metadata",
+                    attempts=[scripted_attempt(process_launch_id=f"hidden {ATOM_A}")],
+                ),
+                FakeBackend(
+                    scenario_id="metadata",
+                    attempts=[
+                        scripted_attempt(
+                            events=(
+                                {"type": "thread.started", "thread_id": "thread-1"},
+                                {"type": "message", "text": f"hidden {sentinel}"},
+                            )
+                        )
+                    ],
+                ),
+                FakeBackend(
+                    scenario_id="metadata",
+                    attempts=[
+                        scripted_attempt(
+                            events=(
+                                {"type": "thread.started", "thread_id": "thread-1"},
+                                {"type": "message", "text": f"hidden {ATOM_A}"},
+                            )
+                        )
+                    ],
+                ),
+            )
+        )
+
+        for backend in backends:
+            with self.subTest(backend=backend), mock.patch(
+                "local_ultra_review.backend.sha256_json"
+            ) as hash_json:
+                with self.assertRaises(WorkerProtocolError):
+                    backend.semantic_identity()
+                hash_json.assert_not_called()
 
     def test_semantic_identity_seals_total_roles_and_manifest_version_then_blocks_after_use(self) -> None:
         attempts = [scripted_attempt(), scripted_attempt(role="verifier", template=verifier_payload_template())]
