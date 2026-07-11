@@ -224,8 +224,14 @@ def seal_two_dot_target(repo: Path, base: str, head: str) -> SealedTarget:
         raise TargetError("target checkout must be clean, including untracked and submodule state")
 
     try:
-        base_sha = _git(root, ["rev-parse", "--verify", f"{base}^{{commit}}"]).decode("ascii").strip()
-        head_sha = _git(root, ["rev-parse", "--verify", f"{head}^{{commit}}"]).decode("ascii").strip()
+        base_sha = _git(
+            root,
+            ["rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}"],
+        ).decode("ascii").strip()
+        head_sha = _git(
+            root,
+            ["rev-parse", "--verify", "--end-of-options", f"{head}^{{commit}}"],
+        ).decode("ascii").strip()
     except UnicodeDecodeError as error:
         raise TargetError("resolved commit identity is invalid") from error
     if base_sha == head_sha:

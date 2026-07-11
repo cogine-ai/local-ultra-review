@@ -134,6 +134,21 @@ class GitTargetTests(unittest.TestCase):
         self.assertNotIn(str(repo.root), json.dumps(packet))
         self.assertEqual(packet["target_identity_hash"], target.target_identity_hash)
 
+    def test_revision_names_starting_with_dash_are_resolved_as_revisions(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        repo.write_text("app.py", "VALUE = 1\n")
+        base = repo.commit("base")
+        repo.write_text("app.py", "VALUE = 2\n")
+        head = repo.commit("head")
+        run(["git", "update-ref", "refs/heads/-base", base], repo.root)
+        run(["git", "update-ref", "refs/heads/-head", head], repo.root)
+
+        target = seal_two_dot_target(repo.root, "-base", "-head")
+
+        self.assertEqual(target.base_sha, base)
+        self.assertEqual(target.head_sha, head)
+
     def test_dirty_or_untracked_checkout_is_rejected(self) -> None:
         temporary, repo = self.make_repo()
         self.addCleanup(temporary.cleanup)
