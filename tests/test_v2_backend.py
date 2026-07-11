@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from local_ultra_review import backend as backend_module  # noqa: E402
 from local_ultra_review.backend import (  # noqa: E402
     CodexCliBackend,
     DISABLED_FEATURES,
@@ -1180,7 +1182,38 @@ class CodexCliBackendTests(unittest.TestCase):
     def test_preflight_trusted_canary_proves_descendant_inheritance_without_values(self) -> None:
         _temporary, fake_codex, _record, backend = self.make_backend()
 
-        evidence = backend.preflight_worker_environment(fake_codex.path.parent / "preflight")
+        def exact_canary(argv, *, environment, cwd, timeout_seconds):
+            del cwd, timeout_seconds
+            keys = sorted(environment)
+            value_digest = hashlib.sha256(
+                json.dumps(
+                    dict(environment), sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            observed = {
+                "parent_keys": keys,
+                "raw_parent_keys": keys,
+                "descendant_keys": keys,
+                "raw_descendant_keys": keys,
+                "parent_values_sha256": value_digest,
+                "descendant_values_sha256": value_digest,
+                "descendant_return_code": 0,
+            }
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=json.dumps(
+                    observed, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8"),
+                stderr=b"",
+            )
+
+        with mock.patch.object(
+            backend_module, "_run_process", side_effect=exact_canary
+        ):
+            evidence = backend.preflight_worker_environment(
+                fake_codex.path.parent / "preflight"
+            )
 
         expected_keys = sorted({"PATH", "HOME", "LANG", "TMPDIR"})
         self.assertEqual(evidence["status"], "passed")
@@ -1191,6 +1224,8 @@ class CodexCliBackendTests(unittest.TestCase):
         self.assertEqual(evidence["descendant_environment_keys"], expected_keys)
         self.assertTrue(evidence["parent_nonallowlisted_keys_excluded"])
         self.assertTrue(evidence["descendant_inheritance_matched"])
+        self.assertTrue(evidence["parent_environment_values_matched"])
+        self.assertTrue(evidence["descendant_environment_values_matched"])
         self.assertEqual(
             evidence["worker_environment_policy_sha256"],
             WORKER_ENVIRONMENT_POLICY_SHA256,
@@ -1215,6 +1250,78 @@ class CodexCliBackendTests(unittest.TestCase):
         self.assertEqual(
             backend.readiness()["environment_preflight"], sealed_evidence
         )
+
+    def test_real_host_canary_cannot_sanitize_runtime_extras_into_a_pass(self) -> None:
+        _temporary, fake_codex, _record, backend = self.make_backend()
+
+        evidence = backend.preflight_worker_environment(
+            fake_codex.path.parent / "real-preflight"
+        )
+
+        should_pass = (
+            not evidence["host_runtime_added_keys"]
+            and evidence["parent_environment_values_matched"]
+            and evidence["descendant_environment_values_matched"]
+            and evidence["descendant_inheritance_matched"]
+        )
+        self.assertEqual(evidence["status"] == "passed", should_pass)
+        self.assertFalse(backend.readiness()["live_dispatch_authorized"])
+
+    def test_preflight_fails_on_runtime_key_or_allowlisted_value_drift(self) -> None:
+        def digest(environment: dict[str, str]) -> str:
+            raw = json.dumps(
+                environment,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return hashlib.sha256(raw).hexdigest()
+
+        for mutation in ("runtime_key", "descendant_value"):
+            _temporary, fake_codex, _record, backend = self.make_backend()
+            observed_digests: list[str] = []
+
+            def altered_canary(argv, *, environment, cwd, timeout_seconds):
+                del cwd, timeout_seconds
+                keys = sorted(environment)
+                expected_digest = digest(dict(environment))
+                observed_digests.append(expected_digest)
+                raw_keys = [*keys, "RUNTIME_INJECTED"] if mutation == "runtime_key" else keys
+                observed = {
+                    "parent_keys": keys,
+                    "raw_parent_keys": raw_keys,
+                    "descendant_keys": keys,
+                    "raw_descendant_keys": raw_keys,
+                    "parent_values_sha256": expected_digest,
+                    "descendant_values_sha256": (
+                        "0" * 64
+                        if mutation == "descendant_value"
+                        else expected_digest
+                    ),
+                    "descendant_return_code": 0,
+                }
+                return subprocess.CompletedProcess(
+                    argv,
+                    0,
+                    stdout=json.dumps(
+                        observed, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8"),
+                    stderr=b"",
+                )
+
+            with self.subTest(mutation=mutation), mock.patch.object(
+                backend_module, "_run_process", side_effect=altered_canary
+            ):
+                evidence = backend.preflight_worker_environment(
+                    fake_codex.path.parent / f"preflight-{mutation}"
+                )
+            self.assertEqual(evidence["status"], "failed")
+            self.assertFalse(backend.readiness()["live_dispatch_authorized"])
+            if mutation == "runtime_key":
+                self.assertIn("RUNTIME_INJECTED", evidence["host_runtime_added_keys"])
+            else:
+                self.assertFalse(evidence["descendant_environment_values_matched"])
+            rendered = json.dumps(evidence, sort_keys=True)
+            self.assertNotIn(observed_digests[0], rendered)
 
     def test_matching_record_cannot_qualify_without_object_bound_version_probe(self) -> None:
         _temporary, _fake_codex, record, backend = self.make_backend()

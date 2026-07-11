@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import subprocess
 import tempfile
 
@@ -38,10 +39,12 @@ def _git(
     root: Path,
     args: list[str],
     *,
-    attr_source: str | None = None,
     repository_view: dict[str, str] | None = None,
 ) -> bytes:
     environment = os.environ.copy()
+    for key in tuple(environment):
+        if key.startswith("GIT_"):
+            environment.pop(key)
     environment.update(
         {
             "GIT_CONFIG_GLOBAL": os.devnull,
@@ -50,27 +53,19 @@ def _git(
             "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_TERMINAL_PROMPT": "0",
             "LC_ALL": "C",
+            "PATH": os.defpath,
         }
     )
-    environment.pop("GIT_EXTERNAL_DIFF", None)
-    environment.pop("GIT_DIFF_OPTS", None)
-    for key in (
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_INDEX_FILE",
-    ):
-        environment.pop(key, None)
     if repository_view is not None:
         environment.update(repository_view)
-    if attr_source is None:
-        environment.pop("GIT_ATTR_SOURCE", None)
-    else:
-        environment["GIT_ATTR_SOURCE"] = attr_source
+    git_executable = shutil.which("git", path=os.defpath)
+    if git_executable is None:
+        raise TargetError("trusted system Git executable is unavailable")
+    git_path = Path(git_executable).resolve()
+    if not git_path.is_absolute() or not git_path.is_file():
+        raise TargetError("trusted system Git executable is unavailable")
     command = [
-        "git",
+        str(git_path),
         "--no-optional-locks",
         "-c",
         "color.ui=false",
@@ -78,6 +73,12 @@ def _git(
         "core.quotePath=true",
         "-c",
         f"core.attributesFile={os.devnull}",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.untrackedCache=false",
+        "-c",
+        f"core.hooksPath={os.devnull}",
         "-c",
         "diff.noprefix=false",
         "-c",
@@ -261,7 +262,6 @@ def seal_two_dot_target(repo: Path, base: str, head: str) -> SealedTarget:
                     range_arg,
                     "--",
                 ],
-                attr_source=head_sha,
                 repository_view=repository_view,
             )
         )
@@ -280,7 +280,6 @@ def seal_two_dot_target(repo: Path, base: str, head: str) -> SealedTarget:
                     range_arg,
                     "--",
                 ],
-                attr_source=head_sha,
                 repository_view=repository_view,
             )
         )
@@ -296,7 +295,6 @@ def seal_two_dot_target(repo: Path, base: str, head: str) -> SealedTarget:
                     "--",
                     f":(literal){record['path']}",
                 ],
-                attr_source=head_sha,
                 repository_view=repository_view,
             )
             for record in raw_records
@@ -325,6 +323,8 @@ def seal_two_dot_target(repo: Path, base: str, head: str) -> SealedTarget:
         if special_reason:
             record["special_reason"] = special_reason
         raw_path_diff = raw_path_diffs[path]
+        if b"\x00" in raw_path_diff:
+            record["binary"] = True
         if not raw_path_diff:
             record["special_reason"] = "unparseable_diff"
         metadata = _atom(

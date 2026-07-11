@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+import hashlib
 import io
 import json
 import os
@@ -42,6 +43,8 @@ COMPLETE_REVIEW_BANNER = (
     "Review process complete under the Codex-native guarded worker profile."
 )
 SECRET = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+FINE_GRAINED_PAT = "github_pat_" + "B" * 40
+COMPOUND_SECRET = "compound-secret-value-1234567890abcdef"
 
 
 def surviving_output_bytes(root: Path, session_root: Path) -> bytes:
@@ -225,7 +228,17 @@ class EvaluationEndToEndTests(unittest.TestCase):
     def test_mixed_binary_sensitive_and_manual_outputs_contain_no_secret(self) -> None:
         fixture = EvaluationFixture(self, kind="mixed")
         fixture.repo.write_text(".env.production", f"API_TOKEN={SECRET}\n")
-        fixture.repo.write_text("config.py", f'PROVIDER_TOKEN = "{SECRET}"\n')
+        fixture.repo.write_text(
+            "config.py",
+            "\n".join(
+                (
+                    f'PROVIDER_TOKEN = "{SECRET}"',
+                    f'AWS_SECRET_ACCESS_KEY = "{COMPOUND_SECRET}"',
+                    f'credential = "{FINE_GRAINED_PAT}"',
+                    "",
+                )
+            ),
+        )
         head = fixture.repo.commit("sensitive head")
         request = EvaluationRequest(
             repo=fixture.repo.root,
@@ -274,8 +287,39 @@ class EvaluationEndToEndTests(unittest.TestCase):
             {"binary_content", "sensitive_path", "sensitive_content_redacted"},
         )
         output = surviving_output_bytes(fixture.root, fixture.session_root)
-        self.assertNotIn(SECRET.encode("utf-8"), output)
+        for secret in (SECRET, COMPOUND_SECRET, FINE_GRAINED_PAT):
+            with self.subTest(secret=secret[:16]):
+                self.assertNotIn(secret.encode("utf-8"), output)
+                self.assertNotIn(
+                    hashlib.sha256(secret.encode("utf-8")).hexdigest().encode("ascii"),
+                    output,
+                )
         self.assertFalse((fixture.root / "report.md").exists())
+
+    def test_candidates_must_resolve_to_a_reviewable_target_hunk(self) -> None:
+        scenarios = (
+            ("regular", {"file": "outside.py", "line": 1}),
+            ("regular", {"file": "app.py", "line": 999}),
+            ("mixed", {"file": "asset.bin", "line": 1}),
+        )
+        for index, (kind, location) in enumerate(scenarios):
+            fixture = EvaluationFixture(self, kind=kind)
+            seeded = candidate(f"target-binding-{index}")
+            seeded.update(location)
+            outcome = evaluate(
+                fixture.request(),
+                fixture.backend([seeded], [("confirmed", "Important")]),
+            )
+            with self.subTest(kind=kind, location=location):
+                self.assertIsNone(outcome.evaluation_completion)
+                self.assertEqual(outcome.diagnostic["status"], "incomplete")
+                self.assertEqual(
+                    outcome.diagnostic["reason_codes"],
+                    ["semantic_contract_rejected"],
+                )
+                store = ArtifactStore(fixture.session_root)
+                self.assertEqual(store.read_artifacts("reviewer_result"), [])
+                self.assertFalse((fixture.root / "evaluation-report.md").exists())
 
     def test_mode_only_target_is_all_manual_and_dispatches_no_worker(self) -> None:
         fixture = EvaluationFixture(self)
@@ -565,7 +609,7 @@ class EvaluationCliTests(unittest.TestCase):
         )
         self.assertEqual(stderr, "")
 
-    def test_built_wheel_console_and_resources_work_from_foreign_cwd(self) -> None:
+    def test_wheel_and_editable_console_and_resources_work_from_foreign_cwd(self) -> None:
         uv = shutil.which("uv")
         self.assertIsNotNone(uv, "Task 6 distribution proof requires uv")
         assert uv is not None
@@ -577,7 +621,6 @@ class EvaluationCliTests(unittest.TestCase):
         shutil.copy2(ROOT / "pyproject.toml", source / "pyproject.toml")
         shutil.copytree(ROOT / "src", source / "src")
         dist = root / "dist"
-        venv = root / "venv"
         subprocess.run(
             [uv, "build", "--wheel", "--out-dir", str(dist), str(source)],
             check=True,
@@ -585,80 +628,110 @@ class EvaluationCliTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             text=True,
         )
-        subprocess.run(
-            [uv, "venv", "--python", sys.executable, str(venv)],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        binary_root = venv / ("Scripts" if os.name == "nt" else "bin")
-        installed_python = binary_root / ("python.exe" if os.name == "nt" else "python")
         wheel = next(dist.glob("*.whl"))
-        subprocess.run(
-            [uv, "pip", "install", "--python", str(installed_python), str(wheel)],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        foreign_cwd = root / "foreign-cwd"
-        foreign_cwd.mkdir()
-        resource_probe = subprocess.run(
-            [
-                str(installed_python),
-                "-c",
-                (
-                    "from local_ultra_review.contracts import load_schema, prompt_contracts; "
-                    "assert load_schema('reviewer-result')['type'] == 'object'; "
-                    "assert set(prompt_contracts()) == {'reviewer-correctness', 'verifier'}"
-                ),
-            ],
-            cwd=foreign_cwd,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        self.assertEqual(
-            (resource_probe.returncode, resource_probe.stdout, resource_probe.stderr),
-            (0, "", ""),
-        )
-
         fake_codex = FakeCodex(root)
         record = write_qualification(root, fake_codex)
-        console = binary_root / (
-            "local-ultra-review-v2.exe" if os.name == "nt" else "local-ultra-review-v2"
-        )
-        session = root / "installed-session"
-        installed_run = subprocess.run(
-            [
-                str(console),
-                "evaluate",
-                "--repo", str(root / "repo-not-opened"),
-                "--base", "explicit-base",
-                "--head", "explicit-head",
-                "--model", "sealed-model-id",
-                "--session-root", str(session),
-                "--codex-path", str(fake_codex.path),
-                "--qualification-record", str(record),
-            ],
-            cwd=foreign_cwd,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        expected = (session.parent / "diagnostic.md").resolve()
-        self.assertEqual(installed_run.returncode, 3)
-        self.assertEqual(
-            installed_run.stdout,
-            f"{expected}\nauthority=non_authoritative_diagnostic status=blocked\n",
-        )
-        self.assertEqual(installed_run.stderr, "")
+        for label, install_arguments in (
+            ("wheel", [str(wheel)]),
+            ("editable", ["-e", str(source)]),
+        ):
+            with self.subTest(install=label):
+                mode_root = root / label
+                mode_root.mkdir()
+                venv = mode_root / "venv"
+                subprocess.run(
+                    [uv, "venv", "--python", sys.executable, str(venv)],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                binary_root = venv / ("Scripts" if os.name == "nt" else "bin")
+                installed_python = binary_root / (
+                    "python.exe" if os.name == "nt" else "python"
+                )
+                subprocess.run(
+                    [
+                        uv,
+                        "pip",
+                        "install",
+                        "--python",
+                        str(installed_python),
+                        *install_arguments,
+                    ],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                foreign_cwd = mode_root / "foreign-cwd"
+                foreign_cwd.mkdir()
+                resource_probe = subprocess.run(
+                    [
+                        str(installed_python),
+                        "-c",
+                        (
+                            "from local_ultra_review.contracts import load_schema, prompt_contracts; "
+                            "assert load_schema('reviewer-result')['type'] == 'object'; "
+                            "assert set(prompt_contracts()) == {'reviewer-correctness', 'verifier'}"
+                        ),
+                    ],
+                    cwd=foreign_cwd,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                self.assertEqual(
+                    (
+                        resource_probe.returncode,
+                        resource_probe.stdout,
+                        resource_probe.stderr,
+                    ),
+                    (0, "", ""),
+                )
+
+                console = binary_root / (
+                    "local-ultra-review-v2.exe"
+                    if os.name == "nt"
+                    else "local-ultra-review-v2"
+                )
+                session = mode_root / "installed-session"
+                installed_run = subprocess.run(
+                    [
+                        str(console),
+                        "evaluate",
+                        "--repo",
+                        str(root / "repo-not-opened"),
+                        "--base",
+                        "explicit-base",
+                        "--head",
+                        "explicit-head",
+                        "--model",
+                        "sealed-model-id",
+                        "--session-root",
+                        str(session),
+                        "--codex-path",
+                        str(fake_codex.path),
+                        "--qualification-record",
+                        str(record),
+                    ],
+                    cwd=foreign_cwd,
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                expected = (session.parent / "diagnostic.md").resolve()
+                self.assertEqual(installed_run.returncode, 3)
+                self.assertEqual(
+                    installed_run.stdout,
+                    f"{expected}\nauthority=non_authoritative_diagnostic status=blocked\n",
+                )
+                self.assertEqual(installed_run.stderr, "")
+                self.assertFalse(session.exists())
         self.assertFalse(fake_codex.version_environment_path.exists())
         self.assertFalse(fake_codex.semantic_launch_path.exists())
-        self.assertFalse(session.exists())
 
 
 if __name__ == "__main__":

@@ -14,8 +14,13 @@ import uuid
 
 from .backend import WorkerProtocolError, validate_run_manifest
 from .contracts import (
+    BLOCKED_DIAGNOSTIC_BANNER,
     ContractError,
+    INCOMPLETE_DIAGNOSTIC_BANNER,
     SCHEMA_VERSION,
+    WORKER_PROFILE_DISPLAY,
+    post_store_diagnostic_assurance,
+    pre_session_diagnostic_assurance,
     review_identity_hash,
     sha256_json,
     validate_payload,
@@ -103,18 +108,6 @@ _INCOMPLETE_REASONS = {
     "scripted_attempts_leftover",
     "scripted_attempt_accounting_mismatch",
     "completion_projection_rejected",
-}
-_DIAGNOSTIC_ASSURANCE = {
-    "worker_boundary": "guarded_unconfined",
-    "hard_worker_confinement": "not_provided",
-    "packet_only_read": "not_guaranteed",
-    "residual_tool_surface": "unknown",
-    "residual_tool_inventory": "unavailable",
-    "worker_child_environment": "not_verified",
-    "filesystem_write_mitigation": "not_verified",
-    "nested_web_search": "not_verified",
-    "backend_stateless_attestation": "unavailable",
-    "target_execution": "not_requested",
 }
 _HARD_CLAIM_PATTERNS = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -366,12 +359,17 @@ def _contains_hard_claim(content: str) -> bool:
     return any(pattern.search(normalized) for pattern in _HARD_CLAIM_PATTERNS)
 
 
-def _contains_false_clean_claim(content: str) -> bool:
-    checked = _normalized_claim_text(
-        content.replace(
-            "makes no claim that the target is clean", "synthetic disclaimer"
-        )
+def _contains_false_clean_claim(
+    content: str, *, allowed_contract_banners: tuple[str, ...] = ()
+) -> bool:
+    checked_content = content.replace(
+        "makes no claim that the target is clean", "synthetic disclaimer"
     )
+    for banner in allowed_contract_banners:
+        checked_content = checked_content.replace(
+            banner, "contracted diagnostic limitation"
+        )
+    checked = _normalized_claim_text(checked_content)
     return _FALSE_CLEAN_PATTERN.search(checked) is not None
 
 
@@ -399,12 +397,26 @@ def _diagnostic_markers_valid(content: str) -> bool:
         "profile: evaluation_slice_v2",
         "release_ready: false",
         "# Synthetic protocol diagnostic — not a code-review result",
+        "worker_profile: `codex_native_guarded`",
+        f"worker_profile_display: `{WORKER_PROFILE_DISPLAY}`",
         "residual_tool_surface: `unknown`",
-        "worker_child_environment: `not_verified`",
+        "hard_worker_confinement: `not_provided`",
     )
-    return content.startswith(
+    if not content.startswith(
         "---\ntitle: Synthetic protocol diagnostic — not a code-review result\n"
-    ) and all(marker in content for marker in required)
+    ) or not all(marker in content for marker in required):
+        return False
+    blocked = content.count(BLOCKED_DIAGNOSTIC_BANNER)
+    incomplete = content.count(INCOMPLETE_DIAGNOSTIC_BANNER)
+    blocked_state = content.count("- state: `blocked`")
+    incomplete_state = content.count("- state: `incomplete`")
+    if "Review process complete" in content:
+        return False
+    if blocked_state == 1 and incomplete_state == 0:
+        return blocked == 1 and incomplete == 0
+    if incomplete_state == 1 and blocked_state == 0:
+        return incomplete == 1 and blocked == 0
+    return False
 
 
 def render_evaluation_report(
@@ -629,6 +641,12 @@ def render_diagnostic_report(
         checked_reasons = _validate_reason_list(
             reasons, allowlist=_BLOCKED_REASONS, label="blocked diagnostic reasons"
         )
+        exact_assurances = (
+            pre_session_diagnostic_assurance(),
+            pre_session_diagnostic_assurance("allowlist_preflight_passed"),
+        )
+        diagnostic_banner = BLOCKED_DIAGNOSTIC_BANNER
+        diagnostic_description = "blocked"
     else:
         checked_plan = _validate_plan(plan)
         if state != "incomplete":
@@ -638,8 +656,11 @@ def render_diagnostic_report(
             allowlist=_INCOMPLETE_REASONS,
             label="incomplete diagnostic reasons",
         )
+        exact_assurances = (post_store_diagnostic_assurance(),)
+        diagnostic_banner = INCOMPLETE_DIAGNOSTIC_BANNER
+        diagnostic_description = "incomplete"
     _safe(assurance_state, "diagnostic assurance")
-    if not isinstance(assurance_state, dict) or assurance_state != _DIAGNOSTIC_ASSURANCE:
+    if not isinstance(assurance_state, dict) or assurance_state not in exact_assurances:
         _raise_render("diagnostic assurance state is not the exact guarded tuple")
     _reject_claim_text(checked_reasons)
     _reject_claim_text(assurance_state)
@@ -656,12 +677,12 @@ def render_diagnostic_report(
         "",
         "# Synthetic protocol diagnostic — not a code-review result",
         "",
-        "This non-authoritative view records an incomplete protocol state. It provides no code-review result.",
+        diagnostic_banner,
+        "",
+        f"This non-authoritative view records a {diagnostic_description} protocol state. It provides no code-review result.",
         "",
         f"- state: {_inline(state)}",
         f"- pre_session: {'true' if checked_plan is None else 'false'}",
-        "- residual_tool_surface: `unknown`",
-        "- worker_child_environment: `not_verified`",
         "",
         "## Stable reason codes",
         "",
@@ -676,7 +697,9 @@ def render_diagnostic_report(
     _safe(content, "rendered diagnostic")
     if not _diagnostic_markers_valid(content):
         _raise_render("rendered diagnostic is missing truthful fixed markers")
-    if _contains_false_clean_claim(content) or _contains_hard_claim(content):
+    if _contains_false_clean_claim(
+        content, allowed_contract_banners=(diagnostic_banner,)
+    ) or _contains_hard_claim(content):
         _raise_render("rendered diagnostic contains forbidden outcome wording")
     return content
 
@@ -709,7 +732,14 @@ def validate_report_artifact_payload(artifact_type: object, payload: object) -> 
         _raise_render("report artifact truthful markers mismatch")
     if _contains_hard_claim(content):
         _raise_render("report artifact contains a forbidden hard claim")
-    if _contains_false_clean_claim(content):
+    allowed_banners = (
+        (BLOCKED_DIAGNOSTIC_BANNER, INCOMPLETE_DIAGNOSTIC_BANNER)
+        if artifact_type == "diagnostic_report"
+        else ()
+    )
+    if _contains_false_clean_claim(
+        content, allowed_contract_banners=allowed_banners
+    ):
         _raise_render("report artifact contains forbidden outcome wording")
 
 

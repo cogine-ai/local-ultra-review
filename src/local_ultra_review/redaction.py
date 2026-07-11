@@ -22,10 +22,6 @@ class RedactionResult:
 
 
 REDACTION_VERSION = "known-sensitive-v1"
-_SENSITIVE_KEY = re.compile(
-    r"^(?:api[_-]?key|secret|password|passwd|token|access[_-]?token|private[_-]?key)$",
-    re.IGNORECASE,
-)
 _PRIVATE_KEY = re.compile(
     r"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----.*?"
     r"-----END(?: [A-Z0-9]+)? PRIVATE KEY-----",
@@ -33,23 +29,26 @@ _PRIVATE_KEY = re.compile(
 )
 _PROVIDER_TOKENS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("github_token", re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}")),
+    ("github_fine_grained_pat", re.compile(r"github_pat_[A-Za-z0-9_]{20,}")),
     ("openai_key", re.compile(r"sk-[A-Za-z0-9_-]{20,}")),
     ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}")),
     ("slack_token", re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}")),
 )
-_SECRET_KEY_PATTERN = (
-    r"(?:api[_-]?key|secret|password|passwd|token|access[_-]?token|private[_-]?key)"
+_ASSIGNMENT_KEY = (
+    r'(?P<key>(?:"(?:\\.|[^"\\\r\n])+"|'
+    r"'(?:\\.|[^'\\\r\n])+'|"
+    r"[A-Za-z_][A-Za-z0-9_.-]*))"
 )
 _DOUBLE_QUOTED_ASSIGNMENT = re.compile(
-    rf'(?i)[\"\']?{_SECRET_KEY_PATTERN}[\"\']?\s*[=:]\s*"'
+    rf'(?i)(?<![A-Za-z0-9_.-]){_ASSIGNMENT_KEY}\s*[=:]\s*"'
     rf'(?P<value>(?:\\.|[^"\\\r\n])*)"'
 )
 _SINGLE_QUOTED_ASSIGNMENT = re.compile(
-    rf"(?i)[\"']?{_SECRET_KEY_PATTERN}[\"']?\s*[=:]\s*'"
+    rf"(?i)(?<![A-Za-z0-9_.-]){_ASSIGNMENT_KEY}\s*[=:]\s*'"
     rf"(?P<value>(?:\\.|[^'\\\r\n])*)'"
 )
 _UNQUOTED_ASSIGNMENT = re.compile(
-    rf"(?i)[\"']?{_SECRET_KEY_PATTERN}[\"']?\s*[=:]\s*"
+    rf"(?i)(?<![A-Za-z0-9_.-]){_ASSIGNMENT_KEY}\s*[=:]\s*"
     rf"(?P<value>(?!(?:redacted|placeholder|example|dummy|none|null)(?:\b|$))"
     rf"[^\s\"',#}}\]]{{8,}})"
 )
@@ -78,6 +77,7 @@ _SENSITIVE_BASENAMES = {
 }
 _SENSITIVE_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".sqlite", ".sqlite3", ".db")
 _SAFE_PLACEHOLDERS = {"", "redacted", "placeholder", "example", "dummy", "none", "null"}
+_SENSITIVE_KEY_FOLLOWERS = {"access", "credential", "credentials", "key", "token", "value"}
 
 RULESET_HASH = sha256_json(
     {
@@ -85,6 +85,7 @@ RULESET_HASH = sha256_json(
         "detectors": [
             "private_key",
             "github_token",
+            "github_fine_grained_pat",
             "openai_key",
             "aws_access_key",
             "slack_token",
@@ -123,6 +124,40 @@ def _is_safe_placeholder(value: str) -> bool:
     return normalized in _SAFE_PLACEHOLDERS or normalized.startswith("[redacted:")
 
 
+def _is_sensitive_key_name(value: str) -> bool:
+    unquoted = value.strip().strip("\"'")
+    separated = re.sub(
+        r"(?<=[a-z0-9])(?=[A-Z])",
+        "_",
+        unquoted,
+    )
+    tokens = re.findall(r"[a-z0-9]+", separated.casefold())
+    if not tokens:
+        return False
+    if any(token in {"apikey", "privatekey"} for token in tokens):
+        return True
+    if any(
+        tokens[index : index + 2] in (["api", "key"], ["private", "key"], ["access", "token"])
+        for index in range(len(tokens) - 1)
+    ):
+        return True
+    for index, token in enumerate(tokens):
+        if token not in {"password", "passwd", "secret", "token"}:
+            continue
+        if index == len(tokens) - 1 or tokens[index + 1] in _SENSITIVE_KEY_FOLLOWERS:
+            return True
+    return False
+
+
+def _sensitive_assignment_matches(value: str):
+    for pattern in _ASSIGNMENT_PATTERNS:
+        for match in pattern.finditer(value):
+            if _is_sensitive_key_name(match.group("key")) and not _is_safe_placeholder(
+                match.group("value")
+            ):
+                yield match
+
+
 def _hunks_for_range(text: str, start: int, end: int) -> tuple[str | None, ...]:
     headers = list(re.finditer(r"(?m)^@@[^\n]*@@[^\n]*$", text))
     affected = []
@@ -140,11 +175,8 @@ def _redact_text(text: str, path: str) -> tuple[str, tuple[dict, ...]]:
     for reason, pattern in _PROVIDER_TOKENS:
         for match in pattern.finditer(text):
             matches.append((match.start(), match.end(), 2, reason))
-    for pattern in _ASSIGNMENT_PATTERNS:
-        for match in pattern.finditer(text):
-            if _is_safe_placeholder(match.group("value")):
-                continue
-            matches.append((match.start("value"), match.end("value"), 1, "secret_assignment"))
+    for match in _sensitive_assignment_matches(text):
+        matches.append((match.start("value"), match.end("value"), 1, "secret_assignment"))
     matches.sort(key=lambda item: (item[0], item[2], -(item[1] - item[0])))
 
     selected: list[tuple[int, int, str]] = []
@@ -242,9 +274,8 @@ def classify_and_redact_diff(
 def _unsafe_string(value: str) -> bool:
     if _PRIVATE_KEY.search(value):
         return True
-    for pattern in _ASSIGNMENT_PATTERNS:
-        if any(not _is_safe_placeholder(match.group("value")) for match in pattern.finditer(value)):
-            return True
+    if any(True for _match in _sensitive_assignment_matches(value)):
+        return True
     return any(pattern.search(value) for _reason, pattern in _PROVIDER_TOKENS)
 
 
@@ -256,7 +287,11 @@ def assert_safe_sink(value: object) -> None:
             for key, child in node.items():
                 if isinstance(key, str) and _unsafe_string(key):
                     raise SensitiveMaterialError("known-sensitive mapping key rejected")
-                if isinstance(key, str) and _SENSITIVE_KEY.fullmatch(key) and isinstance(child, str):
+                if (
+                    isinstance(key, str)
+                    and _is_sensitive_key_name(key)
+                    and isinstance(child, str)
+                ):
                     if not _is_safe_placeholder(child):
                         raise SensitiveMaterialError("known-sensitive assignment rejected")
                 walk(child)

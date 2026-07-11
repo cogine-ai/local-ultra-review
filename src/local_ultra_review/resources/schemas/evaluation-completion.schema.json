@@ -172,6 +172,7 @@
       "additionalProperties": false,
       "required": [
         "worker_profile",
+        "worker_profile_display",
         "worker_boundary",
         "hard_worker_confinement",
         "input_discipline",
@@ -193,6 +194,9 @@
       "properties": {
         "worker_profile": {
           "const": "codex_native_guarded"
+        },
+        "worker_profile_display": {
+          "const": "Codex-native guarded worker (no hard confinement)"
         },
         "worker_boundary": {
           "const": "guarded_unconfined"

@@ -31,15 +31,20 @@ from local_ultra_review.backend import (  # noqa: E402
     WorkerAttempt,
     WorkerUnavailable,
 )
+from local_ultra_review import backend as backend_module  # noqa: E402
 from local_ultra_review import orchestrator as orchestrator_module  # noqa: E402
 from local_ultra_review import render as render_module  # noqa: E402
 from local_ultra_review.completion_projection import review_candidate_hash  # noqa: E402
 from local_ultra_review.contracts import (  # noqa: E402
     ALL_MANUAL_ASSURANCE,
+    DIAGNOSTIC_CONTRACT_VERSION,
+    INCOMPLETE_DIAGNOSTIC_BANNER,
     SCHEMA_VERSION,
     SYNTHETIC_ATTEMPT_ASSURANCE,
     adapter_manual_item_hash,
     canonical_json_bytes,
+    post_store_diagnostic_assurance,
+    pre_session_diagnostic_assurance,
     validate_payload,
     verifier_manual_item_hash,
     sha256_json,
@@ -49,7 +54,6 @@ from local_ultra_review.git_target import (  # noqa: E402
     seal_two_dot_target,
 )
 from local_ultra_review.orchestrator import (  # noqa: E402
-    DIAGNOSTIC_CONTRACT_VERSION,
     EvaluationInputError,
     EvaluationOutcome,
     EvaluationRequest,
@@ -164,7 +168,7 @@ def candidate(label: str = "A", *, severity: str = "Important") -> dict:
     return {
         "severity": severity,
         "file": "app.py",
-        "line": 2,
+        "line": 1,
         "title": f"Candidate {label}",
         "failure_scenario": f"The changed branch exposes failure {label}.",
         "evidence": [f"Evidence for candidate {label}."],
@@ -293,7 +297,9 @@ def codex_readiness(*, canary: bool = False) -> dict:
             ).sha256_json(keys),
             "worker_environment_policy_sha256": WORKER_ENVIRONMENT_POLICY_SHA256,
             "parent_nonallowlisted_keys_excluded": True,
+            "parent_environment_values_matched": True,
             "descendant_inheritance_matched": True,
+            "descendant_environment_values_matched": True,
             "environment_values_recorded": False,
             "error_code": None,
         }
@@ -360,18 +366,7 @@ def post_store_diagnostic(
         "completion_created": False,
         "failure_phase": phase,
         "reason_codes": [reason],
-        "assurance_state": {
-            "worker_boundary": "guarded_unconfined",
-            "hard_worker_confinement": "not_provided",
-            "packet_only_read": "not_guaranteed",
-            "residual_tool_surface": "unknown",
-            "residual_tool_inventory": "unavailable",
-            "worker_child_environment": "not_verified",
-            "filesystem_write_mitigation": "not_verified",
-            "nested_web_search": "not_verified",
-            "backend_stateless_attestation": "unavailable",
-            "target_execution": "not_requested",
-        },
+        "assurance_state": post_store_diagnostic_assurance(),
     }
 
 
@@ -897,7 +892,40 @@ class EvaluationFlowTests(unittest.TestCase):
                 root = Path(temporary.name)
                 fake, backend = real_codex_backend(root)
                 if run_canary:
-                    evidence = backend.preflight_worker_environment(root / "canary")
+                    def exact_canary(argv, *, environment, cwd, timeout_seconds):
+                        del cwd, timeout_seconds
+                        keys = sorted(environment)
+                        value_digest = hashlib.sha256(
+                            json.dumps(
+                                dict(environment),
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8")
+                        ).hexdigest()
+                        observed = {
+                            "parent_keys": keys,
+                            "raw_parent_keys": keys,
+                            "descendant_keys": keys,
+                            "raw_descendant_keys": keys,
+                            "parent_values_sha256": value_digest,
+                            "descendant_values_sha256": value_digest,
+                            "descendant_return_code": 0,
+                        }
+                        return subprocess.CompletedProcess(
+                            argv,
+                            0,
+                            stdout=json.dumps(
+                                observed,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ).encode("utf-8"),
+                            stderr=b"",
+                        )
+
+                    with mock.patch.object(
+                        backend_module, "_run_process", side_effect=exact_canary
+                    ):
+                        evidence = backend.preflight_worker_environment(root / "canary")
                     self.assertEqual(evidence["status"], "passed")
                     evidence["status"] = "failed"
                     evidence["child_environment_keys"].append("CALLER_MUTATION")
@@ -2201,7 +2229,7 @@ class EvaluationFlowTests(unittest.TestCase):
             if (
                 not isinstance(argv, (list, tuple))
                 or not argv
-                or argv[0] != "git"
+                or Path(argv[0]).name != "git"
             ):
                 raise AssertionError(f"Task 4 attempted a non-Git subprocess: {argv!r}")
             commands.append(list(argv))
@@ -2223,7 +2251,13 @@ class EvaluationFlowTests(unittest.TestCase):
             outcome = evaluate(fixture.request(), fixture.backend([], []))
         self.assertIsNotNone(outcome.evaluation_completion)
         self.assertTrue(commands)
-        self.assertTrue(all(command[0] == "git" for command in commands))
+        self.assertTrue(
+            all(
+                Path(command[0]).is_absolute()
+                and Path(command[0]).name == "git"
+                for command in commands
+            )
+        )
         argv_text = json.dumps(commands)
         self.assertNotIn("local_review_session.py", argv_text)
         for v1_script in (
@@ -2255,6 +2289,10 @@ class EvaluationFlowTests(unittest.TestCase):
         self.assertIn("simulated_review_verdict: `clean`", text)
         self.assertIn("makes no claim that the target is clean", text)
         self.assertIn("target_execution: `not_requested`", text)
+        self.assertIn(
+            "worker_profile_display: `Codex-native guarded worker (no hard confinement)`",
+            text,
+        )
         self.assertNotIn("# Local Ultra Review Report", text)
         self.assertNotIn("authoritative_review=true", text)
         self.assertFalse((clean.session_root.parent / "report.md").exists())
@@ -2290,6 +2328,19 @@ class EvaluationFlowTests(unittest.TestCase):
         self.assertIn("state: `blocked`", diagnostic_text)
         self.assertIn("residual_tool_surface: `unknown`", diagnostic_text)
         self.assertIn("worker_child_environment: `not_verified`", diagnostic_text)
+        self.assertIn(
+            "Review process blocked under the Codex-native guarded worker profile. "
+            "Hard worker confinement was not provided. “Clean” means no confirmed "
+            "findings under the completed review contract; it is not a worker-security claim.",
+            diagnostic_text,
+        )
+        self.assertIn("accepted_tool_calls: `not_applicable_no_dispatch`", diagnostic_text)
+        self.assertIn("telemetry_scope: `not_applicable_no_dispatch`", diagnostic_text)
+        self.assertIn(
+            "worker_profile_display: `Codex-native guarded worker (no hard confinement)`",
+            diagnostic_text,
+        )
+        self.assertNotIn("Review process complete", diagnostic_text)
         self.assertNotIn("simulated_review_verdict", diagnostic_text)
         self.assertFalse(blocked_request.session_root.exists())
 
@@ -2342,7 +2393,15 @@ class EvaluationFlowTests(unittest.TestCase):
         text = expected.read_text(encoding="utf-8")
         self.assertIn("state: `incomplete`", text)
         self.assertIn("- `scripted_attempts_exhausted`", text)
-        self.assertNotRegex(text.casefold(), r"\b(no issues|no confirmed findings|pass)\b")
+        self.assertIn(INCOMPLETE_DIAGNOSTIC_BANNER, text)
+        self.assertIn("accepted_tool_calls: `not_available_incomplete`", text)
+        self.assertIn("telemetry_scope: `not_available_incomplete`", text)
+        self.assertNotIn("Review process complete", text)
+        without_contract_banner = text.replace(INCOMPLETE_DIAGNOSTIC_BANNER, "")
+        self.assertNotRegex(
+            without_contract_banner.casefold(),
+            r"\b(no issues|no confirmed findings|pass)\b",
+        )
         store = ArtifactStore(fixture.session_root)
         self.assertEqual(len(store.read_artifacts("diagnostic")), 1)
         reports = store.read_artifacts("diagnostic_report")
@@ -2396,7 +2455,7 @@ class EvaluationFlowTests(unittest.TestCase):
                 )
 
     def test_task5_diagnostic_renderer_rejects_result_claims_and_bad_assurance(self) -> None:
-        assurance = copy.deepcopy(post_store_diagnostic()["assurance_state"])
+        assurance = pre_session_diagnostic_assurance()
         text = render_diagnostic_report(
             plan=None,
             state="blocked",

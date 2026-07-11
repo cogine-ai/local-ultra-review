@@ -19,9 +19,22 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 SCHEMA_VERSION = "2.0-evaluation-slice"
 ORCHESTRATION_CONTRACT_VERSION = "v2-orchestration-contract-1"
+DIAGNOSTIC_CONTRACT_VERSION = "evaluation-diagnostic-v1"
+WORKER_PROFILE_DISPLAY = "Codex-native guarded worker (no hard confinement)"
+BLOCKED_DIAGNOSTIC_BANNER = (
+    "Review process blocked under the Codex-native guarded worker profile. "
+    "Hard worker confinement was not provided. “Clean” means no confirmed "
+    "findings under the completed review contract; it is not a worker-security claim."
+)
+INCOMPLETE_DIAGNOSTIC_BANNER = (
+    "Review process incomplete under the Codex-native guarded worker profile. "
+    "Hard worker confinement was not provided. “Clean” means no confirmed "
+    "findings under the completed review contract; it is not a worker-security claim."
+)
 
 _SYNTHETIC_ATTEMPT_ASSURANCE_ITEMS = (
     ("worker_profile", "codex_native_guarded"),
+    ("worker_profile_display", WORKER_PROFILE_DISPLAY),
     ("worker_boundary", "guarded_unconfined"),
     ("hard_worker_confinement", "not_provided"),
     ("input_discipline", "adapter_packet_minimized"),
@@ -73,6 +86,7 @@ _WORKER_AUTHORITY_FIELDS = frozenset(
         "capability",
         "capabilities",
         "worker_profile",
+        "worker_profile_display",
         "worker_boundary",
         "hard_worker_confinement",
         "context_lineage",
@@ -83,6 +97,49 @@ _WORKER_AUTHORITY_FIELDS = frozenset(
         "telemetry_scope",
     }
 )
+_POST_STORE_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "schema_version",
+        "diagnostic_contract_version",
+        "diagnostic_kind",
+        "status",
+        "profile",
+        "authority",
+        "authoritative_review",
+        "release_ready",
+        "protocol_completeness",
+        "result_state",
+        "target_execution",
+        "completion_created",
+        "failure_phase",
+        "reason_codes",
+        "assurance_state",
+    }
+)
+_POST_STORE_DIAGNOSTIC_REASON_BY_PHASE = {
+    "reviewer_dispatch": {
+        "worker_unavailable",
+        "scripted_attempts_exhausted",
+    },
+    "reviewer_acceptance": {
+        "worker_attempt_rejected",
+        "semantic_contract_rejected",
+        "coverage_accounting_failed",
+    },
+    "verifier_dispatch": {
+        "worker_unavailable",
+        "scripted_attempts_exhausted",
+    },
+    "verifier_acceptance": {
+        "worker_attempt_rejected",
+        "semantic_contract_rejected",
+    },
+    "completion_gate": {
+        "scripted_attempts_leftover",
+        "scripted_attempt_accounting_mismatch",
+        "completion_projection_rejected",
+    },
+}
 
 
 class ContractError(ValueError):
@@ -174,6 +231,116 @@ def all_manual_assurance() -> dict:
     """Return the exact assurance for a target requiring no worker dispatch."""
 
     return dict(_ALL_MANUAL_ASSURANCE_ITEMS)
+
+
+def _diagnostic_assurance(
+    *,
+    accepted_tool_calls: str,
+    telemetry_scope: str,
+    worker_child_environment: str,
+    input_discipline: str,
+    context_lineage: str,
+) -> dict:
+    return {
+        "worker_profile": "codex_native_guarded",
+        "worker_profile_display": WORKER_PROFILE_DISPLAY,
+        "worker_boundary": "guarded_unconfined",
+        "hard_worker_confinement": "not_provided",
+        "input_discipline": input_discipline,
+        "packet_only_read": "not_guaranteed",
+        "residual_tool_surface": "unknown",
+        "residual_tool_inventory": "unavailable",
+        "accepted_tool_calls": accepted_tool_calls,
+        "telemetry_scope": telemetry_scope,
+        "worker_child_environment": worker_child_environment,
+        "filesystem_write_mitigation": "not_verified",
+        "nested_web_search": "not_verified",
+        "broader_network_denial": "not_guaranteed",
+        "connector_github_denial": "not_guaranteed",
+        "ambient_secret_non_access": "not_guaranteed",
+        "context_lineage": context_lineage,
+        "backend_stateless_attestation": "unavailable",
+        "target_execution": "not_requested",
+    }
+
+
+def pre_session_diagnostic_assurance(
+    worker_child_environment: str = "not_verified",
+) -> dict:
+    """Return exact guarded limitations for a blocked pre-dispatch diagnostic."""
+
+    if (
+        not isinstance(worker_child_environment, str)
+        or worker_child_environment
+        not in {"not_verified", "allowlist_preflight_passed"}
+    ):
+        raise ContractError("pre-session worker environment state is invalid")
+    return _diagnostic_assurance(
+        accepted_tool_calls="not_applicable_no_dispatch",
+        telemetry_scope="not_applicable_no_dispatch",
+        worker_child_environment=worker_child_environment,
+        input_discipline="not_applicable_no_dispatch",
+        context_lineage="not_applicable_no_dispatch",
+    )
+
+
+def post_store_diagnostic_assurance() -> dict:
+    """Return exact guarded limitations for an incomplete post-Store diagnostic."""
+
+    return _diagnostic_assurance(
+        accepted_tool_calls="not_available_incomplete",
+        telemetry_scope="not_available_incomplete",
+        worker_child_environment="not_verified",
+        input_discipline="adapter_packet_minimized",
+        context_lineage="not_available_incomplete",
+    )
+
+
+def validate_post_store_diagnostic(value: object) -> None:
+    """Validate an exact adapter-authored incomplete diagnostic payload."""
+
+    _safe_untrusted(value)
+    if not isinstance(value, Mapping) or set(value) != _POST_STORE_DIAGNOSTIC_FIELDS:
+        raise ContractError("post-Store diagnostic fields mismatch")
+    fixed = {
+        "schema_version": SCHEMA_VERSION,
+        "diagnostic_contract_version": DIAGNOSTIC_CONTRACT_VERSION,
+        "diagnostic_kind": "post_store_incomplete",
+        "status": "incomplete",
+        "profile": "evaluation_slice_v2",
+        "authority": "non_authoritative_diagnostic",
+        "protocol_completeness": "incomplete",
+        "result_state": "not_available",
+        "target_execution": "not_requested",
+    }
+    if any(value.get(key) != expected for key, expected in fixed.items()):
+        raise ContractError("post-Store diagnostic fixed state is invalid")
+    if any(
+        value.get(key) is not False
+        for key in ("authoritative_review", "release_ready", "completion_created")
+    ):
+        raise ContractError("post-Store diagnostic boolean state is invalid")
+
+    phase = value.get("failure_phase")
+    if (
+        not isinstance(phase, str)
+        or phase not in _POST_STORE_DIAGNOSTIC_REASON_BY_PHASE
+    ):
+        raise ContractError("post-Store diagnostic failure phase is invalid")
+    reasons = value.get("reason_codes")
+    if (
+        not isinstance(reasons, list)
+        or not reasons
+        or any(not isinstance(reason, str) for reason in reasons)
+        or reasons != sorted(set(reasons))
+        or any(
+            reason not in _POST_STORE_DIAGNOSTIC_REASON_BY_PHASE[phase]
+            for reason in reasons
+        )
+    ):
+        raise ContractError("post-Store diagnostic reasons are invalid for its phase")
+    if value.get("assurance_state") != post_store_diagnostic_assurance():
+        raise ContractError("post-Store diagnostic assurance state is not exact")
 
 
 def _schema_key(name: str) -> str:

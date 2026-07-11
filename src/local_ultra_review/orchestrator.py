@@ -34,19 +34,24 @@ from .completion_projection import (
     completion_source_hashes,
     derive_completion_payload,
     review_candidate_hash,
+    validate_review_candidate_target,
     validate_role_task_record,
     validate_target_packet,
 )
 from .contracts import (
     ContractError,
+    DIAGNOSTIC_CONTRACT_VERSION,
     ORCHESTRATION_CONTRACT_VERSION,
     SCHEMA_VERSION,
     is_required_evidence_sentinel,
+    post_store_diagnostic_assurance,
+    pre_session_diagnostic_assurance,
     prompt_contracts,
     review_identity_hash,
     schema_contracts,
     sha256_json,
     validate_payload,
+    validate_post_store_diagnostic,
     validate_semantic_plan,
 )
 from .git_target import TargetError, build_review_packet, seal_two_dot_target
@@ -66,8 +71,6 @@ from .render import (
 )
 from .store import ArtifactStore, IntegrityError
 
-
-DIAGNOSTIC_CONTRACT_VERSION = "evaluation-diagnostic-v1"
 
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _FAKE_READINESS_FIELDS = {
@@ -114,55 +117,6 @@ _PRE_SESSION_FIELDS = {
     "completion_created",
     "backend_readiness",
 }
-_POST_STORE_FIELDS = {
-    "schema_version",
-    "diagnostic_contract_version",
-    "diagnostic_kind",
-    "status",
-    "profile",
-    "authority",
-    "authoritative_review",
-    "release_ready",
-    "protocol_completeness",
-    "result_state",
-    "target_execution",
-    "completion_created",
-    "failure_phase",
-    "reason_codes",
-    "assurance_state",
-}
-_POST_STORE_PHASES = {
-    "reviewer_dispatch",
-    "reviewer_acceptance",
-    "verifier_dispatch",
-    "verifier_acceptance",
-    "completion_gate",
-}
-_POST_STORE_REASON_BY_PHASE = {
-    "reviewer_dispatch": {
-        "worker_unavailable",
-        "scripted_attempts_exhausted",
-    },
-    "reviewer_acceptance": {
-        "worker_attempt_rejected",
-        "semantic_contract_rejected",
-        "coverage_accounting_failed",
-    },
-    "verifier_dispatch": {
-        "worker_unavailable",
-        "scripted_attempts_exhausted",
-    },
-    "verifier_acceptance": {
-        "worker_attempt_rejected",
-        "semantic_contract_rejected",
-    },
-    "completion_gate": {
-        "scripted_attempts_leftover",
-        "scripted_attempt_accounting_mismatch",
-        "completion_projection_rejected",
-    },
-}
-_POST_STORE_REASONS = set().union(*_POST_STORE_REASON_BY_PHASE.values())
 _BINDING_REASONS = {
     "request_backend_model_mismatch",
     "synthetic_consumption_state_unavailable",
@@ -189,20 +143,6 @@ _RECOVERY_REASONS = {
     "canonical_readback_integrity_failed",
     "terminal_commit_state_uncertain",
 }
-_ASSURANCE_STATE = {
-    "worker_boundary": "guarded_unconfined",
-    "hard_worker_confinement": "not_provided",
-    "packet_only_read": "not_guaranteed",
-    "residual_tool_surface": "unknown",
-    "residual_tool_inventory": "unavailable",
-    "worker_child_environment": "not_verified",
-    "filesystem_write_mitigation": "not_verified",
-    "nested_web_search": "not_verified",
-    "backend_stateless_attestation": "unavailable",
-    "target_execution": "not_requested",
-}
-
-
 class EvaluationInputError(ValueError):
     """Raised when a request cannot name one new explicit evaluation session."""
 
@@ -399,7 +339,9 @@ def _validate_environment_preflight(value: object) -> None:
         "child_environment_keys_sha256",
         "worker_environment_policy_sha256",
         "parent_nonallowlisted_keys_excluded",
+        "parent_environment_values_matched",
         "descendant_inheritance_matched",
+        "descendant_environment_values_matched",
         "environment_values_recorded",
         "error_code",
     }
@@ -414,7 +356,9 @@ def _validate_environment_preflight(value: object) -> None:
         or value["base_environment"] != "empty"
         or value["environment_values_recorded"] is not False
         or not isinstance(value["parent_nonallowlisted_keys_excluded"], bool)
+        or not isinstance(value["parent_environment_values_matched"], bool)
         or not isinstance(value["descendant_inheritance_matched"], bool)
+        or not isinstance(value["descendant_environment_values_matched"], bool)
         or value["error_code"] not in {
             None,
             "canary_nonzero",
@@ -451,7 +395,10 @@ def _validate_environment_preflight(value: object) -> None:
     passed = (
         value["error_code"] is None
         and value["parent_nonallowlisted_keys_excluded"] is True
+        and value["parent_environment_values_matched"] is True
         and value["descendant_inheritance_matched"] is True
+        and value["descendant_environment_values_matched"] is True
+        and value["host_runtime_added_keys"] == []
         and value["child_environment_keys"] == value["descendant_environment_keys"]
         and "TMPDIR" in value["child_environment_keys"]
     )
@@ -643,29 +590,10 @@ def validate_evaluation_diagnostic(value: object) -> None:
         return
 
     if kind == "post_store_incomplete":
-        if set(value) != _POST_STORE_FIELDS:
-            raise ValueError("post-Store diagnostic fields mismatch")
-        fixed = {
-            "status": "incomplete",
-            "profile": "evaluation_slice_v2",
-            "protocol_completeness": "incomplete",
-            "result_state": "not_available",
-            "target_execution": "not_requested",
-        }
-        if any(value.get(key) != expected for key, expected in fixed.items()):
-            raise ValueError("post-Store diagnostic fixed state is invalid")
-        phase = value.get("failure_phase")
-        if phase not in _POST_STORE_PHASES:
-            raise ValueError("post-Store diagnostic failure phase is invalid")
-        reasons = _sorted_unique_strings(
-            value.get("reason_codes"),
-            allowlist=_POST_STORE_REASONS,
-            label="post-Store reasons",
-        )
-        if any(reason not in _POST_STORE_REASON_BY_PHASE[phase] for reason in reasons):
-            raise ValueError("post-Store diagnostic reason is impossible for its phase")
-        if value.get("assurance_state") != _ASSURANCE_STATE:
-            raise ValueError("post-Store assurance state is not exact")
+        try:
+            validate_post_store_diagnostic(value)
+        except ContractError as error:
+            raise ValueError("post-Store diagnostic contract is invalid") from error
         return
     raise ValueError("diagnostic kind is invalid")
 
@@ -755,11 +683,20 @@ def _pre_session_diagnostic(
         "backend_readiness": deepcopy(readiness),
     }
     validate_evaluation_diagnostic(payload)
+    environment_preflight = readiness.get("environment_preflight")
+    worker_child_environment = (
+        "allowlist_preflight_passed"
+        if isinstance(environment_preflight, Mapping)
+        and environment_preflight.get("status") == "passed"
+        else "not_verified"
+    )
     content = render_diagnostic_report(
         plan=None,
         state=payload["status"],
         reasons=payload["reason_codes"],
-        assurance_state=dict(_ASSURANCE_STATE),
+        assurance_state=pre_session_diagnostic_assurance(
+            worker_child_environment
+        ),
     )
     path = materialize_non_authoritative_view(
         sibling_path=_sibling_view_path(session_root, "diagnostic.md"),
@@ -785,7 +722,7 @@ def _post_store_payload(*, phase: str, reason_codes: list[str]) -> dict:
         "completion_created": False,
         "failure_phase": phase,
         "reason_codes": sorted(set(reason_codes)),
-        "assurance_state": dict(_ASSURANCE_STATE),
+        "assurance_state": post_store_diagnostic_assurance(),
     }
 
 
@@ -1227,6 +1164,18 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
                 session_root=session_root,
                 phase="reviewer_acceptance",
                 reason_codes=["worker_attempt_rejected"],
+                semantic_prefix_hashes=semantic_prefix_hashes,
+            )
+        try:
+            for candidate_payload in reviewer_wrapper["result"]["candidates"]:
+                validate_review_candidate_target(candidate_payload, target_packet)
+        except (KeyError, TypeError, ContractError):
+            return _normal_failure(
+                store,
+                plan=plan,
+                session_root=session_root,
+                phase="reviewer_acceptance",
+                reason_codes=["semantic_contract_rejected"],
                 semantic_prefix_hashes=semantic_prefix_hashes,
             )
         try:

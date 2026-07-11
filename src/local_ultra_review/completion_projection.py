@@ -37,7 +37,8 @@ from .redaction import assert_safe_sink
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _GIT_HASH = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 _NORMALIZED_HUNK_HEADER = re.compile(
-    r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@$"
+    r"^@@ -(?P<old_start>\d+)(?:,(?P<old_count>\d+))? "
+    r"\+(?P<new_start>\d+)(?:,(?P<new_count>\d+))? @@$"
 )
 _RESOURCE_PACKAGE = "local_ultra_review.resources"
 _TARGET_FIELDS = {
@@ -375,6 +376,67 @@ def validate_target_packet(packet: dict, *, target_identity_hash: str) -> None:
         raise ValueError("target atom partition is incomplete or overlapping")
 
 
+def _line_is_in_new_hunk_range(line: int, hunk_header: str) -> bool:
+    match = _NORMALIZED_HUNK_HEADER.fullmatch(hunk_header)
+    if match is None:
+        raise ValueError("text hunk header is not normalized")
+    start = int(match.group("new_start"))
+    count_text = match.group("new_count")
+    count = 1 if count_text is None else int(count_text)
+    if count == 0:
+        return line == start
+    return start <= line < start + count
+
+
+@_contract_api
+def validate_review_candidate_target(candidate: dict, target_packet: dict) -> None:
+    """Bind one reviewer candidate to a reviewable atom in the sealed target."""
+
+    review_candidate_hash(candidate)
+    if not isinstance(target_packet, dict):
+        raise ValueError("target packet must be an object")
+    target_identity_hash = target_packet.get("target_identity_hash")
+    validate_target_packet(
+        target_packet,
+        target_identity_hash=target_identity_hash,
+    )
+
+    candidate_path = candidate["file"]
+    candidate_line = candidate["line"]
+    reviewable_ids = set(target_packet["reviewable_atom_ids"])
+    path_atoms = [
+        atom
+        for atom in target_packet["coverage_atoms"]
+        if atom["path"] == candidate_path
+    ]
+    reviewable_path_atoms = [
+        atom for atom in path_atoms if atom["atom_id"] in reviewable_ids
+    ]
+    if not reviewable_path_atoms:
+        raise ValueError("candidate path has no reviewable atom")
+
+    text_hunks = [atom for atom in path_atoms if atom["kind"] == "text_hunk"]
+    if text_hunks:
+        reviewable_hunks = [
+            atom
+            for atom in text_hunks
+            if atom["atom_id"] in reviewable_ids
+        ]
+        if not any(
+            _line_is_in_new_hunk_range(candidate_line, atom["hunk_header"])
+            for atom in reviewable_hunks
+        ):
+            raise ValueError("candidate line is outside every reviewable text hunk")
+        return
+
+    if candidate_line != 1 or not any(
+        atom["kind"] == "path_metadata" for atom in reviewable_path_atoms
+    ):
+        raise ValueError(
+            "metadata-only candidate must use line 1 on reviewable path metadata"
+        )
+
+
 def _base_worker_packet(
     *, plan: dict, target_packet: dict, target_packet_payload_hash: str, role: str
 ) -> dict:
@@ -453,6 +515,7 @@ def build_verifier_task_record(
     """Build the exact reconstructable ordinal-bound verifier task record."""
 
     _validate_plan(plan)
+    validate_review_candidate_target(candidate, target_packet)
     candidate_hash = review_candidate_hash(candidate)
     packet = _base_worker_packet(
         plan=plan,

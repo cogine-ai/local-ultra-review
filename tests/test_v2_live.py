@@ -84,7 +84,13 @@ class LiveCodexDiagnosticTests(unittest.TestCase):
 
             with mock.patch.object(backend_module, "_run_process", side_effect=canary_only):
                 evidence = backend.preflight_worker_environment(scratch)
-            self.assertEqual(evidence["status"], "passed")
+            should_pass = (
+                not evidence["host_runtime_added_keys"]
+                and evidence["parent_environment_values_matched"]
+                and evidence["descendant_environment_values_matched"]
+                and evidence["descendant_inheritance_matched"]
+            )
+            self.assertEqual(evidence["status"] == "passed", should_pass)
             self.assertTrue(observed)
             self.assertFalse(backend.readiness()["live_dispatch_authorized"])
 

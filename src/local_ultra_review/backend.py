@@ -113,21 +113,36 @@ LAUNCH_POLICY_SHA256 = sha256_json(_LAUNCH_POLICY)
 WORKER_ENVIRONMENT_POLICY_SHA256 = sha256_json(_WORKER_ENVIRONMENT_POLICY)
 
 _DESCENDANT_CANARY_SOURCE = """
+import hashlib
 import json
 import os
 import sys
 
 expected_keys = json.loads(sys.argv[1])
 raw_keys = sorted(os.environ.keys())
+expected_values = {
+    key: os.environ[key]
+    for key in expected_keys
+    if key in os.environ
+}
+values_sha256 = hashlib.sha256(
+    json.dumps(
+        expected_values,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
 for key in tuple(os.environ):
     if key not in expected_keys:
         del os.environ[key]
 print(json.dumps({
     "keys": sorted(os.environ.keys()),
     "raw_keys": raw_keys,
+    "values_sha256": values_sha256,
 }, sort_keys=True, separators=(",", ":")))
 """
 _PARENT_CANARY_SOURCE = f"""
+import hashlib
 import json
 import os
 import subprocess
@@ -135,6 +150,18 @@ import sys
 
 expected_keys = json.loads(sys.argv[1])
 raw_parent_keys = sorted(os.environ.keys())
+expected_values = {{
+    key: os.environ[key]
+    for key in expected_keys
+    if key in os.environ
+}}
+parent_values_sha256 = hashlib.sha256(
+    json.dumps(
+        expected_values,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
 for key in tuple(os.environ):
     if key not in expected_keys:
         del os.environ[key]
@@ -155,8 +182,10 @@ descendant = json.loads(completed.stdout) if completed.returncode == 0 else {{}}
 print(json.dumps({{
     "parent_keys": sorted(os.environ.keys()),
     "raw_parent_keys": raw_parent_keys,
+    "parent_values_sha256": parent_values_sha256,
     "descendant_keys": descendant.get("keys", []),
     "raw_descendant_keys": descendant.get("raw_keys", []),
+    "descendant_values_sha256": descendant.get("values_sha256"),
     "descendant_return_code": completed.returncode,
 }}, sort_keys=True, separators=(",", ":")))
 """
@@ -1488,10 +1517,19 @@ class CodexCliBackend:
         tmpdir.mkdir(mode=0o700, exist_ok=True)
         environment = self._child_environment(tmpdir)
         expected_keys = sorted(environment)
+        expected_values_sha256 = hashlib.sha256(
+            json.dumps(
+                environment,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
         parent_keys: list[str] = []
         raw_parent_keys: list[str] = []
         descendant_keys: list[str] = []
         raw_descendant_keys: list[str] = []
+        parent_values_sha256: str | None = None
+        descendant_values_sha256: str | None = None
         error_code: str | None = None
         descendant_return_code: int | None = None
         try:
@@ -1517,6 +1555,10 @@ class CodexCliBackend:
                 raw_parent_keys = observed.get("raw_parent_keys", [])
                 descendant_keys = observed.get("descendant_keys", [])
                 raw_descendant_keys = observed.get("raw_descendant_keys", [])
+                parent_values_sha256 = observed.get("parent_values_sha256")
+                descendant_values_sha256 = observed.get(
+                    "descendant_values_sha256"
+                )
                 descendant_return_code = observed.get("descendant_return_code")
                 if not (
                     isinstance(parent_keys, list)
@@ -1527,6 +1569,12 @@ class CodexCliBackend:
                     and all(isinstance(key, str) for key in descendant_keys)
                     and isinstance(raw_descendant_keys, list)
                     and all(isinstance(key, str) for key in raw_descendant_keys)
+                    and isinstance(parent_values_sha256, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", parent_values_sha256)
+                    is not None
+                    and isinstance(descendant_values_sha256, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", descendant_values_sha256)
+                    is not None
                     and isinstance(descendant_return_code, int)
                 ):
                     raise ValueError("canary result fields are invalid")
@@ -1544,14 +1592,25 @@ class CodexCliBackend:
         host_runtime_added_keys = sorted(
             (set(raw_parent_keys) | set(raw_descendant_keys)) - set(expected_keys)
         )
+        parent_values_matched = (
+            parent_values_sha256 == expected_values_sha256
+        )
+        descendant_values_matched = (
+            descendant_values_sha256 == expected_values_sha256
+        )
         descendant_matched = (
             descendant_return_code == 0
+            and raw_descendant_keys == expected_keys
             and parent_keys == expected_keys
             and descendant_keys == expected_keys
+            and descendant_values_matched
         )
         passed = (
             error_code is None
+            and raw_parent_keys == expected_keys
             and parent_keys == expected_keys
+            and not host_runtime_added_keys
+            and parent_values_matched
             and nonallowlisted_excluded
             and descendant_matched
         )
@@ -1569,6 +1628,8 @@ class CodexCliBackend:
             "worker_environment_policy_sha256": WORKER_ENVIRONMENT_POLICY_SHA256,
             "parent_nonallowlisted_keys_excluded": nonallowlisted_excluded,
             "descendant_inheritance_matched": descendant_matched,
+            "parent_environment_values_matched": parent_values_matched,
+            "descendant_environment_values_matched": descendant_values_matched,
             "environment_values_recorded": False,
             "error_code": error_code,
         }

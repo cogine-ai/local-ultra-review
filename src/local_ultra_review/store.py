@@ -25,12 +25,14 @@ from .contracts import (
     review_identity_hash,
     sha256_json,
     validate_payload,
+    validate_post_store_diagnostic,
     validate_semantic_plan,
 )
 from .completion_projection import (
     completion_source_hashes,
     derive_completion_payload,
     review_candidate_hash,
+    validate_review_candidate_target,
     validate_role_task_record,
     validate_target_packet,
 )
@@ -295,6 +297,11 @@ def _validate_artifact_contract(
                 validate_payload("evaluation-completion", payload)
             except ContractError as error:
                 raise IntegrityError(f"evaluation completion contract failed: {error}") from error
+        elif artifact_type == "diagnostic":
+            try:
+                validate_post_store_diagnostic(payload)
+            except ContractError as error:
+                raise IntegrityError("diagnostic contract failed") from error
         elif artifact_type in {"evaluation_report", "diagnostic_report"}:
             try:
                 validate_report_artifact_payload(artifact_type, payload)
@@ -408,7 +415,7 @@ def _validate_session_sequence(plan: dict, envelopes: list[dict]) -> None:
         for field in ("task_id", "attempt_hash", "thread_id", "process_launch_id")
     }
 
-    for envelope in envelopes[1:]:
+    for envelope_index, envelope in enumerate(envelopes[1:], start=1):
         artifact_type = envelope["artifact_type"]
         if terminal is not None:
             terminal_type, terminal_envelope = terminal
@@ -455,6 +462,17 @@ def _validate_session_sequence(plan: dict, envelopes: list[dict]) -> None:
         if artifact_type in {"evaluation_report", "diagnostic_report"}:
             raise IntegrityError("report cannot precede its corresponding terminal")
         if artifact_type == "diagnostic":
+            expected_prefix_hashes = sorted(
+                prefix["envelope_hash"] for prefix in envelopes[:envelope_index]
+            )
+            if (
+                envelope["producer"].get("operation_id")
+                != "adapter-evaluation-diagnostic"
+                or envelope["input_hashes"] != expected_prefix_hashes
+            ):
+                raise IntegrityError(
+                    "diagnostic must bind every preceding semantic envelope exactly"
+                )
             terminal = (artifact_type, envelope)
             continue
         if artifact_type == "evaluation_completion":
@@ -528,6 +546,7 @@ def _validate_session_sequence(plan: dict, envelopes: list[dict]) -> None:
             ordinals: dict[str, int] = {}
             for candidate in reviewer_result["candidates"]:
                 try:
+                    validate_review_candidate_target(candidate, target_packet)
                     candidate_hash = review_candidate_hash(candidate)
                 except ContractError as error:
                     raise IntegrityError(f"reviewer candidate contract failed: {error}") from error

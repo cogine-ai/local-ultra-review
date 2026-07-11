@@ -25,12 +25,14 @@ from local_ultra_review.backend import (  # noqa: E402
 from local_ultra_review.contracts import (  # noqa: E402
     ALL_MANUAL_ASSURANCE,
     ContractError,
+    DIAGNOSTIC_CONTRACT_VERSION,
     ORCHESTRATION_CONTRACT_VERSION,
     SCHEMA_VERSION,
     SYNTHETIC_ATTEMPT_ASSURANCE,
     adapter_manual_item_hash,
     canonical_finding_hash,
     canonical_json_bytes,
+    post_store_diagnostic_assurance,
     prompt_contracts,
     review_identity_hash,
     schema_contracts,
@@ -69,6 +71,8 @@ from local_ultra_review.store import ArtifactStore, IntegrityError  # noqa: E402
 
 
 TOKEN = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+FINE_GRAINED_PAT = "github_pat_" + "B" * 40
+COMPOUND_SECRET = "compound-secret-value-1234567890abcdef"
 
 
 def run(argv: list[str], cwd: Path, *, text: bool = True) -> str | bytes:
@@ -383,6 +387,92 @@ class GitTargetTests(unittest.TestCase):
         self.assertEqual(actual.manual_dispositions, expected.manual_dispositions)
         self.assertEqual(actual.target_identity_hash, expected.target_identity_hash)
 
+    def test_local_or_environment_fsmonitor_and_repo_path_git_never_execute(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        hook_temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(hook_temporary.cleanup)
+        hook_root = Path(hook_temporary.name)
+        repo.write_text("app.py", "VALUE = 1\n")
+        base = repo.commit("base")
+        repo.write_text("app.py", "VALUE = 2\n")
+        head = repo.commit("head")
+
+        def canary(name: str) -> tuple[Path, Path]:
+            marker = hook_root / f"{name}-ran"
+            executable = hook_root / name
+            executable.write_text(
+                f"#!{sys.executable}\n"
+                "from pathlib import Path\n"
+                f"Path({str(marker)!r}).touch()\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            return executable, marker
+
+        local_hook, local_marker = canary("local-fsmonitor")
+        run(["git", "config", "core.fsmonitor", str(local_hook)], repo.root)
+        seal_two_dot_target(repo.root, base, head)
+        self.assertFalse(local_marker.exists())
+
+        environment_hook, environment_marker = canary("environment-fsmonitor")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.fsmonitor",
+                "GIT_CONFIG_VALUE_0": str(environment_hook),
+            },
+            clear=False,
+        ):
+            seal_two_dot_target(repo.root, base, head)
+        self.assertFalse(environment_marker.exists())
+
+        run(["git", "config", "--unset", "core.fsmonitor"], repo.root)
+        path_git, path_marker = canary("git")
+        repository_git = repo.root / path_git.name
+        repository_git.write_bytes(path_git.read_bytes())
+        repository_git.chmod(0o755)
+        repo.commit("later repository git canary")
+        with mock.patch.dict(
+            os.environ,
+            {"PATH": f".{os.pathsep}{os.environ.get('PATH', '')}"},
+            clear=False,
+        ):
+            seal_two_dot_target(repo.root, base, head)
+        self.assertFalse(path_marker.exists())
+
+    def test_committed_attributes_cannot_downgrade_nul_binary_to_reviewable_text(self) -> None:
+        temporary, repo = self.make_repo()
+        self.addCleanup(temporary.cleanup)
+        repo.write_bytes("asset.bin", b"\x00before\n")
+        base = repo.commit("base")
+        repo.write_text(".gitattributes", "*.bin diff\n")
+        repo.write_bytes("asset.bin", b"\x00after\n")
+        head = repo.commit("force binary as text")
+
+        target = seal_two_dot_target(repo.root, base, head)
+        packet = build_review_packet(target)
+        asset_atom_ids = {
+            atom["atom_id"]
+            for atom in target.coverage_atoms
+            if atom["path"] == "asset.bin"
+        }
+        manual_atom_ids = {
+            atom_id
+            for disposition in target.manual_dispositions
+            if disposition["path"] == "asset.bin"
+            and disposition["reason"] == "binary_content"
+            for atom_id in disposition["atom_ids"]
+        }
+
+        self.assertTrue(asset_atom_ids)
+        self.assertEqual(manual_atom_ids, asset_atom_ids)
+        self.assertFalse(asset_atom_ids & set(packet["reviewable_atom_ids"]))
+        self.assertIn("[WITHHELD:binary_content]", target.redacted_diff_text)
+        self.assertNotIn("\x00after", target.redacted_diff_text)
+
     def test_submodule_ignore_all_cannot_hide_dirty_submodule(self) -> None:
         temporary, repo = self.make_repo()
         self.addCleanup(temporary.cleanup)
@@ -496,6 +586,51 @@ class RedactionTests(unittest.TestCase):
         with self.assertRaises(SensitiveMaterialError):
             assert_safe_sink(json.dumps({"password": raw_secret}))
 
+    def test_compound_secret_keys_and_fine_grained_pat_are_contained(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        repo = GitRepo(Path(temporary.name))
+        repo.write_text("settings.py", "VALUE = 1\n")
+        base = repo.commit("base")
+        repo.write_text(
+            "settings.py",
+            "\n".join(
+                (
+                    f'AWS_SECRET_ACCESS_KEY = "{COMPOUND_SECRET}"',
+                    f'STRIPE_SECRET_KEY = "{COMPOUND_SECRET[::-1]}"',
+                    f'credential = "{FINE_GRAINED_PAT}"',
+                    "",
+                )
+            ),
+        )
+        head = repo.commit("compound secrets")
+
+        target = seal_two_dot_target(repo.root, base, head)
+        packet = json.dumps(build_review_packet(target), sort_keys=True)
+        for secret in (COMPOUND_SECRET, COMPOUND_SECRET[::-1], FINE_GRAINED_PAT):
+            with self.subTest(secret=secret[:16]):
+                self.assertNotIn(secret, packet)
+                self.assertNotIn(hashlib.sha256(secret.encode()).hexdigest(), packet)
+                with self.assertRaises(SensitiveMaterialError):
+                    assert_safe_sink(secret if secret == FINE_GRAINED_PAT else f'AWS_SECRET_ACCESS_KEY="{secret}"')
+        with self.assertRaises(SensitiveMaterialError):
+            assert_safe_sink({"STRIPE_SECRET_KEY": COMPOUND_SECRET})
+        assert_safe_sink(
+            {
+                "ambient_secret_non_access": "not_guaranteed",
+                "password_policy": "minimum-length",
+                "token_count": "12345678",
+            }
+        )
+        self.assertIn("[REDACTED:", target.redacted_diff_text)
+        self.assertTrue(
+            any(
+                item["path"] == "settings.py"
+                and item["reason"] == "sensitive_content_redacted"
+                for item in target.manual_dispositions
+            )
+        )
+
 
 def semantic_plan_for(*, total_attempts: int = 1) -> dict:
     roles = (
@@ -577,11 +712,14 @@ def producer() -> dict:
     }
 
 
-def adapter_producer(operation_id: str = "adapter-target-packet") -> dict:
+def adapter_producer(
+    operation_id: str = "adapter-target-packet",
+    input_hashes: list[str] | None = None,
+) -> dict:
     return {
         "producer_kind": "adapter_operation",
         "operation_id": operation_id,
-        "input_hashes": [],
+        "input_hashes": [] if input_hashes is None else sorted(input_hashes),
     }
 
 
@@ -704,21 +842,9 @@ def completed_completion(plan: dict, reviewer_envelope_hash: str) -> dict:
 
 
 def strict_post_store_diagnostic() -> dict:
-    assurance = {
-        "worker_boundary": "guarded_unconfined",
-        "hard_worker_confinement": "not_provided",
-        "packet_only_read": "not_guaranteed",
-        "residual_tool_surface": "unknown",
-        "residual_tool_inventory": "unavailable",
-        "worker_child_environment": "not_verified",
-        "filesystem_write_mitigation": "not_verified",
-        "nested_web_search": "not_verified",
-        "backend_stateless_attestation": "unavailable",
-        "target_execution": "not_requested",
-    }
     return {
         "schema_version": SCHEMA_VERSION,
-        "diagnostic_contract_version": "evaluation-diagnostic-v1",
+        "diagnostic_contract_version": DIAGNOSTIC_CONTRACT_VERSION,
         "diagnostic_kind": "post_store_incomplete",
         "status": "incomplete",
         "profile": "evaluation_slice_v2",
@@ -731,7 +857,7 @@ def strict_post_store_diagnostic() -> dict:
         "completion_created": False,
         "failure_phase": "reviewer_dispatch",
         "reason_codes": ["worker_unavailable"],
-        "assurance_state": assurance,
+        "assurance_state": post_store_diagnostic_assurance(),
     }
 
 
@@ -784,7 +910,7 @@ def strict_candidate(label: str = "A", *, severity: str = "Important") -> dict:
     return {
         "severity": severity,
         "file": "app.py",
-        "line": 1 if label == "A" else 2,
+        "line": 1,
         "title": f"Candidate {label}",
         "failure_scenario": f"Failure {label} is reachable.",
         "evidence": [f"Evidence {label}."],
@@ -1701,12 +1827,19 @@ class ArtifactStoreTests(unittest.TestCase):
             target_packet_payload_hash=target["payload_hash"],
             timeout_seconds=30,
         )
-        failure.write_artifact(
+        reviewer_packet = failure.write_artifact(
             "reviewer_packet", pending, adapter_producer("adapter-reviewer-packet")
         )
         diagnostic_payload = strict_post_store_diagnostic()
         diagnostic = failure.write_artifact(
-            "diagnostic", diagnostic_payload, adapter_producer("adapter-diagnostic")
+            "diagnostic",
+            diagnostic_payload,
+            adapter_producer(
+                "adapter-evaluation-diagnostic",
+                sorted(
+                    [target["envelope_hash"], reviewer_packet["envelope_hash"]]
+                ),
+            ),
         )
         diagnostic_content = render_diagnostic_report(
             plan=failure._plan,
@@ -1919,10 +2052,12 @@ class ArtifactStoreTests(unittest.TestCase):
             "evaluation_completion",
         )
         for index, artifact_type in enumerate(adapter_types):
-            payload = (
-                all_manual_completion(plan)
-                if artifact_type == "evaluation_completion"
-                else make_report_payload(
+            if artifact_type == "evaluation_completion":
+                payload = all_manual_completion(plan)
+            elif artifact_type == "diagnostic":
+                payload = strict_post_store_diagnostic()
+            elif artifact_type in {"evaluation_report", "diagnostic_report"}:
+                payload = make_report_payload(
                     artifact_type,
                     (
                         render_evaluation_report(
@@ -1939,9 +2074,8 @@ class ArtifactStoreTests(unittest.TestCase):
                         )
                     ),
                 )
-                if artifact_type in {"evaluation_report", "diagnostic_report"}
-                else {"safe": artifact_type}
-            )
+            else:
+                payload = {"safe": artifact_type}
             store_module._validate_artifact_contract(
                 artifact_type,
                 payload,
@@ -1956,6 +2090,107 @@ class ArtifactStoreTests(unittest.TestCase):
             store_module._validate_artifact_contract(
                 "target_packet", {"safe": True}, producer()
             )
+
+    def test_diagnostic_contract_rejects_false_authority_and_binds_exact_prefix(self) -> None:
+        malicious = {
+            "status": "complete",
+            "authority": "canonical_review",
+            "authoritative_review": True,
+            "simulated_review_verdict": "clean",
+        }
+        with self.assertRaises(IntegrityError):
+            store_module._validate_artifact_contract(
+                "diagnostic",
+                malicious,
+                adapter_producer("adapter-evaluation-diagnostic"),
+            )
+
+        for inputs in ([], ["f" * 64]):
+            temporary, store, _session = self.make_store(total_attempts=1)
+            self.addCleanup(temporary.cleanup)
+            target = store.write_artifact(
+                "target_packet",
+                strict_target_packet(),
+                adapter_producer("adapter-target-packet"),
+            )
+            with self.subTest(inputs=inputs), self.assertRaises(IntegrityError):
+                store.write_artifact(
+                    "diagnostic",
+                    strict_post_store_diagnostic(),
+                    adapter_producer(
+                        "adapter-evaluation-diagnostic",
+                        inputs,
+                    ),
+                )
+            self.assertEqual(store.read_artifacts("diagnostic"), [])
+
+        temporary, store, _session = self.make_store(total_attempts=1)
+        self.addCleanup(temporary.cleanup)
+        target = store.write_artifact(
+            "target_packet",
+            strict_target_packet(),
+            adapter_producer("adapter-target-packet"),
+        )
+        diagnostic = store.write_artifact(
+            "diagnostic",
+            strict_post_store_diagnostic(),
+            adapter_producer(
+                "adapter-evaluation-diagnostic",
+                [target["envelope_hash"]],
+            ),
+        )
+        self.assertEqual(diagnostic["input_hashes"], [target["envelope_hash"]])
+        store.verify()
+
+    def test_store_rejects_reviewer_candidate_outside_reviewable_target(self) -> None:
+        temporary, store, _session = self.make_store(total_attempts=2)
+        self.addCleanup(temporary.cleanup)
+        target_payload = strict_target_packet()
+        target = store.write_artifact(
+            "target_packet",
+            target_payload,
+            adapter_producer("adapter-target-packet"),
+        )
+        reviewer_record = build_reviewer_task_record(
+            plan=store._plan,
+            target_packet=target_payload,
+            target_packet_payload_hash=target["payload_hash"],
+            timeout_seconds=30,
+        )
+        store.write_artifact(
+            "reviewer_packet",
+            reviewer_record,
+            adapter_producer("adapter-reviewer-packet"),
+        )
+        invalid_candidate = strict_candidate("outside")
+        invalid_candidate["file"] = "outside.py"
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "task_id": reviewer_record["task_id"],
+            "packet_hash": reviewer_record["packet_hash"],
+            "status": "completed",
+            "coverage": {
+                "reviewed_atom_ids": target_payload["reviewable_atom_ids"],
+                "notes": "Reviewed every sealed reviewable atom.",
+            },
+            "candidates": [invalid_candidate],
+        }
+        fixture = worker_test_envelope(
+            store._plan,
+            "reviewer_result",
+            reviewer_record,
+            result,
+            2,
+        )
+        with self.assertRaisesRegex(IntegrityError, "candidate contract failed"):
+            store.write_artifact(
+                "reviewer_result",
+                fixture["payload"],
+                fixture["producer"],
+            )
+        self.assertEqual(store.read_artifacts("reviewer_result"), [])
+
+    def test_worker_producer_union_rejects_adapter_and_sentinel_evidence(self) -> None:
         with self.assertRaises(IntegrityError):
             store_module._validate_artifact_contract(
                 "reviewer_result", reviewer_wrapper(), adapter_producer()
