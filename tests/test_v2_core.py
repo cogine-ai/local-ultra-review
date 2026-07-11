@@ -1251,6 +1251,25 @@ class CompletionProjectionTests(unittest.TestCase):
                     verifier_result_envelopes=(),
                 )
 
+    def test_projection_rejects_nonmapping_verifier_result_as_contract_error(self) -> None:
+        evidence = list(
+            projection_evidence(
+                candidates=[strict_candidate("A")], dispositions=["confirmed"]
+            )
+        )
+        verifier_results = list(evidence[5])
+        malformed = copy.deepcopy(verifier_results[0])
+        malformed["payload"]["result"] = 7
+        malformed["payload_hash"] = sha256_json(malformed["payload"])
+        malformed["envelope_hash"] = sha256_json(
+            {key: value for key, value in malformed.items() if key != "envelope_hash"}
+        )
+        verifier_results[0] = malformed
+        evidence[5] = tuple(verifier_results)
+
+        with self.assertRaises(ContractError):
+            self.derive(tuple(evidence))
+
     def test_role_task_records_are_exact_reconstructable_and_session_independent(self) -> None:
         evidence = projection_evidence(
             candidates=[strict_candidate("A")], dispositions=["confirmed"]

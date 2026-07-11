@@ -822,7 +822,16 @@ def derive_completion_payload(
         result_by_task: dict[str, dict] = {}
         for envelope in verifier_result_envelopes:
             _validate_source_envelope(envelope, "verifier_result", plan)
-            task_id = envelope["payload"].get("result", {}).get("task_id")
+            wrapper = envelope["payload"]
+            if not isinstance(wrapper, Mapping) or set(wrapper) != {
+                "result",
+                "adapter_manifest",
+            }:
+                raise ValueError("verifier result wrapper fields mismatch")
+            result = wrapper["result"]
+            if not isinstance(result, Mapping):
+                raise ValueError("verifier result must be an object")
+            task_id = result.get("task_id")
             if not isinstance(task_id, str) or task_id in result_by_task:
                 raise ValueError("verifier result task ID is missing or duplicated")
             result_by_task[task_id] = envelope
