@@ -193,6 +193,7 @@ def evaluation_completion_payload() -> dict:
         },
         "reviewer_artifact_hash": HEX_C,
         "verifier_artifact_hashes": [],
+        "verifier_disposition_records": [],
         "canonical_finding_hashes": [],
         "canonical_finding_records": [],
         "manual_item_hashes": [],
@@ -520,6 +521,15 @@ class EvaluationCompletionContractTests(unittest.TestCase):
             }
         )
         payload["verifier_artifact_hashes"] = [HEX_E]
+        payload["verifier_disposition_records"] = [
+            {
+                "candidate_hash": HEX_D,
+                "duplicate_ordinal": 0,
+                "verifier_result_envelope_hash": HEX_E,
+                "disposition": "confirmed",
+                "final_severity": "Important",
+            }
+        ]
         payload["canonical_finding_records"] = [record]
         payload["canonical_finding_hashes"] = [record["canonical_finding_hash"]]
         payload["accepted_artifact_hashes"] = sorted([HEX_C, HEX_E])
@@ -597,6 +607,7 @@ class EvaluationCompletionContractTests(unittest.TestCase):
                 "manual_item_hash": verifier_manual_item_hash(HEX_B, 1, HEX_E),
             },
         ]
+        records.sort(key=lambda record: record["manual_item_hash"])
         payload = evaluation_completion_payload()
         payload["coverage"] = {"total_atoms": 2, "reviewed_atoms": 1, "manual_atoms": 1}
         payload["accounting"].update(
@@ -608,6 +619,22 @@ class EvaluationCompletionContractTests(unittest.TestCase):
             }
         )
         payload["verifier_artifact_hashes"] = [HEX_D, HEX_E]
+        payload["verifier_disposition_records"] = [
+            {
+                "candidate_hash": HEX_B,
+                "duplicate_ordinal": 0,
+                "verifier_result_envelope_hash": HEX_D,
+                "disposition": "needs_manual_review",
+                "final_severity": None,
+            },
+            {
+                "candidate_hash": HEX_B,
+                "duplicate_ordinal": 1,
+                "verifier_result_envelope_hash": HEX_E,
+                "disposition": "needs_manual_review",
+                "final_severity": None,
+            },
+        ]
         payload["accepted_artifact_hashes"] = sorted([HEX_C, HEX_D, HEX_E])
         payload["manual_item_records"] = records
         payload["manual_item_hashes"] = sorted(
@@ -640,8 +667,15 @@ class EvaluationCompletionContractTests(unittest.TestCase):
         )
         mutations.append(duplicated)
         unaccepted = copy.deepcopy(payload)
-        unaccepted["manual_item_records"][1]["verifier_result_envelope_hash"] = HEX_A
-        unaccepted["manual_item_records"][1]["manual_item_hash"] = (
+        verifier_index = next(
+            index
+            for index, record in enumerate(unaccepted["manual_item_records"])
+            if record["domain"] == "verifier_needs_manual_review"
+        )
+        unaccepted["manual_item_records"][verifier_index][
+            "verifier_result_envelope_hash"
+        ] = HEX_A
+        unaccepted["manual_item_records"][verifier_index]["manual_item_hash"] = (
             verifier_manual_item_hash(HEX_B, 0, HEX_A)
         )
         unaccepted["manual_item_hashes"] = sorted(
@@ -676,6 +710,22 @@ class EvaluationCompletionContractTests(unittest.TestCase):
             }
         )
         payload["verifier_artifact_hashes"] = [HEX_D, HEX_E]
+        payload["verifier_disposition_records"] = [
+            {
+                "candidate_hash": HEX_A,
+                "duplicate_ordinal": 1,
+                "verifier_result_envelope_hash": HEX_D,
+                "disposition": "confirmed",
+                "final_severity": "Nit",
+            },
+            {
+                "candidate_hash": HEX_D,
+                "duplicate_ordinal": 0,
+                "verifier_result_envelope_hash": HEX_E,
+                "disposition": "confirmed",
+                "final_severity": "Important",
+            },
+        ]
         payload["canonical_finding_records"] = [first, second]
         payload["canonical_finding_hashes"] = sorted(
             [first["canonical_finding_hash"], second["canonical_finding_hash"]]

@@ -532,19 +532,66 @@ def _validate_evaluation_completion_semantics(value: Mapping[str, Any]) -> None:
 
     accounting = value["accounting"]
     verifier_hashes = value["verifier_artifact_hashes"]
+    disposition_records = value["verifier_disposition_records"]
     if not (
         accounting["verifier_results"]
         == accounting["raw_candidates"]
         == len(verifier_hashes)
+        == len(disposition_records)
     ):
-        raise ContractError("verifier results, raw candidates, and verifier hashes must match")
+        raise ContractError(
+            "verifier results, raw candidates, hashes, and disposition records must match"
+        )
 
-    dispositions = (
-        accounting["confirmed_candidate_dispositions"]
-        + accounting["false_positive"]
-        + accounting["pre_existing"]
-        + accounting["needs_manual_review"]
-    )
+    disposition_sort_keys: list[tuple[str, int, str]] = []
+    disposition_pairs: list[tuple[str, int]] = []
+    disposition_envelopes: list[str] = []
+    disposition_counts = {
+        "confirmed": 0,
+        "false_positive": 0,
+        "pre_existing": 0,
+        "needs_manual_review": 0,
+    }
+    ordinals_by_candidate: dict[str, list[int]] = {}
+    for record in disposition_records:
+        candidate_hash = record["candidate_hash"]
+        ordinal = record["duplicate_ordinal"]
+        envelope_hash = record["verifier_result_envelope_hash"]
+        disposition = record["disposition"]
+        final_severity = record["final_severity"]
+        if (disposition == "confirmed") != (final_severity in {"Important", "Nit"}):
+            raise ContractError(
+                "verifier final severity must be present iff disposition is confirmed"
+            )
+        disposition_sort_keys.append((candidate_hash, ordinal, envelope_hash))
+        disposition_pairs.append((candidate_hash, ordinal))
+        disposition_envelopes.append(envelope_hash)
+        disposition_counts[disposition] += 1
+        ordinals_by_candidate.setdefault(candidate_hash, []).append(ordinal)
+    if disposition_sort_keys != sorted(disposition_sort_keys):
+        raise ContractError("verifier disposition records must be canonically sorted")
+    if len(disposition_pairs) != len(set(disposition_pairs)):
+        raise ContractError("verifier candidate/ordinal pairs must be globally unique")
+    if len(disposition_envelopes) != len(set(disposition_envelopes)):
+        raise ContractError("verifier disposition envelopes must be globally unique")
+    if sorted(disposition_envelopes) != verifier_hashes:
+        raise ContractError("verifier disposition records must project every verifier hash")
+    for candidate_hash, ordinals in ordinals_by_candidate.items():
+        if sorted(ordinals) != list(range(len(ordinals))):
+            raise ContractError(
+                f"verifier duplicate ordinals must be contiguous for {candidate_hash}"
+            )
+    expected_count_fields = {
+        "confirmed": "confirmed_candidate_dispositions",
+        "false_positive": "false_positive",
+        "pre_existing": "pre_existing",
+        "needs_manual_review": "needs_manual_review",
+    }
+    for disposition, field in expected_count_fields.items():
+        if accounting[field] != disposition_counts[disposition]:
+            raise ContractError(f"{field} is not the exact disposition-record projection")
+
+    dispositions = sum(disposition_counts.values())
     if dispositions != accounting["raw_candidates"]:
         raise ContractError("candidate dispositions must sum to raw candidates")
     confirmed = accounting["confirmed_candidate_dispositions"]
@@ -559,6 +606,7 @@ def _validate_evaluation_completion_semantics(value: Mapping[str, Any]) -> None:
         raise ContractError("canonical finding records must match canonical finding count")
     canonical_hashes: list[str] = []
     confirmed_memberships: list[tuple[str, int, str]] = []
+    confirmed_projection: list[tuple[str, int, str, str]] = []
     canonical_root_keys: list[bytes] = []
     for record in canonical_records:
         if not isinstance(record, Mapping) or set(record) != _CANONICAL_FINDING_FIELDS | {
@@ -584,10 +632,29 @@ def _validate_evaluation_completion_semantics(value: Mapping[str, Any]) -> None:
             if identity[2] not in verifier_hashes:
                 raise ContractError("canonical finding references an unaccepted verifier result")
             confirmed_memberships.append(identity)
+            confirmed_projection.append((*identity, instance["final_severity"]))
     if len(confirmed_memberships) != confirmed or len(set(confirmed_memberships)) != confirmed:
         raise ContractError("each confirmed candidate instance must belong to exactly one group")
     if len(set(canonical_root_keys)) != len(canonical_root_keys):
         raise ContractError("one severity-free root cause may appear in only one canonical group")
+    expected_confirmed_projection = sorted(
+        (
+            record["candidate_hash"],
+            record["duplicate_ordinal"],
+            record["verifier_result_envelope_hash"],
+            record["final_severity"],
+        )
+        for record in disposition_records
+        if record["disposition"] == "confirmed"
+    )
+    if sorted(confirmed_projection) != expected_confirmed_projection:
+        raise ContractError(
+            "canonical confirmed instances must exactly project confirmed dispositions"
+        )
+    if canonical_records != sorted(
+        canonical_records, key=lambda record: record["canonical_finding_hash"]
+    ):
+        raise ContractError("canonical finding records must be sorted by hash")
     if value["canonical_finding_hashes"] != sorted(canonical_hashes):
         raise ContractError("canonical finding hashes must be the exact record projection")
 
@@ -647,10 +714,27 @@ def _validate_evaluation_completion_semantics(value: Mapping[str, Any]) -> None:
         raise ContractError("adapter manual disposition count mismatch")
     if verifier_manual_count != accounting["needs_manual_review"]:
         raise ContractError("verifier manual disposition count mismatch")
+    expected_verifier_manual = {
+        (
+            record["candidate_hash"],
+            record["duplicate_ordinal"],
+            record["verifier_result_envelope_hash"],
+        )
+        for record in disposition_records
+        if record["disposition"] == "needs_manual_review"
+    }
+    if verifier_manual_identities != expected_verifier_manual:
+        raise ContractError(
+            "verifier manual items must exactly project needs-manual dispositions"
+        )
     if len(adapter_manual_atoms) != coverage["manual_atoms"]:
         raise ContractError("adapter manual dispositions must cover every manual atom exactly once")
     if value["manual_item_hashes"] != sorted(manual_hashes):
         raise ContractError("manual item hashes must be the exact record projection")
+    if manual_records != sorted(
+        manual_records, key=lambda record: record["manual_item_hash"]
+    ):
+        raise ContractError("manual item records must be sorted by hash")
 
     all_instance_pairs = [
         (candidate_hash, duplicate_ordinal)
@@ -669,9 +753,13 @@ def _validate_evaluation_completion_semantics(value: Mapping[str, Any]) -> None:
         raise ContractError("candidate/ordinal instance belongs to more than one terminal domain")
     if len(all_terminal_envelopes) != len(set(all_terminal_envelopes)):
         raise ContractError("verifier result belongs to more than one terminal domain")
-    unreferenced_verifiers = set(verifier_hashes) - set(all_terminal_envelopes)
-    if len(unreferenced_verifiers) != accounting["false_positive"] + accounting["pre_existing"]:
-        raise ContractError("verifier result references do not reconcile terminal dispositions")
+    referenced_terminal_envelopes = {
+        record["verifier_result_envelope_hash"]
+        for record in disposition_records
+        if record["disposition"] in {"confirmed", "needs_manual_review"}
+    }
+    if set(all_terminal_envelopes) != referenced_terminal_envelopes:
+        raise ContractError("terminal finding/manual references do not match dispositions")
 
     reviewer_state = value["reviewer_execution_state"]
     dispatch_state = value["worker_dispatch_state"]

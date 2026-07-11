@@ -364,13 +364,18 @@ This reviewed prerequisite supersedes any conflicting Task 1/2 contract shape. I
 - Modify: `src/local_ultra_review/resources/schemas/evaluation-completion.schema.json`
 - Modify: `src/local_ultra_review/redaction.py`
 - Modify: `src/local_ultra_review/store.py`
+- Create: `src/local_ultra_review/completion_projection.py`
 - Modify: `tests/test_v2_backend.py`
 - Modify: `tests/test_v2_contracts.py`
 - Modify: `tests/test_v2_core.py`
 
 ### Semantic plan and review identity
 
-- Add one required `semantic_plan` object to the strict stored plan. Keep session ID/root/time outside it.
+- Add one required `semantic_plan` object and one required top-level
+  `target_packet_payload_hash` to the strict stored plan. The packet hash is the
+  SHA-256 of the exact session-independent target packet and is included in
+  `plan_integrity_hash`; Store creation therefore happens only after the packet is
+  built. Keep session ID/root/time outside the semantic plan.
 - `semantic_plan` has exact keys and validation for: `profile=evaluation_slice_v2`, `authority=synthetic_evaluation`, `execution_backend=fake_evaluation`, `release_ready=false`, `roles=["correctness"]`, explicit model, schema contracts, prompt contracts, redaction contract, fake readiness, fake semantic identity, orchestration-contract version, and run-manifest version.
 - Expose single-source public metadata APIs/constants; do not import private versions or duplicate strings in the orchestrator. Exact resource metadata is:
   - schemas: exactly `reviewer-result`, `verifier-result`, and `evaluation-completion`, each with `schema_version` and SHA-256 over canonical loaded JSON;
@@ -387,7 +392,7 @@ This reviewed prerequisite supersedes any conflicting Task 1/2 contract shape. I
   })
   ```
 
-  Changing semantic inputs without recomputing review identity must fail even if `plan_integrity_hash` is recomputed. Session ID/root/time changes affect plan integrity but not review identity.
+  Changing semantic inputs without recomputing review identity must fail even if `plan_integrity_hash` is recomputed. Session ID/root/time and the separately anchored exact target-packet payload hash affect plan integrity but do not change this approved review-identity formula. Store requires the first target envelope payload hash to equal the plan anchor on both write and verification.
 - A successful synthetic plan contains only Fake readiness/identity; blocked Codex diagnostic state is never mixed into it. Task 4's semantic-plan builder must reject a backend identity model that differs from the request before Store creation.
 
 ### Fake scenario snapshot and consumption
@@ -450,6 +455,56 @@ This reviewed prerequisite supersedes any conflicting Task 1/2 contract shape. I
 - Store owns artifact-type/producer enforcement for the slice's exact registry. Adapter types are `target_packet`, `reviewer_packet`, `verifier_packet`, `evaluation_completion`, `diagnostic`, `evaluation_report`, and `diagnostic_report`; worker types are only `reviewer_result` and `verifier_result`. For worker result artifacts it cross-checks producer, wrapper manifest, result, task/packet/attempt/thread/process fields, run-manifest version, assurance tuple, and input hashes. Worker `input_hashes` are exactly the sorted task and packet hashes; bound attempt/output hash remains manifest evidence, not an input. Adapter artifact types reject worker producers and worker result types reject adapter producers.
 - Completion gating occurs only after `store.verify()`, then re-reads persisted reviewer/verifier wrappers from the Store and derives assurance, counts, groups, and accepted hashes from those canonical artifacts. It may not trust the in-memory `WorkerAttempt`. Manifest omission, mismatch, wrong producer kind, or post-persistence tampering fails closed.
 
+### Independent-review corrections
+
+The first Task 3.5 implementation was independently rejected before Task 4. These
+corrections are part of Task 3.5 acceptance and supersede any looser wording above.
+
+- Add required `verifier_disposition_records`, one exact record for every raw
+  verifier result: candidate hash, zero-based duplicate ordinal, verifier result
+  envelope hash, actual disposition, and `final_severity` (`Important|Nit` iff
+  confirmed, otherwise explicit `null`). Records are sorted by candidate hash,
+  ordinal, and envelope hash; candidate/ordinal pairs and envelope hashes are
+  globally unique; ordinals for each candidate hash are exactly `0..n-1`.
+- Counts for all four dispositions are exact projections of those records. No
+  verifier may remain in an untyped bucket. Confirmed/manual references must be
+  exact projections of the corresponding disposition records.
+- Add a pure `completion_projection` module shared by Store and Task 4. It owns
+  candidate hashing, deterministic reviewer/verifier task IDs, strict task-packet
+  records, and derivation of the complete completion payload from persisted target,
+  packet, and worker-result envelopes. Store compares a submitted completion byte-
+  semantically with this re-derived payload; Task 4 must not hand-assemble it.
+- Persist one strict target packet before any semantic work. Persist each complete
+  role task record before dispatch; the record binds task ID, role, packet and packet
+  hash, packaged prompt text, output schema, timeout, and recomputed task hash. Every
+  accepted worker result must resolve to exactly one matching role packet/task
+  record. Missing, orphan, extra, or cross-role packets/results reject completion.
+- The strict stored plan also carries `target_packet_payload_hash`, computed before
+  Store creation. The unique first target envelope must match this anchor exactly;
+  normalized/rehashed packet-only tampering therefore cannot retain the sealed plan.
+- Derive coverage and adapter manual records only from the unique persisted target
+  packet. Derive candidate hashes and ordinals from the persisted reviewer candidate
+  array. Derive every verifier disposition, canonical group, merged proof/fix/risk,
+  and Important retention only from persisted verifier wrappers. Completion producer
+  inputs are exactly all semantic source envelope hashes; accepted artifact hashes
+  remain exactly worker result envelope hashes.
+- `canonical_finding_records` and `manual_item_records` are sorted by their embedded
+  hashes. Reversing either array must fail, so one semantic outcome has one canonical
+  completion representation.
+- Store enforces artifact lifecycle from ledger order in both writes and `verify()`:
+  a success path has one completion followed by at most one evaluation report; a
+  failure path has one diagnostic followed by at most one diagnostic report; reports
+  require their terminal source; success and failure terminals are mutually exclusive;
+  no packet/result/semantic artifact follows either terminal.
+- The Fake/manifest/producer evidence validators reject the complete normalized
+  `not_applicable*` sentinel family, including `not_applicable_no_dispatch`, for task,
+  thread, and process evidence. The frozen Fake snapshot rejects `|=` mutation.
+- A pre-dispatch Codex diagnostic records
+  `telemetry_scope=not_applicable_no_dispatch`. CLI binary identity scope is
+  `unexecuted_nofollow_file_object` only after a successful held-file-object hash;
+  inspection failure reports `unavailable` in readiness, semantic identity, and the
+  blocked diagnostic.
+
 ### TDD sequence
 
 1. Test exact semantic-plan fields/constants, exact resource-hash algorithms, public manifest metadata, review-identity binding, and session-field exclusion.
@@ -457,8 +512,13 @@ This reviewed prerequisite supersedes any conflicting Task 1/2 contract shape. I
 3. Mutation-test every completed/all-manual iff, nullable reviewer hash, zero dispatch/accepted hashes, disposition-vs-atom accounting, domain-separated adapter/verifier manual hashes (including duplicate needs-manual and mixed sources), exact assurance tuples, and rejection of cross-spliced states.
 4. Test complete raw/canonical equations, one-group-per-confirmed-instance membership, deterministic merged proof/provenance/fix/risk fields, Important retention, verdict equations, and canonical hash coverage.
 5. Test both producer variants and exact artifact-type registry; reject missing/extra wrapper/manifest fields, fake sentinels, secret metadata, wrong producer kind, producer/manifest/result mismatch, input-hash mismatch, and persisted tampering.
-6. Run focused backend/contract/core tests and capture RED, implement the smallest contract extension, run the full suite, and commit `Reconcile V2 orchestration contracts`.
-7. Generate a review package and obtain an independent backend/contract/store review before Task 4.
+6. Mutation-test the independent-review corrections: confirmed Important cannot be
+   rewritten as false-positive, pre-existing, Nit, or clean; duplicate ordinals and
+   result-envelope cross-splices fail; missing/orphan packets fail; adapter manual
+   records bind the target packet; record order is canonical; and success/failure
+   terminal paths are exclusive and single-report.
+7. Run focused backend/contract/core tests and capture RED, implement the smallest contract extension, run the full suite, and commit `Reconcile V2 orchestration contracts`.
+8. Generate a review package and obtain an independent backend/contract/store review before Task 4. Fix every Critical/Important finding and repeat the review before proceeding.
 
 ## Task 4: Orchestrate reviewer and fresh verifier accounting
 

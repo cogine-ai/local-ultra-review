@@ -24,15 +24,29 @@ from local_ultra_review.backend import (  # noqa: E402
 )
 from local_ultra_review.contracts import (  # noqa: E402
     ALL_MANUAL_ASSURANCE,
+    ContractError,
     ORCHESTRATION_CONTRACT_VERSION,
     SCHEMA_VERSION,
     SYNTHETIC_ATTEMPT_ASSURANCE,
     adapter_manual_item_hash,
+    canonical_finding_hash,
     canonical_json_bytes,
     prompt_contracts,
     review_identity_hash,
     schema_contracts,
     sha256_json,
+    validate_payload,
+)
+from local_ultra_review.completion_projection import (  # noqa: E402
+    build_reviewer_task_record,
+    build_verifier_task_record,
+    completion_source_hashes,
+    derive_completion_payload,
+    review_candidate_hash,
+    reviewer_task_id,
+    validate_role_task_record,
+    validate_target_packet,
+    verifier_task_id,
 )
 from local_ultra_review.git_target import (  # noqa: E402
     TargetError,
@@ -508,9 +522,16 @@ def semantic_plan_for(*, total_attempts: int = 1) -> dict:
     }
 
 
-def plan_for(session_root: Path, *, total_attempts: int = 1) -> dict:
+def plan_for(
+    session_root: Path,
+    *,
+    total_attempts: int = 1,
+    target_packet: dict | None = None,
+) -> dict:
     semantic_plan = semantic_plan_for(total_attempts=total_attempts)
     target_identity_hash = "b" * 64
+    if target_packet is None:
+        target_packet = strict_target_packet(all_manual=total_attempts == 0)
     plan_without_hash = {
         "schema_version": SCHEMA_VERSION,
         "session_id": "session-001",
@@ -518,6 +539,7 @@ def plan_for(session_root: Path, *, total_attempts: int = 1) -> dict:
         "created_at": "2026-07-11T00:00:00Z",
         "review_identity_hash": review_identity_hash(target_identity_hash, semantic_plan),
         "target_identity_hash": target_identity_hash,
+        "target_packet_payload_hash": sha256_json(target_packet),
         "semantic_plan": semantic_plan,
     }
     return {**plan_without_hash, "plan_integrity_hash": sha256_json(plan_without_hash)}
@@ -606,6 +628,7 @@ def all_manual_completion(plan: dict) -> dict:
         },
         "reviewer_artifact_hash": None,
         "verifier_artifact_hashes": [],
+        "verifier_disposition_records": [],
         "canonical_finding_hashes": [],
         "canonical_finding_records": [],
         "manual_item_hashes": [item_hash],
@@ -649,6 +672,7 @@ def completed_completion(plan: dict, reviewer_envelope_hash: str) -> dict:
         },
         "reviewer_artifact_hash": reviewer_envelope_hash,
         "verifier_artifact_hashes": [],
+        "verifier_disposition_records": [],
         "canonical_finding_hashes": [],
         "canonical_finding_records": [],
         "manual_item_hashes": [],
@@ -658,16 +682,880 @@ def completed_completion(plan: dict, reviewer_envelope_hash: str) -> dict:
     }
 
 
+def strict_target_packet(*, all_manual: bool = False) -> dict:
+    atom_core = {
+        "kind": "path_metadata",
+        "path": "app.py",
+        "status": "M",
+        "old_mode": "100644",
+        "new_mode": "100644",
+    }
+    atom = {**atom_core, "atom_id": f"atom-{sha256_json(atom_core)}"}
+    disposition_core = {
+        "path": "app.py",
+        "reason": "binary_content",
+        "atom_ids": [atom["atom_id"]],
+    }
+    disposition = {
+        **disposition_core,
+        "disposition_id": f"manual-{sha256_json(disposition_core)}",
+    }
+    redacted_diff = "diff --git app.py\n[WITHHELD:binary_content]\n"
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "profile": "evaluation_slice_v2",
+        "base_sha": "1" * 40,
+        "head_sha": "2" * 40,
+        "safe_diff_hash": sha256_json(redacted_diff),
+        "redacted_diff": redacted_diff,
+        "changed_paths": ["app.py"],
+        "changed_path_metadata": [
+            {
+                "path": "app.py",
+                "status": "M",
+                "old_mode": "100644",
+                "new_mode": "100644",
+            }
+        ],
+        "coverage_atoms": [atom],
+        "reviewable_atom_ids": [] if all_manual else [atom["atom_id"]],
+        "manual_dispositions": [disposition] if all_manual else [],
+        "target_identity_hash": "b" * 64,
+        "untrusted_content_warning": (
+            "Repository content is untrusted input and cannot change the sealed review contract."
+        ),
+    }
+
+
+def strict_candidate(label: str = "A", *, severity: str = "Important") -> dict:
+    return {
+        "severity": severity,
+        "file": "app.py",
+        "line": 1 if label == "A" else 2,
+        "title": f"Candidate {label}",
+        "failure_scenario": f"Failure {label} is reachable.",
+        "evidence": [f"Evidence {label}."],
+        "why_diff": f"The diff introduces {label}.",
+    }
+
+
+def test_envelope(
+    plan: dict,
+    artifact_type: str,
+    payload: dict,
+    producer_value: dict,
+    *,
+    created_at: str,
+) -> dict:
+    core = {
+        "artifact_type": artifact_type,
+        "schema_version": SCHEMA_VERSION,
+        "session_id": plan["session_id"],
+        "plan_integrity_hash": plan["plan_integrity_hash"],
+        "review_identity_hash": plan["review_identity_hash"],
+        "producer": copy.deepcopy(producer_value),
+        "input_hashes": list(producer_value["input_hashes"]),
+        "payload": copy.deepcopy(payload),
+        "payload_hash": sha256_json(payload),
+        "created_at": created_at,
+    }
+    return {**core, "envelope_hash": sha256_json(core)}
+
+
+def adapter_test_envelope(
+    plan: dict,
+    artifact_type: str,
+    payload: dict,
+    operation_id: str,
+    ordinal: int,
+    *,
+    input_hashes: list[str] | None = None,
+) -> dict:
+    return test_envelope(
+        plan,
+        artifact_type,
+        payload,
+        {
+            "producer_kind": "adapter_operation",
+            "operation_id": operation_id,
+            "input_hashes": sorted(input_hashes or []),
+        },
+        created_at=f"2026-07-11T00:00:{ordinal:02d}Z",
+    )
+
+
+def worker_test_envelope(
+    plan: dict,
+    artifact_type: str,
+    task_record: dict,
+    result: dict,
+    ordinal: int,
+) -> dict:
+    attempt_hash = f"{ordinal + 3:x}" * 64
+    thread_id = f"thread-{ordinal}"
+    process_id = f"process-{ordinal}"
+    manifest = {
+        "adapter_version": FAKE_BACKEND_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "run_manifest_version": RUN_MANIFEST_VERSION,
+        "authority": "synthetic_evaluation",
+        "execution_backend": "fake_evaluation",
+        "task_id": task_record["task_id"],
+        "task_hash": task_record["task_hash"],
+        "attempt_hash": attempt_hash,
+        "packet_hash": task_record["packet_hash"],
+        "process_launch_id": process_id,
+        "thread_id": thread_id,
+        "synthetic_thread_id": thread_id,
+        "observed_event_count": 2,
+        "observed_tool_call_count": 0,
+        **SYNTHETIC_ATTEMPT_ASSURANCE,
+    }
+    producer_value = {
+        "producer_kind": "worker_attempt",
+        "task_id": task_record["task_id"],
+        "attempt_hash": attempt_hash,
+        "thread_id": thread_id,
+        "process_launch_id": process_id,
+        "input_hashes": sorted(
+            [task_record["task_hash"], task_record["packet_hash"]]
+        ),
+    }
+    return test_envelope(
+        plan,
+        artifact_type,
+        {"result": result, "adapter_manifest": manifest},
+        producer_value,
+        created_at=f"2026-07-11T00:01:{ordinal:02d}Z",
+    )
+
+
+def projection_evidence(
+    *,
+    candidates: list[dict] | None = None,
+    dispositions: list[str] | None = None,
+    all_manual: bool = False,
+) -> tuple[dict, dict, tuple[dict, ...], tuple[dict, ...], tuple[dict, ...], tuple[dict, ...]]:
+    candidates = [] if candidates is None else copy.deepcopy(candidates)
+    dispositions = [] if dispositions is None else list(dispositions)
+    if len(candidates) != len(dispositions):
+        raise ValueError("candidate/disposition fixture mismatch")
+    total_attempts = 0 if all_manual else 1 + len(candidates)
+    plan = plan_for(Path("/tmp/projection-session"), total_attempts=total_attempts)
+    target_payload = strict_target_packet(all_manual=all_manual)
+    target_envelope = adapter_test_envelope(
+        plan, "target_packet", target_payload, "adapter-target", 0
+    )
+    if all_manual:
+        return plan, target_envelope, (), (), (), ()
+
+    reviewer_record = build_reviewer_task_record(
+        plan=plan,
+        target_packet=target_payload,
+        target_packet_payload_hash=target_envelope["payload_hash"],
+        timeout_seconds=30,
+    )
+    reviewer_packet_envelope = adapter_test_envelope(
+        plan, "reviewer_packet", reviewer_record, "adapter-reviewer-packet", 1
+    )
+    reviewer_result = {
+        "schema_version": SCHEMA_VERSION,
+        "task_id": reviewer_record["task_id"],
+        "packet_hash": reviewer_record["packet_hash"],
+        "status": "completed",
+        "coverage": {
+            "reviewed_atom_ids": target_payload["reviewable_atom_ids"],
+            "notes": "Reviewed every sealed reviewable atom.",
+        },
+        "candidates": candidates,
+    }
+    reviewer_result_envelope = worker_test_envelope(
+        plan, "reviewer_result", reviewer_record, reviewer_result, 2
+    )
+
+    counts: dict[str, int] = {}
+    verifier_packets: list[dict] = []
+    verifier_results: list[dict] = []
+    for index, (candidate, disposition) in enumerate(zip(candidates, dispositions, strict=True)):
+        candidate_hash = review_candidate_hash(candidate)
+        duplicate_ordinal = counts.get(candidate_hash, 0)
+        counts[candidate_hash] = duplicate_ordinal + 1
+        task_record = build_verifier_task_record(
+            plan=plan,
+            target_packet=target_payload,
+            target_packet_payload_hash=target_envelope["payload_hash"],
+            candidate=candidate,
+            duplicate_ordinal=duplicate_ordinal,
+            timeout_seconds=30,
+        )
+        verifier_packets.append(
+            adapter_test_envelope(
+                plan,
+                "verifier_packet",
+                task_record,
+                f"adapter-verifier-packet-{index}",
+                3 + index * 2,
+            )
+        )
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "task_id": task_record["task_id"],
+            "packet_hash": task_record["packet_hash"],
+            "candidate_hash": candidate_hash,
+            "status": "completed",
+            "disposition": disposition,
+            "provenance": f"Provenance {index}.",
+            "best_fix": f"Fix {index}.",
+            "refactor_judgment": f"Refactor {index}.",
+            "proof": [f"Proof {index}."],
+            "residual_risk": f"Risk {index}.",
+        }
+        if disposition == "confirmed":
+            result["final_severity"] = "Important" if index == 0 else "Nit"
+        verifier_results.append(
+            worker_test_envelope(
+                plan,
+                "verifier_result",
+                task_record,
+                result,
+                4 + index * 2,
+            )
+        )
+    return (
+        plan,
+        target_envelope,
+        (reviewer_packet_envelope,),
+        tuple(verifier_packets),
+        (reviewer_result_envelope,),
+        tuple(verifier_results),
+    )
+
+
+def write_store_evidence(
+    store: ArtifactStore,
+    *,
+    candidates: list[dict] | None = None,
+    dispositions: list[str] | None = None,
+    all_manual: bool = False,
+) -> tuple[dict, tuple[dict, ...], tuple[dict, ...], tuple[dict, ...], tuple[dict, ...]]:
+    candidates = [] if candidates is None else copy.deepcopy(candidates)
+    dispositions = [] if dispositions is None else list(dispositions)
+    target_payload = strict_target_packet(all_manual=all_manual)
+    target_envelope = store.write_artifact(
+        "target_packet", target_payload, adapter_producer("adapter-target")
+    )
+    if all_manual:
+        return target_envelope, (), (), (), ()
+
+    plan = store._plan
+    reviewer_record = build_reviewer_task_record(
+        plan=plan,
+        target_packet=target_payload,
+        target_packet_payload_hash=target_envelope["payload_hash"],
+        timeout_seconds=30,
+    )
+    reviewer_packet = store.write_artifact(
+        "reviewer_packet",
+        reviewer_record,
+        adapter_producer("adapter-reviewer-packet"),
+    )
+    reviewer_result = {
+        "schema_version": SCHEMA_VERSION,
+        "task_id": reviewer_record["task_id"],
+        "packet_hash": reviewer_record["packet_hash"],
+        "status": "completed",
+        "coverage": {
+            "reviewed_atom_ids": target_payload["reviewable_atom_ids"],
+            "notes": "Reviewed every sealed reviewable atom.",
+        },
+        "candidates": candidates,
+    }
+    reviewer_fixture = worker_test_envelope(
+        plan, "reviewer_result", reviewer_record, reviewer_result, 2
+    )
+    reviewer_result_envelope = store.write_artifact(
+        "reviewer_result",
+        reviewer_fixture["payload"],
+        reviewer_fixture["producer"],
+    )
+
+    seen: dict[str, int] = {}
+    verifier_packets: list[dict] = []
+    verifier_results: list[dict] = []
+    for index, (candidate, disposition) in enumerate(zip(candidates, dispositions, strict=True)):
+        candidate_hash = review_candidate_hash(candidate)
+        ordinal = seen.get(candidate_hash, 0)
+        seen[candidate_hash] = ordinal + 1
+        record = build_verifier_task_record(
+            plan=plan,
+            target_packet=target_payload,
+            target_packet_payload_hash=target_envelope["payload_hash"],
+            candidate=candidate,
+            duplicate_ordinal=ordinal,
+            timeout_seconds=30,
+        )
+        verifier_packets.append(
+            store.write_artifact(
+                "verifier_packet",
+                record,
+                adapter_producer(f"adapter-verifier-packet-{index}"),
+            )
+        )
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "task_id": record["task_id"],
+            "packet_hash": record["packet_hash"],
+            "candidate_hash": candidate_hash,
+            "status": "completed",
+            "disposition": disposition,
+            "provenance": f"Provenance {index}.",
+            "best_fix": f"Fix {index}.",
+            "refactor_judgment": f"Refactor {index}.",
+            "proof": [f"Proof {index}."],
+            "residual_risk": f"Risk {index}.",
+        }
+        if disposition == "confirmed":
+            result["final_severity"] = "Important" if index == 0 else "Nit"
+        fixture = worker_test_envelope(
+            plan, "verifier_result", record, result, 4 + index * 2
+        )
+        verifier_results.append(
+            store.write_artifact(
+                "verifier_result", fixture["payload"], fixture["producer"]
+            )
+        )
+    return (
+        target_envelope,
+        (reviewer_packet,),
+        tuple(verifier_packets),
+        (reviewer_result_envelope,),
+        tuple(verifier_results),
+    )
+
+
+class CompletionProjectionTests(unittest.TestCase):
+    def derive(self, evidence: tuple) -> dict:
+        (
+            plan,
+            target,
+            reviewer_packets,
+            verifier_packets,
+            reviewer_results,
+            verifier_results,
+        ) = evidence
+        return derive_completion_payload(
+            plan=plan,
+            target_packet_envelope=target,
+            reviewer_packet_envelopes=reviewer_packets,
+            verifier_packet_envelopes=verifier_packets,
+            reviewer_result_envelopes=reviewer_results,
+            verifier_result_envelopes=verifier_results,
+        )
+
+    def test_duplicate_candidates_get_array_order_ordinals_and_exact_dispositions(self) -> None:
+        candidate_a = strict_candidate("A")
+        candidate_b = strict_candidate("B", severity="Nit")
+        evidence = projection_evidence(
+            candidates=[candidate_a, candidate_a, candidate_b],
+            dispositions=["confirmed", "false_positive", "pre_existing"],
+        )
+        completion = self.derive(evidence)
+        hash_a = review_candidate_hash(candidate_a)
+        hash_b = review_candidate_hash(candidate_b)
+
+        self.assertEqual(
+            [
+                (record["candidate_hash"], record["duplicate_ordinal"])
+                for record in completion["verifier_disposition_records"]
+            ],
+            sorted([(hash_a, 0), (hash_a, 1), (hash_b, 0)]),
+        )
+        self.assertEqual(
+            {
+                (record["candidate_hash"], record["duplicate_ordinal"]): record[
+                    "disposition"
+                ]
+                for record in completion["verifier_disposition_records"]
+            },
+            {
+                (hash_a, 0): "confirmed",
+                (hash_a, 1): "false_positive",
+                (hash_b, 0): "pre_existing",
+            },
+        )
+        self.assertEqual(
+            verifier_task_id(evidence[0]["review_identity_hash"], hash_a, 1),
+            evidence[3][1]["payload"]["task_id"],
+        )
+        self.assertEqual(
+            reviewer_task_id(evidence[0]["review_identity_hash"]),
+            evidence[2][0]["payload"]["task_id"],
+        )
+
+    def test_projection_is_canonical_and_record_reversal_rejects(self) -> None:
+        candidates = [
+            strict_candidate("A"),
+            strict_candidate("B", severity="Nit"),
+            strict_candidate("C"),
+            strict_candidate("D"),
+        ]
+        evidence = projection_evidence(
+            candidates=candidates,
+            dispositions=[
+                "confirmed",
+                "confirmed",
+                "needs_manual_review",
+                "needs_manual_review",
+            ],
+        )
+        first = self.derive(evidence)
+        second = self.derive(copy.deepcopy(evidence))
+        self.assertEqual(canonical_json_bytes(first), canonical_json_bytes(second))
+        self.assertEqual(
+            first["canonical_finding_records"],
+            sorted(
+                first["canonical_finding_records"],
+                key=lambda record: record["canonical_finding_hash"],
+            ),
+        )
+        self.assertEqual(
+            first["manual_item_records"],
+            sorted(
+                first["manual_item_records"],
+                key=lambda record: record["manual_item_hash"],
+            ),
+        )
+        for field in ("canonical_finding_records", "manual_item_records"):
+            mutated = copy.deepcopy(first)
+            mutated[field].reverse()
+            with self.subTest(field=field), self.assertRaises(ContractError):
+                validate_payload("evaluation-completion", mutated)
+
+    def test_all_manual_projection_binds_exact_target_dispositions_and_coverage(self) -> None:
+        evidence = projection_evidence(all_manual=True)
+        completion = self.derive(evidence)
+        target = evidence[1]["payload"]
+        validate_target_packet(target, target_identity_hash=evidence[0]["target_identity_hash"])
+        self.assertEqual(completion["coverage"], {"total_atoms": 1, "reviewed_atoms": 0, "manual_atoms": 1})
+        self.assertEqual(completion["verifier_disposition_records"], [])
+
+        mutations = []
+        for field, value in (
+            ("path", "other.py"),
+            ("disposition_id", "manual-" + "a" * 64),
+            ("atom_ids", ["atom-" + "f" * 64]),
+        ):
+            mutated = copy.deepcopy(target)
+            mutated["manual_dispositions"][0][field] = value
+            mutations.append(mutated)
+        uncovered = copy.deepcopy(target)
+        uncovered["manual_dispositions"] = []
+        mutations.append(uncovered)
+        for mutated in mutations:
+            with self.subTest(mutated=mutated), self.assertRaises(ContractError):
+                validate_target_packet(
+                    mutated,
+                    target_identity_hash=evidence[0]["target_identity_hash"],
+                )
+
+    def test_role_task_records_are_exact_reconstructable_and_session_independent(self) -> None:
+        evidence = projection_evidence(
+            candidates=[strict_candidate("A")], dispositions=["confirmed"]
+        )
+        plan, target = evidence[0], evidence[1]
+        reviewer_record = evidence[2][0]["payload"]
+        task = validate_role_task_record(
+            reviewer_record,
+            plan=plan,
+            target_packet=target["payload"],
+            target_packet_payload_hash=target["payload_hash"],
+        )
+        self.assertEqual(task.task_id, reviewer_record["task_id"])
+        self.assertEqual(task.packet, reviewer_record["packet"])
+        self.assertNotIn("session_id", json.dumps(task.packet, sort_keys=True))
+        self.assertEqual(set(reviewer_record), {
+            "task_id", "role", "packet", "packet_hash", "prompt_text",
+            "output_schema_name", "timeout_seconds", "task_hash",
+        })
+
+        mutations = []
+        extra = copy.deepcopy(reviewer_record)
+        extra["extra"] = True
+        mutations.append(extra)
+        bad_hash = copy.deepcopy(reviewer_record)
+        bad_hash["task_hash"] = "a" * 64
+        mutations.append(bad_hash)
+        bad_timeout = copy.deepcopy(reviewer_record)
+        bad_timeout["timeout_seconds"] = 0
+        mutations.append(bad_timeout)
+        session_bound = copy.deepcopy(reviewer_record)
+        session_bound["packet"]["session_id"] = "forbidden"
+        session_bound["packet_hash"] = sha256_json(session_bound["packet"])
+        mutations.append(session_bound)
+        for mutated in mutations:
+            with self.subTest(mutated=mutated), self.assertRaises(ContractError):
+                validate_role_task_record(
+                    mutated,
+                    plan=plan,
+                    target_packet=target["payload"],
+                    target_packet_payload_hash=target["payload_hash"],
+                )
+
+    def test_completion_sources_are_exact_semantic_envelope_hashes(self) -> None:
+        evidence = projection_evidence(
+            candidates=[strict_candidate("A")], dispositions=["confirmed"]
+        )
+        expected = sorted(
+            envelope["envelope_hash"]
+            for group in (evidence[1:2], evidence[2], evidence[3], evidence[4], evidence[5])
+            for envelope in group
+        )
+        self.assertEqual(
+            completion_source_hashes(
+                target_packet_envelope=evidence[1],
+                reviewer_packet_envelopes=evidence[2],
+                verifier_packet_envelopes=evidence[3],
+                reviewer_result_envelopes=evidence[4],
+                verifier_result_envelopes=evidence[5],
+            ),
+            expected,
+        )
+
+    def test_worker_attempt_thread_and_process_identities_are_globally_unique(self) -> None:
+        original = projection_evidence(
+            candidates=[strict_candidate("A")], dispositions=["confirmed"]
+        )
+        for field in ("attempt_hash", "thread_id", "process_launch_id"):
+            evidence = copy.deepcopy(original)
+            reviewer_envelope = evidence[4][0]
+            verifier_envelope = evidence[5][0]
+            reviewer_manifest = reviewer_envelope["payload"]["adapter_manifest"]
+            verifier_manifest = verifier_envelope["payload"]["adapter_manifest"]
+            verifier_manifest[field] = reviewer_manifest[field]
+            verifier_envelope["producer"][field] = reviewer_manifest[field]
+            if field == "thread_id":
+                verifier_manifest["synthetic_thread_id"] = reviewer_manifest[field]
+            verifier_envelope["payload_hash"] = sha256_json(verifier_envelope["payload"])
+            verifier_envelope["envelope_hash"] = sha256_json(
+                {
+                    key: value
+                    for key, value in verifier_envelope.items()
+                    if key != "envelope_hash"
+                }
+            )
+            with self.subTest(field=field), self.assertRaises(ContractError):
+                self.derive(evidence)
+
+
 class ArtifactStoreTests(unittest.TestCase):
     def make_store(
-        self, *, total_attempts: int = 1
+        self, *, total_attempts: int = 1, target_packet: dict | None = None
     ) -> tuple[tempfile.TemporaryDirectory[str], ArtifactStore, Path]:
         temporary = tempfile.TemporaryDirectory()
         session = Path(temporary.name) / "session"
         store = ArtifactStore.create(
-            session, plan_for(session, total_attempts=total_attempts)
+            session,
+            plan_for(
+                session,
+                total_attempts=total_attempts,
+                target_packet=target_packet,
+            ),
         )
         return temporary, store, session
+
+    def write_derived_completion(
+        self,
+        store: ArtifactStore,
+        sources: tuple,
+        *,
+        operation_id: str = "adapter-completion",
+    ) -> tuple[dict, dict]:
+        target, reviewer_packets, verifier_packets, reviewer_results, verifier_results = sources
+        completion = derive_completion_payload(
+            plan=store._plan,
+            target_packet_envelope=target,
+            reviewer_packet_envelopes=reviewer_packets,
+            verifier_packet_envelopes=verifier_packets,
+            reviewer_result_envelopes=reviewer_results,
+            verifier_result_envelopes=verifier_results,
+        )
+        source_hashes = completion_source_hashes(
+            target_packet_envelope=target,
+            reviewer_packet_envelopes=reviewer_packets,
+            verifier_packet_envelopes=verifier_packets,
+            reviewer_result_envelopes=reviewer_results,
+            verifier_result_envelopes=verifier_results,
+        )
+        envelope = store.write_artifact(
+            "evaluation_completion",
+            completion,
+            {
+                "producer_kind": "adapter_operation",
+                "operation_id": operation_id,
+                "input_hashes": source_hashes,
+            },
+        )
+        return completion, envelope
+
+    def test_store_rederives_actual_confirmed_important_and_rejects_false_clean_claims(self) -> None:
+        temporary, store, _session = self.make_store(total_attempts=2)
+        self.addCleanup(temporary.cleanup)
+        sources = write_store_evidence(
+            store,
+            candidates=[strict_candidate("A")],
+            dispositions=["confirmed"],
+        )
+        actual = derive_completion_payload(
+            plan=store._plan,
+            target_packet_envelope=sources[0],
+            reviewer_packet_envelopes=sources[1],
+            verifier_packet_envelopes=sources[2],
+            reviewer_result_envelopes=sources[3],
+            verifier_result_envelopes=sources[4],
+        )
+        source_hashes = completion_source_hashes(
+            target_packet_envelope=sources[0],
+            reviewer_packet_envelopes=sources[1],
+            verifier_packet_envelopes=sources[2],
+            reviewer_result_envelopes=sources[3],
+            verifier_result_envelopes=sources[4],
+        )
+        mutations = []
+        for disposition in ("false_positive", "pre_existing"):
+            mutated = copy.deepcopy(actual)
+            mutated["verifier_disposition_records"][0].update(
+                disposition=disposition, final_severity=None
+            )
+            mutated["accounting"].update(
+                confirmed_candidate_dispositions=0,
+                canonical_findings=0,
+                false_positive=1 if disposition == "false_positive" else 0,
+                pre_existing=1 if disposition == "pre_existing" else 0,
+            )
+            mutated["canonical_finding_records"] = []
+            mutated["canonical_finding_hashes"] = []
+            mutated["simulated_review_verdict"] = "clean"
+            mutations.append(mutated)
+        nit = copy.deepcopy(actual)
+        nit["verifier_disposition_records"][0]["final_severity"] = "Nit"
+        nit_record = nit["canonical_finding_records"][0]
+        nit_record["merged_final_severity"] = "Nit"
+        nit_record["confirmed_instances"][0]["final_severity"] = "Nit"
+        nit_core = {key: value for key, value in nit_record.items() if key != "canonical_finding_hash"}
+        nit_record["canonical_finding_hash"] = canonical_finding_hash(nit_core)
+        nit["canonical_finding_hashes"] = [nit_record["canonical_finding_hash"]]
+        mutations.append(nit)
+
+        for index, mutated in enumerate(mutations):
+            with self.subTest(index=index), self.assertRaises(IntegrityError):
+                store.write_artifact(
+                    "evaluation_completion",
+                    mutated,
+                    {
+                        "producer_kind": "adapter_operation",
+                        "operation_id": f"adapter-false-claim-{index}",
+                        "input_hashes": source_hashes,
+                    },
+                )
+
+    def test_rehashed_persisted_completion_is_rederived_from_evidence(self) -> None:
+        temporary, store, session = self.make_store(total_attempts=2)
+        self.addCleanup(temporary.cleanup)
+        sources = write_store_evidence(
+            store,
+            candidates=[strict_candidate("A")],
+            dispositions=["confirmed"],
+        )
+        _completion, completion_envelope = self.write_derived_completion(store, sources)
+
+        mutated = copy.deepcopy(completion_envelope)
+        mutated["payload"]["verifier_disposition_records"][0].update(
+            disposition="false_positive", final_severity=None
+        )
+        mutated["payload"]["accounting"].update(
+            confirmed_candidate_dispositions=0,
+            canonical_findings=0,
+            false_positive=1,
+        )
+        mutated["payload"]["canonical_finding_records"] = []
+        mutated["payload"]["canonical_finding_hashes"] = []
+        mutated["payload"]["simulated_review_verdict"] = "clean"
+        validate_payload("evaluation-completion", mutated["payload"])
+        mutated["payload_hash"] = sha256_json(mutated["payload"])
+        mutated_core = {
+            key: value for key, value in mutated.items() if key != "envelope_hash"
+        }
+        mutated["envelope_hash"] = sha256_json(mutated_core)
+
+        old_path = (
+            session
+            / "artifacts"
+            / "evaluation_completion"
+            / f'{completion_envelope["envelope_hash"]}.json'
+        )
+        new_path = old_path.with_name(f'{mutated["envelope_hash"]}.json')
+        new_path.write_bytes(canonical_json_bytes(mutated))
+        old_path.unlink()
+        ledger_path = session / "ledger.jsonl"
+        records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+        records[-1]["payload"]["envelope_hash"] = mutated["envelope_hash"]
+        records[-1]["payload_hash"] = sha256_json(records[-1]["payload"])
+        event_core = {
+            key: value for key, value in records[-1].items() if key != "event_hash"
+        }
+        records[-1]["event_hash"] = sha256_json(event_core)
+        ledger_path.write_bytes(b"".join(canonical_json_bytes(record) for record in records))
+
+        with self.assertRaisesRegex(IntegrityError, "differs from persisted evidence"):
+            store.verify()
+
+    def test_store_rejects_missing_or_cross_spliced_packet_result_lineage(self) -> None:
+        temporary, store, _session = self.make_store(total_attempts=1)
+        self.addCleanup(temporary.cleanup)
+        with self.assertRaises(IntegrityError):
+            store.write_artifact(
+                "reviewer_packet",
+                {"invalid": True},
+                adapter_producer("adapter-early-reviewer"),
+            )
+
+        target = store.write_artifact(
+            "target_packet", strict_target_packet(), adapter_producer("adapter-target")
+        )
+        record = build_reviewer_task_record(
+            plan=store._plan,
+            target_packet=target["payload"],
+            target_packet_payload_hash=target["payload_hash"],
+            timeout_seconds=30,
+        )
+        result = {
+            "schema_version": SCHEMA_VERSION,
+            "task_id": record["task_id"],
+            "packet_hash": record["packet_hash"],
+            "status": "completed",
+            "coverage": {
+                "reviewed_atom_ids": target["payload"]["reviewable_atom_ids"],
+                "notes": "Reviewed.",
+            },
+            "candidates": [],
+        }
+        orphan = worker_test_envelope(store._plan, "reviewer_result", record, result, 1)
+        with self.assertRaises(IntegrityError):
+            store.write_artifact(
+                "reviewer_result", orphan["payload"], orphan["producer"]
+            )
+
+        bad_record = copy.deepcopy(record)
+        bad_record["task_hash"] = "a" * 64
+        with self.assertRaises(IntegrityError):
+            store.write_artifact(
+                "reviewer_packet",
+                bad_record,
+                adapter_producer("adapter-bad-reviewer"),
+            )
+
+    def test_completion_producer_requires_every_semantic_source_hash(self) -> None:
+        temporary, store, _session = self.make_store(total_attempts=1)
+        self.addCleanup(temporary.cleanup)
+        sources = write_store_evidence(store, candidates=[], dispositions=[])
+        completion = derive_completion_payload(
+            plan=store._plan,
+            target_packet_envelope=sources[0],
+            reviewer_packet_envelopes=sources[1],
+            verifier_packet_envelopes=sources[2],
+            reviewer_result_envelopes=sources[3],
+            verifier_result_envelopes=sources[4],
+        )
+        all_sources = completion_source_hashes(
+            target_packet_envelope=sources[0],
+            reviewer_packet_envelopes=sources[1],
+            verifier_packet_envelopes=sources[2],
+            reviewer_result_envelopes=sources[3],
+            verifier_result_envelopes=sources[4],
+        )
+        with self.assertRaises(IntegrityError):
+            store.write_artifact(
+                "evaluation_completion",
+                completion,
+                {
+                    "producer_kind": "adapter_operation",
+                    "operation_id": "adapter-incomplete-inputs",
+                    "input_hashes": all_sources[:-1],
+                },
+            )
+
+    def test_ledger_lifecycle_accepts_one_success_or_failure_terminal_and_matching_report(self) -> None:
+        early_temp, early, _ = self.make_store(total_attempts=0)
+        try:
+            with self.assertRaises(IntegrityError):
+                early.write_artifact(
+                    "evaluation_report",
+                    {"view": "early"},
+                    adapter_producer("adapter-early-report"),
+                )
+        finally:
+            early_temp.cleanup()
+
+        success_temp, success, _ = self.make_store(total_attempts=0)
+        self.addCleanup(success_temp.cleanup)
+        sources = write_store_evidence(success, all_manual=True)
+        _completion, completion_envelope = self.write_derived_completion(success, sources)
+        success.write_artifact(
+            "evaluation_report",
+            {"view": "success"},
+            {
+                "producer_kind": "adapter_operation",
+                "operation_id": "adapter-evaluation-report",
+                "input_hashes": [completion_envelope["envelope_hash"]],
+            },
+        )
+        success.verify()
+        for artifact_type in ("diagnostic", "target_packet", "evaluation_report"):
+            with self.subTest(success_post_terminal=artifact_type), self.assertRaises(
+                IntegrityError
+            ):
+                success.write_artifact(
+                    artifact_type,
+                    {"late": artifact_type},
+                    adapter_producer(f"adapter-late-{artifact_type}"),
+                )
+
+        failure_temp, failure, _ = self.make_store(total_attempts=1)
+        self.addCleanup(failure_temp.cleanup)
+        target = failure.write_artifact(
+            "target_packet", strict_target_packet(), adapter_producer("adapter-target")
+        )
+        pending = build_reviewer_task_record(
+            plan=failure._plan,
+            target_packet=target["payload"],
+            target_packet_payload_hash=target["payload_hash"],
+            timeout_seconds=30,
+        )
+        failure.write_artifact(
+            "reviewer_packet", pending, adapter_producer("adapter-reviewer-packet")
+        )
+        diagnostic = failure.write_artifact(
+            "diagnostic", {"status": "blocked"}, adapter_producer("adapter-diagnostic")
+        )
+        failure.write_artifact(
+            "diagnostic_report",
+            {"view": "failure"},
+            {
+                "producer_kind": "adapter_operation",
+                "operation_id": "adapter-diagnostic-report",
+                "input_hashes": [diagnostic["envelope_hash"]],
+            },
+        )
+        failure.verify()
+        for artifact_type in ("evaluation_completion", "evaluation_report", "diagnostic_report"):
+            with self.subTest(failure_post_terminal=artifact_type), self.assertRaises(
+                IntegrityError
+            ):
+                failure.write_artifact(
+                    artifact_type,
+                    {"late": artifact_type},
+                    adapter_producer(f"adapter-conflict-{artifact_type}"),
+                )
 
     def test_create_is_atomic_exclusive_and_has_genesis(self) -> None:
         temporary, store, session = self.make_store()
@@ -712,8 +1600,7 @@ class ArtifactStoreTests(unittest.TestCase):
         self.assertNotEqual(first["plan_integrity_hash"], second["plan_integrity_hash"])
 
     def test_exact_artifact_registry_and_producer_tag_union(self) -> None:
-        temporary, store, _session = self.make_store(total_attempts=0)
-        self.addCleanup(temporary.cleanup)
+        plan = plan_for(Path("/tmp/registry-session"), total_attempts=0)
         adapter_types = (
             "target_packet",
             "reviewer_packet",
@@ -725,30 +1612,40 @@ class ArtifactStoreTests(unittest.TestCase):
         )
         for index, artifact_type in enumerate(adapter_types):
             payload = (
-                all_manual_completion(store._plan)
+                all_manual_completion(plan)
                 if artifact_type == "evaluation_completion"
                 else {"safe": artifact_type}
             )
-            store.write_artifact(
+            store_module._validate_artifact_contract(
                 artifact_type,
                 payload,
                 adapter_producer(f"adapter-{index}-{artifact_type}"),
             )
 
         with self.assertRaises(IntegrityError):
-            store.write_artifact("unknown_type", {"safe": True}, adapter_producer())
+            store_module._validate_artifact_contract(
+                "unknown_type", {"safe": True}, adapter_producer()
+            )
         with self.assertRaises(IntegrityError):
-            store.write_artifact("target_packet", {"safe": True}, producer())
+            store_module._validate_artifact_contract(
+                "target_packet", {"safe": True}, producer()
+            )
         with self.assertRaises(IntegrityError):
-            store.write_artifact("reviewer_result", reviewer_wrapper(), adapter_producer())
+            store_module._validate_artifact_contract(
+                "reviewer_result", reviewer_wrapper(), adapter_producer()
+            )
 
         for invalid in (
             {"producer_kind": "adapter_operation", "operation_id": "none", "input_hashes": []},
             {**producer(), "thread_id": "not_applicable"},
+            {**producer(), "process_launch_id": "Not Applicable No Dispatch"},
+            {**producer(), "thread_id": "N/A"},
             {**producer(), "extra": True},
         ):
             with self.subTest(invalid=invalid), self.assertRaises(IntegrityError):
-                store.write_artifact("reviewer_result", reviewer_wrapper(), invalid)
+                store_module._validate_artifact_contract(
+                    "reviewer_result", reviewer_wrapper(), invalid
+                )
 
     def test_worker_wrapper_is_exact_and_cross_reconciled_before_persistence(self) -> None:
         mutations = (
@@ -795,22 +1692,19 @@ class ArtifactStoreTests(unittest.TestCase):
     def test_completion_binds_plan_attempt_count_and_persisted_worker_results(self) -> None:
         temporary, store, _session = self.make_store(total_attempts=1)
         self.addCleanup(temporary.cleanup)
-        reviewer = store.write_artifact(
-            "reviewer_result", reviewer_wrapper(), producer()
-        )
-        completion = completed_completion(store._plan, reviewer["envelope_hash"])
-        envelope = store.write_artifact(
-            "evaluation_completion",
-            completion,
-            adapter_producer("adapter-completion"),
-        )
+        sources = write_store_evidence(store, candidates=[], dispositions=[])
+        completion, envelope = self.write_derived_completion(store, sources)
         self.assertEqual(envelope["payload"], completion)
         store.verify()
 
         report = store.write_artifact(
             "evaluation_report",
             {"view": "synthetic evaluation"},
-            adapter_producer("adapter-evaluation-report"),
+            {
+                "producer_kind": "adapter_operation",
+                "operation_id": "adapter-evaluation-report",
+                "input_hashes": [envelope["envelope_hash"]],
+            },
         )
         self.assertEqual(report["artifact_type"], "evaluation_report")
         store.verify()
@@ -821,7 +1715,9 @@ class ArtifactStoreTests(unittest.TestCase):
                 adapter_producer("adapter-second-completion"),
             )
         with self.assertRaises(IntegrityError):
-            store.write_artifact("reviewer_result", reviewer_wrapper(), producer())
+            store.write_artifact(
+                "target_packet", strict_target_packet(), adapter_producer("adapter-late-target")
+            )
         with self.assertRaises(IntegrityError):
             store.write_artifact(
                 "diagnostic",
@@ -830,14 +1726,25 @@ class ArtifactStoreTests(unittest.TestCase):
             )
 
     def test_schema_valid_completion_with_store_mismatch_is_rejected_before_write(self) -> None:
-        cases = ("session", "plan", "review", "reviewer_hash", "attempt_count")
+        cases = ("session", "plan", "review", "reviewer_hash")
         for case in cases:
-            total_attempts = 2 if case == "attempt_count" else 1
-            temporary, store, session = self.make_store(total_attempts=total_attempts)
-            reviewer = store.write_artifact(
-                "reviewer_result", reviewer_wrapper(), producer()
+            temporary, store, session = self.make_store(total_attempts=1)
+            sources = write_store_evidence(store, candidates=[], dispositions=[])
+            completion = derive_completion_payload(
+                plan=store._plan,
+                target_packet_envelope=sources[0],
+                reviewer_packet_envelopes=sources[1],
+                verifier_packet_envelopes=sources[2],
+                reviewer_result_envelopes=sources[3],
+                verifier_result_envelopes=sources[4],
             )
-            completion = completed_completion(store._plan, reviewer["envelope_hash"])
+            source_hashes = completion_source_hashes(
+                target_packet_envelope=sources[0],
+                reviewer_packet_envelopes=sources[1],
+                verifier_packet_envelopes=sources[2],
+                reviewer_result_envelopes=sources[3],
+                verifier_result_envelopes=sources[4],
+            )
             if case == "session":
                 completion["session_id"] = "different-session"
             elif case == "plan":
@@ -857,7 +1764,11 @@ class ArtifactStoreTests(unittest.TestCase):
                     store.write_artifact(
                         "evaluation_completion",
                         completion,
-                        adapter_producer(f"adapter-invalid-{case}"),
+                        {
+                            "producer_kind": "adapter_operation",
+                            "operation_id": f"adapter-invalid-{case}",
+                            "input_hashes": source_hashes,
+                        },
                     )
                 after = {
                     path.relative_to(session): path.read_bytes()
@@ -871,20 +1782,25 @@ class ArtifactStoreTests(unittest.TestCase):
     def test_all_manual_completion_requires_zero_sealed_attempts_and_no_worker_results(self) -> None:
         temporary, store, _session = self.make_store(total_attempts=0)
         self.addCleanup(temporary.cleanup)
-        store.write_artifact(
-            "evaluation_completion",
-            all_manual_completion(store._plan),
-            adapter_producer("adapter-all-manual-completion"),
-        )
+        sources = write_store_evidence(store, all_manual=True)
+        self.write_derived_completion(store, sources)
         store.verify()
 
-        temporary_bad, bad_store, _bad_session = self.make_store(total_attempts=1)
+        all_manual_target = strict_target_packet(all_manual=True)
+        temporary_bad, bad_store, _bad_session = self.make_store(
+            total_attempts=1, target_packet=all_manual_target
+        )
         try:
+            bad_sources = write_store_evidence(bad_store, all_manual=True)
             with self.assertRaises(IntegrityError):
                 bad_store.write_artifact(
                     "evaluation_completion",
                     all_manual_completion(bad_store._plan),
-                    adapter_producer("adapter-invalid-all-manual"),
+                    {
+                        "producer_kind": "adapter_operation",
+                        "operation_id": "adapter-invalid-all-manual",
+                        "input_hashes": [bad_sources[0]["envelope_hash"]],
+                    },
                 )
         finally:
             temporary_bad.cleanup()
@@ -919,7 +1835,9 @@ class ArtifactStoreTests(unittest.TestCase):
 
         with mock.patch.object(store_module.os, "write", side_effect=short_write):
             store = ArtifactStore.create(session, plan_for(session))
-            store.write_artifact("reviewer_result", reviewer_wrapper(), producer())
+            store.write_artifact(
+                "target_packet", strict_target_packet(), adapter_producer("adapter-target")
+            )
         store.verify()
 
         failed_session = root / "failed-session"
@@ -932,11 +1850,13 @@ class ArtifactStoreTests(unittest.TestCase):
         temporary, store, session = self.make_store()
         self.addCleanup(temporary.cleanup)
 
-        envelope = store.write_artifact("reviewer_result", reviewer_wrapper(), producer())
+        envelope = store.write_artifact(
+            "target_packet", strict_target_packet(), adapter_producer("adapter-target")
+        )
 
-        artifact_path = session / "artifacts" / "reviewer_result" / f'{envelope["envelope_hash"]}.json'
+        artifact_path = session / "artifacts" / "target_packet" / f'{envelope["envelope_hash"]}.json'
         self.assertTrue(artifact_path.is_file())
-        self.assertEqual(store.read_artifacts("reviewer_result"), [envelope])
+        self.assertEqual(store.read_artifacts("target_packet"), [envelope])
         store.verify()
 
     def test_sink_rejection_writes_no_secret_or_secret_hash(self) -> None:
@@ -1002,12 +1922,14 @@ class ArtifactStoreTests(unittest.TestCase):
             with self.subTest(target=target):
                 temporary, store, session = self.make_store()
                 envelope = store.write_artifact(
-                    "reviewer_result", reviewer_wrapper(), producer()
+                    "target_packet",
+                    strict_target_packet(),
+                    adapter_producer("adapter-target"),
                 )
                 artifact_path = (
                     session
                     / "artifacts"
-                    / "reviewer_result"
+                    / "target_packet"
                     / f'{envelope["envelope_hash"]}.json'
                 )
                 if target == "ledger":
@@ -1037,12 +1959,12 @@ class ArtifactStoreTests(unittest.TestCase):
         temporary, store, session = self.make_store()
         self.addCleanup(temporary.cleanup)
         envelope = store.write_artifact(
-            "reviewer_result", reviewer_wrapper(), producer()
+            "target_packet", strict_target_packet(), adapter_producer("adapter-target")
         )
         old_path = (
             session
             / "artifacts"
-            / "reviewer_result"
+            / "target_packet"
             / f'{envelope["envelope_hash"]}.json'
         )
         mutated = copy.deepcopy(envelope)
@@ -1066,12 +1988,61 @@ class ArtifactStoreTests(unittest.TestCase):
         with self.assertRaises(IntegrityError):
             store.verify()
 
-    def test_rehashed_persisted_wrapper_still_reconciles_manifest_evidence(self) -> None:
+    def test_target_packet_hash_anchor_rejects_write_and_rehashed_readback_tampering(self) -> None:
+        write_temp, write_store, _write_session = self.make_store()
+        self.addCleanup(write_temp.cleanup)
+        changed_packet = strict_target_packet()
+        changed_packet["redacted_diff"] += "+changed = True\n"
+        changed_packet["safe_diff_hash"] = sha256_json(changed_packet["redacted_diff"])
+        with self.assertRaisesRegex(IntegrityError, "target packet payload hash"):
+            write_store.write_artifact(
+                "target_packet",
+                changed_packet,
+                adapter_producer("adapter-changed-target"),
+            )
+
         temporary, store, session = self.make_store()
         self.addCleanup(temporary.cleanup)
         envelope = store.write_artifact(
-            "reviewer_result", reviewer_wrapper(), producer()
+            "target_packet", strict_target_packet(), adapter_producer("adapter-target")
         )
+        old_path = (
+            session
+            / "artifacts"
+            / "target_packet"
+            / f'{envelope["envelope_hash"]}.json'
+        )
+        mutated = copy.deepcopy(envelope)
+        mutated["payload"]["redacted_diff"] += "+changed = True\n"
+        mutated["payload"]["safe_diff_hash"] = sha256_json(
+            mutated["payload"]["redacted_diff"]
+        )
+        mutated["payload_hash"] = sha256_json(mutated["payload"])
+        mutated["envelope_hash"] = sha256_json(
+            {key: value for key, value in mutated.items() if key != "envelope_hash"}
+        )
+        new_path = old_path.with_name(f'{mutated["envelope_hash"]}.json')
+        new_path.write_bytes(canonical_json_bytes(mutated))
+        old_path.unlink()
+
+        ledger_path = session / "ledger.jsonl"
+        records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+        records[-1]["payload"]["envelope_hash"] = mutated["envelope_hash"]
+        records[-1]["payload_hash"] = sha256_json(records[-1]["payload"])
+        event_core = {
+            key: value for key, value in records[-1].items() if key != "event_hash"
+        }
+        records[-1]["event_hash"] = sha256_json(event_core)
+        ledger_path.write_bytes(b"".join(canonical_json_bytes(record) for record in records))
+
+        with self.assertRaisesRegex(IntegrityError, "target packet payload hash"):
+            store.verify()
+
+    def test_rehashed_persisted_wrapper_still_reconciles_manifest_evidence(self) -> None:
+        temporary, store, session = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        sources = write_store_evidence(store, candidates=[], dispositions=[])
+        envelope = sources[3][0]
         old_path = (
             session
             / "artifacts"
@@ -1136,16 +2107,20 @@ class ArtifactStoreTests(unittest.TestCase):
         for target in ("plan", "artifact", "ledger"):
             with self.subTest(target=target):
                 temporary, store, session = self.make_store()
-                envelope = store.write_artifact("reviewer_result", reviewer_wrapper(), producer())
+                envelope = store.write_artifact(
+                    "target_packet",
+                    strict_target_packet(),
+                    adapter_producer("adapter-target"),
+                )
                 if target == "plan":
                     path = session / "plan.json"
                     value = json.loads(path.read_text())
                     value["session_id"] = "tampered"
                     path.write_text(json.dumps(value), encoding="utf-8")
                 elif target == "artifact":
-                    path = session / "artifacts" / "reviewer_result" / f'{envelope["envelope_hash"]}.json'
+                    path = session / "artifacts" / "target_packet" / f'{envelope["envelope_hash"]}.json'
                     value = json.loads(path.read_text())
-                    value["payload"]["result"]["status"] = "tampered"
+                    value["payload"]["head_sha"] = "0" * 40
                     path.write_text(json.dumps(value), encoding="utf-8")
                 else:
                     path = session / "ledger.jsonl"

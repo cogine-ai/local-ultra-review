@@ -223,6 +223,7 @@ class _FrozenDict(dict):
     popitem = _immutable
     setdefault = _immutable
     update = _immutable
+    __ior__ = _immutable
 
     def __deepcopy__(self, memo: dict[int, object]) -> "_FrozenDict":
         del memo
@@ -356,7 +357,11 @@ def _schema_key(name: str) -> str:
 def _validate_task(task: WorkerTask) -> None:
     if task.role not in {"reviewer", "verifier"}:
         raise WorkerProtocolError("worker task role is invalid")
-    if not isinstance(task.task_id, str) or not task.task_id:
+    if (
+        not isinstance(task.task_id, str)
+        or not task.task_id
+        or _is_evidence_sentinel(task.task_id)
+    ):
         raise WorkerProtocolError("worker task ID is missing")
     if not isinstance(task.packet, dict):
         raise WorkerProtocolError("worker packet must be an object")
@@ -496,12 +501,25 @@ def _validate_scripted_attempt_before_hash(attempt: object) -> ScriptedAttempt:
         raise WorkerProtocolError("scripted attempt contains unsafe sensitive material") from error
     if attempt.expected_role not in {"reviewer", "verifier"}:
         raise WorkerProtocolError("scripted attempt expected role is invalid")
-    if not isinstance(attempt.process_launch_id, str) or not attempt.process_launch_id.strip():
+    if (
+        not isinstance(attempt.process_launch_id, str)
+        or not attempt.process_launch_id.strip()
+        or _is_evidence_sentinel(attempt.process_launch_id)
+    ):
         raise WorkerProtocolError("scripted attempt has no process launch evidence")
     if not isinstance(attempt.raw_events, tuple) or any(
         not isinstance(event, dict) for event in attempt.raw_events
     ):
         raise WorkerProtocolError("scripted attempt events must be object records")
+    if any(not _event_matches_harmless_contract(event) for event in attempt.raw_events):
+        raise WorkerProtocolError("scripted attempt events violate the harmless contract")
+    thread_ids = _thread_id_occurrences(attempt.raw_events)
+    if (
+        len(thread_ids) != 1
+        or not isinstance(thread_ids[0], str)
+        or _is_evidence_sentinel(thread_ids[0])
+    ):
+        raise WorkerProtocolError("scripted attempt requires one real thread ID")
     if not isinstance(attempt.last_message_template, bytes):
         raise WorkerProtocolError("scripted last-message template must be bytes")
     if not isinstance(attempt.return_code, int) or isinstance(attempt.return_code, bool):
@@ -574,12 +592,18 @@ _RUN_MANIFEST_BASE_FIELDS = {
 _SENTINEL_EVIDENCE = {
     "none",
     "not_applicable",
-    "not-applicable",
-    "n/a",
+    "n_a",
     "unknown",
     "unavailable",
     "adapter",
 }
+
+
+def _is_evidence_sentinel(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+    return normalized in _SENTINEL_EVIDENCE or normalized.startswith("not_applicable")
 
 
 def validate_run_manifest(value: object) -> None:
@@ -607,7 +631,7 @@ def validate_run_manifest(value: object) -> None:
         if (
             not isinstance(child, str)
             or not child.strip()
-            or child.strip().lower() in _SENTINEL_EVIDENCE
+            or _is_evidence_sentinel(child)
         ):
             raise WorkerProtocolError(f"run manifest {key} is invalid")
     if value["synthetic_thread_id"] != value["thread_id"]:
@@ -672,7 +696,11 @@ def _accept_scripted_attempt(
     if len(thread_occurrences) != 1:
         raise WorkerProtocolError("scripted attempt must contain exactly one thread ID")
     thread_id = thread_occurrences[0]
-    if not isinstance(thread_id, str) or not thread_id.strip():
+    if (
+        not isinstance(thread_id, str)
+        or not thread_id.strip()
+        or _is_evidence_sentinel(thread_id)
+    ):
         raise WorkerProtocolError("scripted attempt thread ID is empty")
     if thread_id in seen_thread_ids:
         raise WorkerProtocolError("scripted attempt reused a thread ID")
@@ -1140,6 +1168,7 @@ class CodexCliBackend:
         }
         self._environment_preflight: dict | None = None
         self._cli_binary_sha256: str | None = None
+        self._cli_binary_identity_scope = "unavailable"
         self._cli_version: str | None = None
         self._cli_diagnostic_state = "unavailable"
         self._inspect_cli()
@@ -1179,6 +1208,7 @@ class CodexCliBackend:
             self._cli_binary_sha256 = _hash_nofollow_executable_object(
                 self._codex_path
             )
+            self._cli_binary_identity_scope = "unexecuted_nofollow_file_object"
             self._cli_version = None
             self._cli_diagnostic_state = "object_bound_version_probe_unavailable"
         except OSError:
@@ -1262,7 +1292,7 @@ class CodexCliBackend:
             "cli_version": None,
             "version_probe_executed": False,
             "object_bound_executable_binding": "unavailable",
-            "cli_binary_identity_scope": "unexecuted_nofollow_file_object",
+            "cli_binary_identity_scope": self._cli_binary_identity_scope,
             "environment_preflight": environment_preflight,
             "live_dispatch_authorized": False,
             "live_dispatch_blockers": blockers,
@@ -1288,7 +1318,7 @@ class CodexCliBackend:
             "cli_diagnostic_state": self._cli_diagnostic_state,
             "version_probe_executed": False,
             "object_bound_executable_binding": "unavailable",
-            "cli_binary_identity_scope": "unexecuted_nofollow_file_object",
+            "cli_binary_identity_scope": self._cli_binary_identity_scope,
             "launch_policy_sha256": LAUNCH_POLICY_SHA256,
             "worker_environment_policy_sha256": WORKER_ENVIRONMENT_POLICY_SHA256,
             "diagnostic_record_sha256": self._diagnostic_record_sha256,
@@ -1484,7 +1514,7 @@ class CodexCliBackend:
             "residual_tool_surface": "unknown",
             "residual_tool_inventory": "unavailable",
             "accepted_tool_calls": "not_applicable_no_dispatch",
-            "telemetry_scope": "observed_events_only",
+            "telemetry_scope": "not_applicable_no_dispatch",
             "worker_child_environment": (
                 "allowlist_preflight_passed" if preflight_state == "passed" else "not_verified"
             ),
@@ -1499,7 +1529,7 @@ class CodexCliBackend:
             "cli_version": None,
             "version_probe_executed": False,
             "object_bound_executable_binding": "unavailable",
-            "cli_binary_identity_scope": "unexecuted_nofollow_file_object",
+            "cli_binary_identity_scope": self._cli_binary_identity_scope,
             "launch_policy_sha256": LAUNCH_POLICY_SHA256,
             "worker_environment_policy_sha256": WORKER_ENVIRONMENT_POLICY_SHA256,
             "canonical_inventory_oracle": "unavailable",

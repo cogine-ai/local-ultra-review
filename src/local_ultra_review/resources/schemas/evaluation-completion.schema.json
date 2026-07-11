@@ -21,6 +21,7 @@
     "accounting",
     "reviewer_artifact_hash",
     "verifier_artifact_hashes",
+    "verifier_disposition_records",
     "canonical_finding_hashes",
     "canonical_finding_records",
     "manual_item_hashes",
@@ -145,6 +146,10 @@
     "verifier_artifact_hashes": {
       "$ref": "#/$defs/hashArray"
     },
+    "verifier_disposition_records": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/verifierDispositionRecord"}
+    },
     "canonical_finding_hashes": {
       "$ref": "#/$defs/hashArray"
     },
@@ -244,6 +249,31 @@
     }
   },
   "$defs": {
+    "verifierDispositionRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_hash",
+        "duplicate_ordinal",
+        "verifier_result_envelope_hash",
+        "disposition",
+        "final_severity"
+      ],
+      "properties": {
+        "candidate_hash": {"$ref": "#/$defs/sha256"},
+        "duplicate_ordinal": {"type": "integer", "minimum": 0},
+        "verifier_result_envelope_hash": {"$ref": "#/$defs/sha256"},
+        "disposition": {
+          "enum": ["confirmed", "false_positive", "pre_existing", "needs_manual_review"]
+        },
+        "final_severity": {
+          "oneOf": [
+            {"enum": ["Important", "Nit"]},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
     "nonemptyStringArray": {
       "type": "array",
       "minItems": 1,

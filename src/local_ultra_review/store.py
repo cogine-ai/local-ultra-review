@@ -26,6 +26,13 @@ from .contracts import (
     validate_payload,
     validate_semantic_plan,
 )
+from .completion_projection import (
+    completion_source_hashes,
+    derive_completion_payload,
+    review_candidate_hash,
+    validate_role_task_record,
+    validate_target_packet,
+)
 from .redaction import assert_safe_sink
 
 
@@ -42,6 +49,7 @@ _PLAN_FIELDS = {
     "created_at",
     "review_identity_hash",
     "target_identity_hash",
+    "target_packet_payload_hash",
     "semantic_plan",
     "plan_integrity_hash",
 }
@@ -59,12 +67,16 @@ _ARTIFACT_TYPES = _ADAPTER_ARTIFACT_TYPES | _WORKER_ARTIFACT_TYPES
 _SENTINEL_EVIDENCE = {
     "none",
     "not_applicable",
-    "not-applicable",
-    "n/a",
+    "n_a",
     "unknown",
     "unavailable",
     "adapter",
 }
+
+
+def _is_evidence_sentinel(value: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+    return normalized in _SENTINEL_EVIDENCE or normalized.startswith("not_applicable")
 
 
 def _now() -> str:
@@ -201,6 +213,9 @@ def _validate_plan(plan: dict, session_root: Path) -> str:
         plan.get("review_identity_hash"), "review identity hash"
     )
     target_identity = _validate_hash(plan.get("target_identity_hash"), "target identity hash")
+    _validate_hash(
+        plan.get("target_packet_payload_hash"), "target packet payload hash"
+    )
     try:
         validate_semantic_plan(plan.get("semantic_plan"))
         computed_review_identity = review_identity_hash(
@@ -234,7 +249,7 @@ def _validate_producer(producer: object) -> list[str]:
             if (
                 not isinstance(child, str)
                 or not child.strip()
-                or child.strip().lower() in _SENTINEL_EVIDENCE
+                or _is_evidence_sentinel(child)
             ):
                 raise IntegrityError(f"invalid worker producer {key}")
         _validate_hash(producer["attempt_hash"], "producer attempt hash")
@@ -246,7 +261,7 @@ def _validate_producer(producer: object) -> list[str]:
         if (
             not isinstance(operation_id, str)
             or not operation_id.strip()
-            or operation_id.strip().lower() in _SENTINEL_EVIDENCE
+            or _is_evidence_sentinel(operation_id)
         ):
             raise IntegrityError("invalid adapter producer operation ID")
     else:
@@ -319,37 +334,230 @@ def _validate_artifact_contract(
     return input_hashes
 
 
-def _validate_completion_store_binding(
-    payload: dict,
-    plan: dict,
-    worker_hashes: dict[str, set[str]],
+def _validate_result_task_lineage(
+    envelope: dict,
+    task_record: dict,
+    *,
+    expected_role: str,
+    seen_execution: dict[str, set[str]],
 ) -> None:
-    """Bind a completion to this plan and the canonical persisted worker envelopes."""
+    """Bind one worker result envelope to its immediately preceding task record."""
 
-    assert_safe_sink(
-        {"payload": payload, "plan": plan, "worker_hashes": worker_hashes}
-    )
-    if (
-        payload.get("session_id") != plan["session_id"]
-        or payload.get("plan_integrity_hash") != plan["plan_integrity_hash"]
-        or payload.get("review_identity_hash") != plan["review_identity_hash"]
+    wrapper = envelope["payload"]
+    result = wrapper["result"]
+    manifest = wrapper["adapter_manifest"]
+    producer = envelope["producer"]
+    if task_record["role"] != expected_role:
+        raise IntegrityError("worker result role does not match pending task record")
+    if not (
+        result["task_id"]
+        == manifest["task_id"]
+        == producer["task_id"]
+        == task_record["task_id"]
+        and result["packet_hash"]
+        == manifest["packet_hash"]
+        == task_record["packet_hash"]
+        and manifest["task_hash"] == task_record["task_hash"]
     ):
-        raise IntegrityError("evaluation completion identity does not match the Store plan")
-    reviewer_hashes = worker_hashes.get("reviewer_result", set())
-    verifier_hashes = worker_hashes.get("verifier_result", set())
-    if payload["reviewer_execution_state"] == "completed":
-        if reviewer_hashes != {payload["reviewer_artifact_hash"]}:
-            raise IntegrityError("completion reviewer hash does not match persisted result")
-        if verifier_hashes != set(payload["verifier_artifact_hashes"]):
-            raise IntegrityError("completion verifier hashes do not match persisted results")
-        expected_attempts = 1 + payload["accounting"]["raw_candidates"]
-    else:
-        if reviewer_hashes or verifier_hashes:
-            raise IntegrityError("all-manual completion cannot coexist with worker results")
-        expected_attempts = 0
-    semantic_total = plan["semantic_plan"]["fake_semantic_identity"]["total_attempts"]
-    if semantic_total != expected_attempts:
-        raise IntegrityError("completion dispatch count does not match sealed Fake attempts")
+        raise IntegrityError("worker result does not resolve to its role task record")
+    expected_inputs = sorted([task_record["task_hash"], task_record["packet_hash"]])
+    if envelope["input_hashes"] != expected_inputs:
+        raise IntegrityError("worker result inputs do not bind the pending task record")
+    if expected_role == "verifier":
+        packet = task_record["packet"]
+        if result["candidate_hash"] != packet["candidate_hash"]:
+            raise IntegrityError("verifier result candidate does not match its packet")
+    for field in ("task_id", "attempt_hash", "thread_id", "process_launch_id"):
+        value = manifest[field]
+        if value in seen_execution[field]:
+            raise IntegrityError(f"duplicate worker {field} across accepted results")
+        seen_execution[field].add(value)
+
+
+def _validate_session_sequence(plan: dict, envelopes: list[dict]) -> None:
+    """Validate the single ledger-order lifecycle used by writes and readback."""
+
+    if not envelopes:
+        return
+    first = envelopes[0]
+    if first["artifact_type"] != "target_packet":
+        raise IntegrityError("the first committed artifact must be the target packet")
+    try:
+        validate_target_packet(
+            first["payload"], target_identity_hash=plan["target_identity_hash"]
+        )
+    except ContractError as error:
+        raise IntegrityError(f"target packet contract failed: {error}") from error
+
+    target_envelope = first
+    target_packet = first["payload"]
+    if first["payload_hash"] != plan["target_packet_payload_hash"]:
+        raise IntegrityError("target packet payload hash does not match the Store plan")
+    reviewer_packets: list[dict] = []
+    verifier_packets: list[dict] = []
+    reviewer_results: list[dict] = []
+    verifier_results: list[dict] = []
+    reviewer_result: dict | None = None
+    pending: tuple[str, dict] | None = None
+    verifier_instances: list[tuple[dict, str, int]] = []
+    verifier_index = 0
+    terminal: tuple[str, dict] | None = None
+    report_seen = False
+    seen_execution = {
+        field: set()
+        for field in ("task_id", "attempt_hash", "thread_id", "process_launch_id")
+    }
+
+    for envelope in envelopes[1:]:
+        artifact_type = envelope["artifact_type"]
+        if terminal is not None:
+            terminal_type, terminal_envelope = terminal
+            expected_report = (
+                "evaluation_report"
+                if terminal_type == "evaluation_completion"
+                else "diagnostic_report"
+            )
+            if report_seen or artifact_type != expected_report:
+                raise IntegrityError("artifact follows a terminal outside its one matching report")
+            if envelope["input_hashes"] != [terminal_envelope["envelope_hash"]]:
+                raise IntegrityError("report inputs must exactly reference its terminal artifact")
+            report_seen = True
+            continue
+
+        if artifact_type == "target_packet":
+            raise IntegrityError("a session must contain exactly one target packet")
+        if artifact_type in {"evaluation_report", "diagnostic_report"}:
+            raise IntegrityError("report cannot precede its corresponding terminal")
+        if artifact_type == "diagnostic":
+            terminal = (artifact_type, envelope)
+            continue
+        if artifact_type == "evaluation_completion":
+            if pending is not None:
+                raise IntegrityError("completion cannot follow an unmatched role packet")
+            if target_packet["reviewable_atom_ids"]:
+                if reviewer_result is None or verifier_index != len(verifier_instances):
+                    raise IntegrityError("completion requires a fully matched semantic prefix")
+            elif any((reviewer_packets, verifier_packets, reviewer_results, verifier_results)):
+                raise IntegrityError("all-manual completion permits only the target packet")
+            try:
+                projected = derive_completion_payload(
+                    plan=plan,
+                    target_packet_envelope=target_envelope,
+                    reviewer_packet_envelopes=reviewer_packets,
+                    verifier_packet_envelopes=verifier_packets,
+                    reviewer_result_envelopes=reviewer_results,
+                    verifier_result_envelopes=verifier_results,
+                )
+                source_hashes = completion_source_hashes(
+                    target_packet_envelope=target_envelope,
+                    reviewer_packet_envelopes=reviewer_packets,
+                    verifier_packet_envelopes=verifier_packets,
+                    reviewer_result_envelopes=reviewer_results,
+                    verifier_result_envelopes=verifier_results,
+                )
+            except ContractError as error:
+                raise IntegrityError(f"completion projection failed: {error}") from error
+            if canonical_json_bytes(envelope["payload"]) != canonical_json_bytes(projected):
+                raise IntegrityError("submitted completion differs from persisted evidence projection")
+            if envelope["input_hashes"] != source_hashes:
+                raise IntegrityError("completion inputs must equal every semantic source envelope")
+            terminal = (artifact_type, envelope)
+            continue
+
+        if artifact_type == "reviewer_packet":
+            if (
+                not target_packet["reviewable_atom_ids"]
+                or reviewer_packets
+                or reviewer_result is not None
+                or pending is not None
+            ):
+                raise IntegrityError("reviewer packet is not valid at this lifecycle position")
+            record = envelope["payload"]
+            try:
+                validate_role_task_record(
+                    record,
+                    plan=plan,
+                    target_packet=target_packet,
+                    target_packet_payload_hash=target_envelope["payload_hash"],
+                )
+            except ContractError as error:
+                raise IntegrityError(f"reviewer packet contract failed: {error}") from error
+            if record["role"] != "reviewer":
+                raise IntegrityError("reviewer packet contains the wrong role")
+            reviewer_packets.append(envelope)
+            pending = ("reviewer", record)
+            continue
+
+        if artifact_type == "reviewer_result":
+            if pending is None or pending[0] != "reviewer" or reviewer_result is not None:
+                raise IntegrityError("reviewer result has no unique pending reviewer packet")
+            _validate_result_task_lineage(
+                envelope,
+                pending[1],
+                expected_role="reviewer",
+                seen_execution=seen_execution,
+            )
+            reviewer_results.append(envelope)
+            reviewer_result = envelope["payload"]["result"]
+            ordinals: dict[str, int] = {}
+            for candidate in reviewer_result["candidates"]:
+                try:
+                    candidate_hash = review_candidate_hash(candidate)
+                except ContractError as error:
+                    raise IntegrityError(f"reviewer candidate contract failed: {error}") from error
+                duplicate_ordinal = ordinals.get(candidate_hash, 0)
+                ordinals[candidate_hash] = duplicate_ordinal + 1
+                verifier_instances.append(
+                    (candidate, candidate_hash, duplicate_ordinal)
+                )
+            pending = None
+            continue
+
+        if artifact_type == "verifier_packet":
+            if (
+                reviewer_result is None
+                or pending is not None
+                or verifier_index >= len(verifier_instances)
+            ):
+                raise IntegrityError("verifier packet is not the next expected candidate task")
+            record = envelope["payload"]
+            try:
+                validate_role_task_record(
+                    record,
+                    plan=plan,
+                    target_packet=target_packet,
+                    target_packet_payload_hash=target_envelope["payload_hash"],
+                )
+            except ContractError as error:
+                raise IntegrityError(f"verifier packet contract failed: {error}") from error
+            candidate, candidate_hash, duplicate_ordinal = verifier_instances[verifier_index]
+            packet = record["packet"]
+            if (
+                record["role"] != "verifier"
+                or packet["candidate"] != candidate
+                or packet["candidate_hash"] != candidate_hash
+                or packet["duplicate_ordinal"] != duplicate_ordinal
+            ):
+                raise IntegrityError("verifier packet does not bind the next reviewer candidate")
+            verifier_packets.append(envelope)
+            pending = ("verifier", record)
+            continue
+
+        if artifact_type == "verifier_result":
+            if pending is None or pending[0] != "verifier":
+                raise IntegrityError("verifier result has no unique pending verifier packet")
+            _validate_result_task_lineage(
+                envelope,
+                pending[1],
+                expected_role="verifier",
+                seen_execution=seen_execution,
+            )
+            verifier_results.append(envelope)
+            verifier_index += 1
+            pending = None
+            continue
+
+        raise IntegrityError("artifact is not valid in the semantic lifecycle prefix")
 
 
 class ArtifactStore:
@@ -529,14 +737,10 @@ class ArtifactStore:
             raise IntegrityError("session root entry type does not match contract")
         plan = self._plan
         _validate_plan(plan, self.session_root)
-        _records, committed = self._verify_ledger(plan)
+        records, committed = self._verify_ledger(plan)
 
         observed: set[tuple[str, str]] = set()
-        worker_hashes: dict[str, set[str]] = {
-            "reviewer_result": set(),
-            "verifier_result": set(),
-        }
-        completion_payloads: list[dict] = []
+        envelopes_by_identity: dict[tuple[str, str], dict] = {}
         for path in self._artifact_files():
             envelope = _load_canonical_json(path)
             assert_safe_sink(envelope)
@@ -584,18 +788,20 @@ class ArtifactStore:
             if artifact_identity in observed:
                 raise IntegrityError("duplicate artifact envelope")
             observed.add(artifact_identity)
-            if artifact_type in _WORKER_ARTIFACT_TYPES:
-                worker_hashes[artifact_type].add(envelope_hash)
-            elif artifact_type == "evaluation_completion":
-                completion_payloads.append(envelope["payload"])
+            envelopes_by_identity[artifact_identity] = envelope
         if observed != committed:
             raise IntegrityError("artifact files and commit ledger disagree")
-        if len(completion_payloads) > 1:
-            raise IntegrityError("a session may contain at most one evaluation completion")
-        if completion_payloads:
-            _validate_completion_store_binding(
-                completion_payloads[0], plan, worker_hashes
-            )
+        ordered_envelopes = [
+            envelopes_by_identity[
+                (
+                    record["payload"]["artifact_type"],
+                    record["payload"]["envelope_hash"],
+                )
+            ]
+            for record in records
+            if record["event_type"] == "artifact_committed"
+        ]
+        _validate_session_sequence(plan, ordered_envelopes)
 
     def _append_event_unchecked(
         self, event_type: str, payload: dict, *, allow_reserved: bool = False
@@ -634,24 +840,6 @@ class ArtifactStore:
         input_hashes = _validate_artifact_contract(artifact_type, payload, producer)
         self.verify()
         plan = self._plan
-        completion_directory = self.session_root / "artifacts" / "evaluation_completion"
-        if (
-            completion_directory.exists()
-            and any(completion_directory.glob("*.json"))
-            and artifact_type != "evaluation_report"
-        ):
-            raise IntegrityError("evaluation completion is terminal for the session")
-        worker_hashes = {
-            worker_type: {
-                path.stem
-                for path in (
-                    self.session_root / "artifacts" / worker_type
-                ).glob("*.json")
-            }
-            for worker_type in _WORKER_ARTIFACT_TYPES
-        }
-        if artifact_type == "evaluation_completion":
-            _validate_completion_store_binding(payload, plan, worker_hashes)
         core = {
             "artifact_type": artifact_type,
             "schema_version": SCHEMA_VERSION,
@@ -666,6 +854,19 @@ class ArtifactStore:
         }
         envelope = {**core, "envelope_hash": sha256_json(core)}
         assert_safe_sink(envelope)
+
+        records, _committed = self._verify_ledger(plan)
+        ordered_envelopes = [
+            _load_canonical_json(
+                self.session_root
+                / "artifacts"
+                / record["payload"]["artifact_type"]
+                / f'{record["payload"]["envelope_hash"]}.json'
+            )
+            for record in records
+            if record["event_type"] == "artifact_committed"
+        ]
+        _validate_session_sequence(plan, [*ordered_envelopes, envelope])
 
         artifact_directory = self.session_root / "artifacts" / artifact_type
         artifact_directory.mkdir(mode=0o700, exist_ok=True)

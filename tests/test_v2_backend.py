@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -28,6 +29,7 @@ from local_ultra_review.backend import (  # noqa: E402
     WorkerProtocolError,
     WorkerUnavailable,
     WorkerTask,
+    validate_run_manifest,
 )
 from local_ultra_review.contracts import (  # noqa: E402
     SCHEMA_VERSION,
@@ -297,6 +299,56 @@ class FakeBackendTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         result = backend.run(reviewer_task(), Path(temporary.name))
         self.assertEqual(result.thread_id, "thread-snapshot")
+
+    def test_required_evidence_rejects_normalized_not_applicable_family(self) -> None:
+        sentinels = (
+            "not_applicable_no_dispatch",
+            "Not-Applicable-Else",
+            "not applicable later",
+            "N/A",
+        )
+        for sentinel in sentinels:
+            process_backend = FakeBackend(
+                scenario_id="process-sentinel",
+                attempts=[scripted_attempt(process_launch_id=sentinel)],
+            )
+            with self.subTest(kind="process-readiness", sentinel=sentinel):
+                self.assertFalse(process_backend.readiness()["ready"])
+            with self.subTest(kind="process-run", sentinel=sentinel), self.assertRaises(
+                WorkerProtocolError
+            ):
+                process_backend.run(reviewer_task(), Path(tempfile.mkdtemp()))
+
+            thread_backend = FakeBackend(
+                scenario_id="thread-sentinel",
+                attempts=[
+                    scripted_attempt(
+                        events=(
+                            {"type": "thread.started", "thread_id": sentinel},
+                            {"type": "turn.completed"},
+                        )
+                    )
+                ],
+            )
+            with self.subTest(kind="thread-readiness", sentinel=sentinel):
+                self.assertFalse(thread_backend.readiness()["ready"])
+            with self.subTest(kind="thread-run", sentinel=sentinel), self.assertRaises(
+                WorkerProtocolError
+            ):
+                thread_backend.run(reviewer_task(), Path(tempfile.mkdtemp()))
+
+        accepted = self.run_attempt(scripted_attempt())
+        for field in ("task_id", "thread_id", "synthetic_thread_id", "process_launch_id"):
+            manifest = copy.deepcopy(accepted.manifest)
+            manifest[field] = "Not Applicable No Dispatch"
+            with self.subTest(field=field), self.assertRaises(WorkerProtocolError):
+                validate_run_manifest(manifest)
+
+    def test_recursive_snapshot_rejects_in_place_union(self) -> None:
+        backend = FakeBackend(scenario_id="frozen", attempts=[scripted_attempt()])
+        frozen_event = backend._attempts[0].raw_events[0]  # noqa: SLF001
+        with self.assertRaises(TypeError):
+            frozen_event |= {"extra": "mutation"}
 
     def test_semantic_identity_rejects_sensitive_scenario_or_launch_evidence(self) -> None:
         backends = (
@@ -989,7 +1041,45 @@ class CodexCliBackendTests(unittest.TestCase):
         self.assertFalse(diagnostic["live_dispatch_authorized"])
         self.assertFalse(diagnostic["semantic_subprocess_launched"])
         self.assertEqual(diagnostic["accepted_tool_calls"], "not_applicable_no_dispatch")
+        self.assertEqual(diagnostic["telemetry_scope"], "not_applicable_no_dispatch")
         self.assertEqual(diagnostic["target_execution"], "not_requested")
+
+    def test_failed_binary_inspection_has_unavailable_scope_in_every_view(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        nonexecutable = root / "nonexecutable"
+        nonexecutable.write_text("not executable", encoding="utf-8")
+        regular_target = root / "regular-target"
+        regular_target.write_text("target", encoding="utf-8")
+        symlink = root / "symlink"
+        symlink.symlink_to(regular_target)
+        directory = root / "directory"
+        directory.mkdir()
+        cases = (root / "missing", nonexecutable, symlink, directory)
+
+        for index, path in enumerate(cases):
+            record = root / f"qualification-{index}.json"
+            backend = CodexCliBackend(
+                codex_path=path,
+                model="sealed-model-id",
+                qualification_record=record,
+                parent_environment=parent_environment(),
+            )
+            with self.subTest(path=path):
+                self.assertEqual(
+                    backend.readiness()["cli_binary_identity_scope"], "unavailable"
+                )
+                self.assertEqual(
+                    backend.semantic_identity()["cli_binary_identity_scope"],
+                    "unavailable",
+                )
+                with self.assertRaises(WorkerUnavailable) as raised:
+                    backend.run(reviewer_task(), root / f"attempt-{index}")
+                self.assertEqual(
+                    raised.exception.diagnostic["cli_binary_identity_scope"],
+                    "unavailable",
+                )
 
     def test_record_claiming_complete_inventory_cannot_turn_gate_on(self) -> None:
         _temporary, fake_codex, _record, backend = self.make_backend(
