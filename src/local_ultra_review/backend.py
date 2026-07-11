@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -60,14 +61,24 @@ _EXACT_TOOL_MARKERS = {
     "collaboration",
     "computer_use",
     "exec_command",
+    "file_change",
+    "file_changed",
+    "file_edit",
+    "file_update",
+    "file_write",
     "function_call",
     "image_generation",
     "mcp_call",
     "remote_plugin",
+    "search_query",
     "shell_tool",
     "tool_call",
     "unified_exec",
     "view_image",
+    "web_search",
+    "web_search_call",
+    "web_search_query",
+    "write_file",
 }
 
 DISABLED_FEATURES = (
@@ -231,7 +242,20 @@ def _marker_is_tool_call(marker: str) -> bool:
     if marker in _EXACT_TOOL_MARKERS:
         return True
     return (
-        marker.startswith(("collaboration_", "command_", "function_", "mcp_", "tool_"))
+        marker.startswith(
+            (
+                "collaboration_",
+                "command_",
+                "file_change",
+                "file_write",
+                "function_",
+                "mcp_",
+                "search_query",
+                "tool_",
+                "web_search",
+                "write_file",
+            )
+        )
         or marker.endswith(("_command", "_function_call", "_mcp_call", "_tool_call"))
         or "apply_patch" in marker
     )
@@ -327,8 +351,6 @@ def _validate_task(task: WorkerTask) -> None:
 
 
 def _bind_template(template: bytes, task: WorkerTask) -> bytes:
-    if not isinstance(template, bytes):
-        raise WorkerProtocolError("scripted last-message template must be bytes")
     placeholders = set(_PLACEHOLDER.findall(template))
     unknown = placeholders - _ALLOWED_PLACEHOLDERS
     if unknown:
@@ -350,6 +372,60 @@ def _bind_template(template: bytes, task: WorkerTask) -> bytes:
     if b"{{" in bound or b"}}" in bound:
         raise WorkerProtocolError("scripted attempt contains an unresolved placeholder")
     return bound
+
+
+def _validate_unbound_template(template: bytes, role: str) -> None:
+    placeholders = set(_PLACEHOLDER.findall(template))
+    unknown = placeholders - _ALLOWED_PLACEHOLDERS
+    if unknown:
+        raise WorkerProtocolError("scripted attempt contains an unknown placeholder")
+    remainder = template
+    for placeholder in _ALLOWED_PLACEHOLDERS:
+        remainder = remainder.replace(placeholder, b"")
+    if b"{{" in remainder or b"}}" in remainder:
+        raise WorkerProtocolError("scripted attempt contains an unresolved placeholder")
+    payload = _json_without_duplicate_keys(template)
+    if not isinstance(payload, dict):
+        raise WorkerProtocolError("scripted last-message template must be one JSON object")
+    required = {
+        "task_id": "{{TASK_ID}}",
+        "packet_hash": "{{PACKET_HASH}}",
+    }
+    if role == "verifier":
+        required["candidate_hash"] = "{{CANDIDATE_HASH}}"
+    for field, placeholder in required.items():
+        if payload.get(field) != placeholder:
+            raise WorkerProtocolError(
+                f"scripted attempt {field} must use its unbound adapter placeholder"
+            )
+
+
+def _validate_scripted_attempt_before_hash(attempt: object) -> ScriptedAttempt:
+    if not isinstance(attempt, ScriptedAttempt):
+        raise WorkerProtocolError("scripted attempt has an invalid type")
+    try:
+        assert_safe_sink(attempt.expected_role)
+        assert_safe_sink(attempt.process_launch_id)
+        assert_safe_sink(attempt.raw_events)
+        assert_safe_sink(attempt.last_message_template)
+    except SensitiveMaterialError as error:
+        raise WorkerProtocolError("scripted attempt contains unsafe sensitive material") from error
+    if attempt.expected_role not in {"reviewer", "verifier"}:
+        raise WorkerProtocolError("scripted attempt expected role is invalid")
+    if not isinstance(attempt.process_launch_id, str) or not attempt.process_launch_id.strip():
+        raise WorkerProtocolError("scripted attempt has no process launch evidence")
+    if not isinstance(attempt.raw_events, tuple) or any(
+        not isinstance(event, dict) for event in attempt.raw_events
+    ):
+        raise WorkerProtocolError("scripted attempt events must be object records")
+    if not isinstance(attempt.last_message_template, bytes):
+        raise WorkerProtocolError("scripted last-message template must be bytes")
+    if not isinstance(attempt.return_code, int) or isinstance(attempt.return_code, bool):
+        raise WorkerProtocolError("scripted attempt return code is invalid")
+    if not isinstance(attempt.timed_out, bool):
+        raise WorkerProtocolError("scripted attempt timeout evidence is invalid")
+    _validate_unbound_template(attempt.last_message_template, attempt.expected_role)
+    return attempt
 
 
 def _attempt_hash(attempt: ScriptedAttempt, bound_message: bytes) -> str:
@@ -385,6 +461,7 @@ def _accept_scripted_attempt(
     seen_thread_ids: set[str],
     seen_process_launch_ids: set[str],
 ) -> WorkerAttempt:
+    _validate_scripted_attempt_before_hash(attempt)
     _validate_task(task)
     if attempt.expected_role != task.role:
         raise WorkerProtocolError("scripted attempt role mismatch")
@@ -392,20 +469,8 @@ def _accept_scripted_attempt(
         raise WorkerProtocolError("scripted attempt timed out")
     if attempt.return_code != 0:
         raise WorkerProtocolError("scripted attempt returned a nonzero status")
-    if not isinstance(attempt.process_launch_id, str) or not attempt.process_launch_id.strip():
-        raise WorkerProtocolError("scripted attempt has no process launch evidence")
     if attempt.process_launch_id in seen_process_launch_ids:
         raise WorkerProtocolError("scripted attempt reused a process launch ID")
-    if not isinstance(attempt.raw_events, tuple) or any(
-        not isinstance(event, dict) for event in attempt.raw_events
-    ):
-        raise WorkerProtocolError("scripted attempt events must be object records")
-
-    try:
-        assert_safe_sink(attempt.raw_events)
-        assert_safe_sink(attempt.last_message_template)
-    except SensitiveMaterialError as error:
-        raise WorkerProtocolError("scripted attempt contains unsafe sensitive material") from error
 
     observed_tool_calls = sum(
         1 for event in attempt.raw_events if _event_observes_tool_call(event)
@@ -520,9 +585,7 @@ class FakeBackend:
         try:
             assert_safe_sink(self._scenario_id)
             for attempt in self._attempts:
-                assert_safe_sink(attempt.raw_events)
-                assert_safe_sink(attempt.last_message_template)
-                assert_safe_sink(attempt.process_launch_id)
+                _validate_scripted_attempt_before_hash(attempt)
                 templates.append(
                     {
                         "expected_role": attempt.expected_role,
@@ -593,13 +656,137 @@ def _run_process(
     )
 
 
-def _materialize_exact(path: Path, data: bytes) -> None:
-    if path.exists():
-        if not path.is_file() or path.is_symlink() or path.read_bytes() != data:
-            raise WorkerProtocolError(f"attempt materialization conflicts at {path.name}")
-        return
-    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+def _lexical_absolute_path(path: Path) -> Path:
+    expanded = Path(path).expanduser()
+    if ".." in expanded.parts:
+        raise WorkerProtocolError("adapter path must not contain parent traversal")
+    absolute = Path(os.path.abspath(os.fspath(expanded)))
+    # macOS exposes root-owned compatibility aliases such as /var -> /private/var.
+    # Canonicalize only that first, root-owned component; every caller-controlled
+    # component below it is still opened one-by-one with O_NOFOLLOW.
+    if len(absolute.parts) > 1:
+        first_component = Path(absolute.anchor) / absolute.parts[1]
+        try:
+            first_metadata = os.lstat(first_component)
+        except OSError:
+            first_metadata = None
+        if (
+            first_metadata is not None
+            and stat.S_ISLNK(first_metadata.st_mode)
+            and first_metadata.st_uid == 0
+        ):
+            trusted_target = Path(os.path.realpath(first_component))
+            absolute = trusted_target.joinpath(*absolute.parts[2:])
+    return absolute
+
+
+def _directory_open_flags() -> int:
+    required = ("O_DIRECTORY", "O_NOFOLLOW")
+    if any(not hasattr(os, name) for name in required):
+        raise WorkerProtocolError("no-follow directory traversal is unavailable")
+    return (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+
+
+def _open_directory_chain(path: Path) -> int:
+    absolute = _lexical_absolute_path(path)
+    flags = _directory_open_flags()
     try:
+        descriptor = os.open(absolute.anchor, flags)
+    except OSError as error:
+        raise WorkerProtocolError("cannot open attempt path anchor safely") from error
+    try:
+        for component in absolute.parts[1:]:
+            if component in {"", ".", ".."}:
+                raise WorkerProtocolError("attempt path component is invalid")
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            try:
+                child = os.open(component, flags, dir_fd=descriptor)
+            except OSError as error:
+                raise WorkerProtocolError(
+                    "attempt path contains a symlink or non-directory component"
+                ) from error
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _open_child_directory(parent_descriptor: int, name: str) -> int:
+    if not name or "/" in name or name in {".", ".."}:
+        raise WorkerProtocolError("attempt child directory name is invalid")
+    try:
+        os.mkdir(name, mode=0o700, dir_fd=parent_descriptor)
+    except FileExistsError:
+        pass
+    try:
+        return os.open(name, _directory_open_flags(), dir_fd=parent_descriptor)
+    except OSError as error:
+        raise WorkerProtocolError(
+            "attempt child path is a symlink or non-directory"
+        ) from error
+
+
+def _read_descriptor(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _materialize_exact_at(directory_descriptor: int, name: str, data: bytes) -> None:
+    if not name or "/" in name or name in {".", ".."}:
+        raise WorkerProtocolError("attempt materialization name is invalid")
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise WorkerProtocolError("no-follow file materialization is unavailable")
+    flags = os.O_RDWR | nofollow | getattr(os, "O_CLOEXEC", 0)
+    created = False
+    try:
+        descriptor = os.open(
+            name,
+            flags | os.O_CREAT | os.O_EXCL,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        created = True
+    except FileExistsError:
+        try:
+            descriptor = os.open(name, flags, dir_fd=directory_descriptor)
+        except OSError as error:
+            raise WorkerProtocolError(
+                f"attempt materialization destination is unsafe: {name}"
+            ) from error
+    except OSError as error:
+        raise WorkerProtocolError(
+            f"cannot reserve attempt materialization: {name}"
+        ) from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise WorkerProtocolError(
+                f"attempt materialization destination is not a private regular file: {name}"
+            )
+        if metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+            raise WorkerProtocolError(
+                f"attempt materialization destination permissions are unsafe: {name}"
+            )
+        if not created:
+            if _read_descriptor(descriptor) != data:
+                raise WorkerProtocolError(f"attempt materialization conflicts at {name}")
+            return
         view = memoryview(data)
         offset = 0
         while offset < len(view):
@@ -608,8 +795,56 @@ def _materialize_exact(path: Path, data: bytes) -> None:
                 raise WorkerProtocolError("attempt materialization made no progress")
             offset += written
         os.fsync(descriptor)
+        os.fsync(directory_descriptor)
+    except Exception:
+        if created:
+            try:
+                os.unlink(name, dir_fd=directory_descriptor)
+                os.fsync(directory_descriptor)
+            except OSError:
+                pass
+        raise
     finally:
         os.close(descriptor)
+
+
+def _stat_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _snapshot_executable(path: Path) -> tuple[tuple[int, ...], str]:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("no-follow executable inspection is unavailable")
+    path_metadata = os.lstat(path)
+    if not stat.S_ISREG(path_metadata.st_mode):
+        raise OSError("CLI binary is not a regular file")
+    if not path_metadata.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+        raise OSError("CLI binary is not executable")
+    descriptor = os.open(
+        path,
+        os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0),
+    )
+    try:
+        descriptor_metadata = os.fstat(descriptor)
+        if _stat_identity(descriptor_metadata) != _stat_identity(path_metadata):
+            raise OSError("CLI binary changed before hashing")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    return _stat_identity(path_metadata), digest.hexdigest()
 
 
 def _utc_timestamp(value: str) -> datetime:
@@ -636,7 +871,7 @@ class CodexCliBackend:
             assert_safe_sink(model)
         except SensitiveMaterialError as error:
             raise ValueError("model identifier contains unsafe sensitive material") from error
-        self._codex_path = Path(codex_path).expanduser().resolve()
+        self._codex_path = _lexical_absolute_path(Path(codex_path))
         self._model = model
         self._qualification_record_path = Path(qualification_record).expanduser().resolve()
         source_environment = os.environ if parent_environment is None else parent_environment
@@ -678,12 +913,8 @@ class CodexCliBackend:
 
     def _inspect_cli(self) -> None:
         try:
-            if not self._codex_path.is_file() or not os.access(self._codex_path, os.X_OK):
-                self._cli_diagnostic_state = "binary_unavailable"
-                return
-            self._cli_binary_sha256 = hashlib.sha256(
-                self._codex_path.read_bytes()
-            ).hexdigest()
+            before_identity, before_hash = _snapshot_executable(self._codex_path)
+            self._cli_binary_sha256 = before_hash
             with tempfile.TemporaryDirectory(prefix="local-ultra-review-codex-version-") as root:
                 scratch = Path(root).resolve()
                 tmpdir = scratch / "tmp"
@@ -694,6 +925,10 @@ class CodexCliBackend:
                     cwd=scratch,
                     timeout_seconds=10,
                 )
+            after_identity, after_hash = _snapshot_executable(self._codex_path)
+            if after_identity != before_identity or after_hash != before_hash:
+                self._cli_diagnostic_state = "binary_replaced_during_version_probe"
+                return
             if completed.returncode != 0:
                 self._cli_diagnostic_state = "version_probe_nonzero"
                 return
@@ -790,17 +1025,25 @@ class CodexCliBackend:
 
     def semantic_identity(self) -> dict:
         exposures: list[str] = []
-        if self._qualification_payload is not None:
+        inventory_source = "unavailable"
+        exposures_hash: str | None = None
+        if (
+            self._qualification_state == "valid_diagnostic"
+            and self._qualification_payload is not None
+        ):
             observed = self._qualification_payload.get("known_observed_exposures")
             if isinstance(observed, list) and all(isinstance(item, str) for item in observed):
                 exposures = list(observed)
+                inventory_source = "worker_observed_only"
+                exposures_hash = sha256_json(exposures)
         inventory = {
             "inventory_scope": "known_observed_partial",
+            "inventory_source": inventory_source,
             "residual_tool_surface": "unknown",
             "residual_tool_inventory": "unavailable",
             "canonical_inventory_oracle": "unavailable",
             "known_observed_exposures": exposures,
-            "known_observed_exposures_sha256": sha256_json(exposures),
+            "known_observed_exposures_sha256": exposures_hash,
         }
         return {
             "backend": "codex_cli_guarded",
@@ -820,14 +1063,10 @@ class CodexCliBackend:
 
     def build_launch_spec(self, task: WorkerTask, attempt_dir: Path) -> dict:
         _validate_task(task)
-        attempt_root = Path(attempt_dir).expanduser().resolve()
+        attempt_root = _lexical_absolute_path(Path(attempt_dir))
         packet_dir = attempt_root / "packet"
         scratch_dir = attempt_root / "scratch"
         tmpdir = scratch_dir / "tmp"
-        for directory in (attempt_root, packet_dir, scratch_dir, tmpdir):
-            directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if not directory.is_dir() or directory.is_symlink():
-                raise WorkerProtocolError("attempt path is not a trusted directory")
 
         try:
             schema = load_schema(task.output_schema_name)
@@ -839,8 +1078,22 @@ class CodexCliBackend:
         packet_path = packet_dir / "packet.json"
         schema_path = scratch_dir / "output-schema.json"
         result_path = scratch_dir / "result.json"
-        _materialize_exact(packet_path, packet_bytes)
-        _materialize_exact(schema_path, schema_bytes)
+        descriptors: list[int] = []
+        try:
+            attempt_descriptor = _open_directory_chain(attempt_root)
+            descriptors.append(attempt_descriptor)
+            packet_descriptor = _open_child_directory(attempt_descriptor, "packet")
+            descriptors.append(packet_descriptor)
+            scratch_descriptor = _open_child_directory(attempt_descriptor, "scratch")
+            descriptors.append(scratch_descriptor)
+            tmp_descriptor = _open_child_directory(scratch_descriptor, "tmp")
+            descriptors.append(tmp_descriptor)
+            _materialize_exact_at(packet_descriptor, "packet.json", packet_bytes)
+            _materialize_exact_at(scratch_descriptor, "output-schema.json", schema_bytes)
+            _materialize_exact_at(scratch_descriptor, "result.json", b"")
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
 
         environment = self._child_environment(tmpdir)
         argv = [
