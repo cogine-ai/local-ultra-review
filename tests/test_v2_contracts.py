@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import importlib.resources
 import os
 from pathlib import Path
@@ -8,19 +9,40 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from local_ultra_review.contracts import (  # noqa: E402
+    ALL_MANUAL_ASSURANCE,
     ContractError,
+    ORCHESTRATION_CONTRACT_VERSION,
     SCHEMA_VERSION,
+    SYNTHETIC_ATTEMPT_ASSURANCE,
+    adapter_manual_item_hash,
     canonical_json_bytes,
+    canonical_finding_hash,
     load_schema,
+    prompt_contracts,
     reject_worker_authority_fields,
+    review_identity_hash,
+    schema_contracts,
     sha256_json,
+    validate_semantic_plan,
     validate_payload,
+    verifier_manual_item_hash,
+)
+from local_ultra_review.backend import (  # noqa: E402
+    FAKE_BACKEND_VERSION,
+    PROTOCOL_VERSION,
+    RUN_MANIFEST_VERSION,
+)
+from local_ultra_review.redaction import (  # noqa: E402
+    REDACTION_VERSION,
+    RULESET_HASH,
+    redaction_contract,
 )
 
 
@@ -29,6 +51,7 @@ HEX_B = "b" * 64
 HEX_C = "c" * 64
 HEX_D = "d" * 64
 HEX_E = "e" * 64
+TOKEN = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 
 
 def reviewer_payload(*, with_candidate: bool = True) -> dict:
@@ -107,26 +130,35 @@ def qualification_payload() -> dict:
 
 
 def assurance_contract_under_test() -> dict:
-    return {
-        "worker_profile": "codex_native_guarded",
-        "worker_boundary": "guarded_unconfined",
-        "hard_worker_confinement": "not_provided",
-        "input_discipline": "adapter_packet_minimized",
-        "packet_only_read": "not_guaranteed",
-        "residual_tool_surface": "unknown",
-        "residual_tool_inventory": "unavailable",
-        "accepted_tool_calls": "none_observed",
-        "telemetry_scope": "observed_events_only",
-        "worker_child_environment": "allowlist_preflight_passed",
-        "filesystem_write_mitigation": "read_only_preflight_passed",
-        "nested_web_search": "disabled_and_observed_absent",
-        "broader_network_denial": "not_guaranteed",
-        "connector_github_denial": "not_guaranteed",
-        "ambient_secret_non_access": "not_guaranteed",
-        "context_lineage": "fresh_process_inferred",
-        "backend_stateless_attestation": "unavailable",
-        "target_execution": "not_requested",
+    return dict(SYNTHETIC_ATTEMPT_ASSURANCE)
+
+
+def canonical_finding_record() -> dict:
+    payload = {
+        "root_cause": {
+            "file": "src/example.py",
+            "line": 12,
+            "title": "State can be lost",
+            "failure_scenario": "A retry overwrites the prior state.",
+            "evidence": ["The retry branch assigns before it reads."],
+            "why_diff": "The changed assignment reverses the ordering.",
+        },
+        "merged_final_severity": "Important",
+        "confirmed_instances": [
+            {
+                "candidate_hash": HEX_D,
+                "duplicate_ordinal": 0,
+                "verifier_result_envelope_hash": HEX_E,
+                "final_severity": "Important",
+            }
+        ],
+        "proof": ["The failing branch is reachable after one retry."],
+        "provenance": ["Introduced by the changed retry branch."],
+        "best_fix": ["Restore ownership at the retry boundary."],
+        "refactor_judgment": ["A local ownership fix is sufficient."],
+        "residual_risk": ["Concurrency beyond one retry was not exercised."],
     }
+    return {**payload, "canonical_finding_hash": canonical_finding_hash(payload)}
 
 
 def evaluation_completion_payload() -> dict:
@@ -142,6 +174,8 @@ def evaluation_completion_payload() -> dict:
         "review_identity_hash": HEX_B,
         "protocol_completeness": "complete",
         "simulated_review_verdict": "clean",
+        "reviewer_execution_state": "completed",
+        "worker_dispatch_state": "synthetic_attempts_accepted",
         "coverage": {
             "total_atoms": 1,
             "reviewed_atoms": 1,
@@ -150,7 +184,8 @@ def evaluation_completion_payload() -> dict:
         "accounting": {
             "raw_candidates": 0,
             "verifier_results": 0,
-            "confirmed_findings": 0,
+            "confirmed_candidate_dispositions": 0,
+            "canonical_findings": 0,
             "false_positive": 0,
             "pre_existing": 0,
             "needs_manual_review": 0,
@@ -159,7 +194,9 @@ def evaluation_completion_payload() -> dict:
         "reviewer_artifact_hash": HEX_C,
         "verifier_artifact_hashes": [],
         "canonical_finding_hashes": [],
+        "canonical_finding_records": [],
         "manual_item_hashes": [],
+        "manual_item_records": [],
         "accepted_artifact_hashes": [HEX_C],
         "assurance_contract_under_test": assurance_contract_under_test(),
     }
@@ -393,7 +430,21 @@ class EvaluationCompletionContractTests(unittest.TestCase):
         payload = evaluation_completion_payload()
         payload["coverage"] = {"total_atoms": 2, "reviewed_atoms": 1, "manual_atoms": 1}
         payload["accounting"]["adapter_manual_items"] = 1
-        payload["manual_item_hashes"] = [HEX_D]
+        disposition = {
+            "path": "secret.env",
+            "reason": "sensitive_path",
+            "atom_ids": ["atom-1"],
+            "disposition_id": "manual-" + HEX_D,
+        }
+        manual_hash = adapter_manual_item_hash(disposition)
+        payload["manual_item_hashes"] = [manual_hash]
+        payload["manual_item_records"] = [
+            {
+                "domain": "adapter_manual_disposition",
+                "disposition": disposition,
+                "manual_item_hash": manual_hash,
+            }
+        ]
         payload["accepted_artifact_hashes"] = [HEX_C]
         payload["simulated_review_verdict"] = "manual_review_required"
         validate_payload("evaluation-completion", payload)
@@ -403,6 +454,372 @@ class EvaluationCompletionContractTests(unittest.TestCase):
         unsorted_hashes["accounting"]["adapter_manual_items"] = 2
         with self.assertRaises(ContractError):
             validate_payload("evaluation-completion", unsorted_hashes)
+
+    def test_completed_and_all_manual_branches_are_bidirectional(self) -> None:
+        completed = evaluation_completion_payload()
+        for mutation in (
+            {"reviewer_execution_state": "not_applicable_no_reviewable_atoms"},
+            {"worker_dispatch_state": "not_applicable_no_reviewable_atoms"},
+            {"reviewer_artifact_hash": None},
+        ):
+            payload = copy.deepcopy(completed)
+            payload.update(mutation)
+            with self.subTest(mutation=mutation), self.assertRaises(ContractError):
+                validate_payload("evaluation-completion", payload)
+
+        disposition = {
+            "path": "asset.bin",
+            "reason": "binary_content",
+            "atom_ids": ["atom-1", "atom-2"],
+            "disposition_id": "manual-" + HEX_A,
+        }
+        item_hash = adapter_manual_item_hash(disposition)
+        all_manual = evaluation_completion_payload()
+        all_manual.update(
+            {
+                "reviewer_execution_state": "not_applicable_no_reviewable_atoms",
+                "worker_dispatch_state": "not_applicable_no_reviewable_atoms",
+                "reviewer_artifact_hash": None,
+                "verifier_artifact_hashes": [],
+                "accepted_artifact_hashes": [],
+                "manual_item_hashes": [item_hash],
+                "manual_item_records": [
+                    {
+                        "domain": "adapter_manual_disposition",
+                        "disposition": disposition,
+                        "manual_item_hash": item_hash,
+                    }
+                ],
+                "assurance_contract_under_test": dict(ALL_MANUAL_ASSURANCE),
+                "simulated_review_verdict": "manual_review_required",
+            }
+        )
+        all_manual["coverage"] = {"total_atoms": 2, "reviewed_atoms": 0, "manual_atoms": 2}
+        all_manual["accounting"]["adapter_manual_items"] = 1
+        validate_payload("evaluation-completion", all_manual)
+
+        for path, value in (
+            (("accounting", "raw_candidates"), 1),
+            (("accounting", "canonical_findings"), 1),
+            (("coverage", "reviewed_atoms"), 1),
+        ):
+            mutated = copy.deepcopy(all_manual)
+            mutated[path[0]][path[1]] = value
+            with self.subTest(path=path), self.assertRaises(ContractError):
+                validate_payload("evaluation-completion", mutated)
+
+    def test_raw_canonical_membership_hashes_and_verdict_equations_are_exact(self) -> None:
+        record = canonical_finding_record()
+        payload = evaluation_completion_payload()
+        payload["accounting"].update(
+            {
+                "raw_candidates": 1,
+                "verifier_results": 1,
+                "confirmed_candidate_dispositions": 1,
+                "canonical_findings": 1,
+            }
+        )
+        payload["verifier_artifact_hashes"] = [HEX_E]
+        payload["canonical_finding_records"] = [record]
+        payload["canonical_finding_hashes"] = [record["canonical_finding_hash"]]
+        payload["accepted_artifact_hashes"] = sorted([HEX_C, HEX_E])
+        payload["simulated_review_verdict"] = "findings"
+        validate_payload("evaluation-completion", payload)
+
+        mutations = []
+        wrong_count = copy.deepcopy(payload)
+        wrong_count["accounting"]["canonical_findings"] = 0
+        mutations.append(wrong_count)
+        duplicate_membership = copy.deepcopy(payload)
+        duplicate_membership["canonical_finding_records"].append(copy.deepcopy(record))
+        duplicate_membership["canonical_finding_hashes"] = [record["canonical_finding_hash"]]
+        mutations.append(duplicate_membership)
+        changed_proof = copy.deepcopy(payload)
+        changed_proof["canonical_finding_records"][0]["proof"] = ["different proof"]
+        mutations.append(changed_proof)
+        severity_downgrade = copy.deepcopy(payload)
+        severity_downgrade["canonical_finding_records"][0]["merged_final_severity"] = "Nit"
+        severity_core = {
+            key: value
+            for key, value in severity_downgrade["canonical_finding_records"][0].items()
+            if key != "canonical_finding_hash"
+        }
+        with self.assertRaises(ContractError):
+            canonical_finding_hash(severity_core)
+        wrong_verdict = copy.deepcopy(payload)
+        wrong_verdict["simulated_review_verdict"] = "clean"
+        mutations.append(wrong_verdict)
+        for mutated in mutations:
+            with self.subTest(mutated=mutated), self.assertRaises(ContractError):
+                validate_payload("evaluation-completion", mutated)
+
+    def test_manual_hash_domains_bind_complete_distinct_instances(self) -> None:
+        disposition = {
+            "path": "asset.bin",
+            "reason": "binary_content",
+            "atom_ids": ["atom-1"],
+            "disposition_id": "manual-" + HEX_A,
+        }
+        adapter_hash = adapter_manual_item_hash(disposition)
+        verifier_zero = verifier_manual_item_hash(HEX_B, 0, HEX_D)
+        verifier_one = verifier_manual_item_hash(HEX_B, 1, HEX_E)
+        self.assertNotEqual(adapter_hash, verifier_zero)
+        self.assertNotEqual(verifier_zero, verifier_one)
+        changed = copy.deepcopy(disposition)
+        changed["reason"] = "special_file"
+        self.assertNotEqual(adapter_hash, adapter_manual_item_hash(changed))
+
+    def test_mixed_adapter_and_duplicate_verifier_manual_records_are_exact(self) -> None:
+        disposition = {
+            "path": "asset.bin",
+            "reason": "binary_content",
+            "atom_ids": ["atom-manual"],
+            "disposition_id": "manual-" + HEX_A,
+        }
+        records = [
+            {
+                "domain": "adapter_manual_disposition",
+                "disposition": disposition,
+                "manual_item_hash": adapter_manual_item_hash(disposition),
+            },
+            {
+                "domain": "verifier_needs_manual_review",
+                "candidate_hash": HEX_B,
+                "duplicate_ordinal": 0,
+                "verifier_result_envelope_hash": HEX_D,
+                "manual_item_hash": verifier_manual_item_hash(HEX_B, 0, HEX_D),
+            },
+            {
+                "domain": "verifier_needs_manual_review",
+                "candidate_hash": HEX_B,
+                "duplicate_ordinal": 1,
+                "verifier_result_envelope_hash": HEX_E,
+                "manual_item_hash": verifier_manual_item_hash(HEX_B, 1, HEX_E),
+            },
+        ]
+        payload = evaluation_completion_payload()
+        payload["coverage"] = {"total_atoms": 2, "reviewed_atoms": 1, "manual_atoms": 1}
+        payload["accounting"].update(
+            {
+                "raw_candidates": 2,
+                "verifier_results": 2,
+                "needs_manual_review": 2,
+                "adapter_manual_items": 1,
+            }
+        )
+        payload["verifier_artifact_hashes"] = [HEX_D, HEX_E]
+        payload["accepted_artifact_hashes"] = sorted([HEX_C, HEX_D, HEX_E])
+        payload["manual_item_records"] = records
+        payload["manual_item_hashes"] = sorted(
+            record["manual_item_hash"] for record in records
+        )
+        payload["simulated_review_verdict"] = "manual_review_required"
+        validate_payload("evaluation-completion", payload)
+
+        mutations = []
+        missing = copy.deepcopy(payload)
+        missing["manual_item_records"].pop()
+        mutations.append(missing)
+        arbitrary = copy.deepcopy(payload)
+        arbitrary["manual_item_hashes"][0] = HEX_A
+        arbitrary["manual_item_hashes"].sort()
+        mutations.append(arbitrary)
+        cross_spliced = copy.deepcopy(payload)
+        first_hash = cross_spliced["manual_item_records"][0]["manual_item_hash"]
+        cross_spliced["manual_item_records"][0]["manual_item_hash"] = (
+            cross_spliced["manual_item_records"][1]["manual_item_hash"]
+        )
+        cross_spliced["manual_item_records"][1]["manual_item_hash"] = first_hash
+        mutations.append(cross_spliced)
+        duplicated = copy.deepcopy(payload)
+        duplicated["manual_item_records"][2] = copy.deepcopy(
+            duplicated["manual_item_records"][1]
+        )
+        duplicated["manual_item_hashes"] = sorted(
+            {record["manual_item_hash"] for record in duplicated["manual_item_records"]}
+        )
+        mutations.append(duplicated)
+        unaccepted = copy.deepcopy(payload)
+        unaccepted["manual_item_records"][1]["verifier_result_envelope_hash"] = HEX_A
+        unaccepted["manual_item_records"][1]["manual_item_hash"] = (
+            verifier_manual_item_hash(HEX_B, 0, HEX_A)
+        )
+        unaccepted["manual_item_hashes"] = sorted(
+            record["manual_item_hash"] for record in unaccepted["manual_item_records"]
+        )
+        mutations.append(unaccepted)
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), self.assertRaises(ContractError):
+                validate_payload("evaluation-completion", mutation)
+
+    def test_canonical_root_and_instance_memberships_are_globally_unique(self) -> None:
+        first = canonical_finding_record()
+        second = copy.deepcopy(first)
+        second["confirmed_instances"] = [
+            {
+                "candidate_hash": HEX_A,
+                "duplicate_ordinal": 1,
+                "verifier_result_envelope_hash": HEX_D,
+                "final_severity": "Nit",
+            }
+        ]
+        second["merged_final_severity"] = "Nit"
+        core = {key: value for key, value in second.items() if key != "canonical_finding_hash"}
+        second["canonical_finding_hash"] = canonical_finding_hash(core)
+        payload = evaluation_completion_payload()
+        payload["accounting"].update(
+            {
+                "raw_candidates": 2,
+                "verifier_results": 2,
+                "confirmed_candidate_dispositions": 2,
+                "canonical_findings": 2,
+            }
+        )
+        payload["verifier_artifact_hashes"] = [HEX_D, HEX_E]
+        payload["canonical_finding_records"] = [first, second]
+        payload["canonical_finding_hashes"] = sorted(
+            [first["canonical_finding_hash"], second["canonical_finding_hash"]]
+        )
+        payload["accepted_artifact_hashes"] = sorted([HEX_C, HEX_D, HEX_E])
+        payload["simulated_review_verdict"] = "findings"
+        with self.assertRaises(ContractError):
+            validate_payload("evaluation-completion", payload)
+
+
+class SemanticPlanContractTests(unittest.TestCase):
+    def semantic_plan(self) -> dict:
+        readiness = {
+            "ready": True,
+            "mode": "synthetic_evaluation_only",
+            "authority": "synthetic_evaluation",
+            "execution_backend": "fake_evaluation",
+            "live_dispatch_authorized": False,
+            "live_dispatch_blockers": ["fake_backend_has_no_live_authority"],
+            "consumption_state": {
+                "total_attempts": 0,
+                "consumed_attempts": 0,
+                "remaining_attempts": 0,
+            },
+        }
+        identity = {
+            "backend": "fake_evaluation",
+            "backend_version": FAKE_BACKEND_VERSION,
+            "protocol_version": PROTOCOL_VERSION,
+            "run_manifest_version": RUN_MANIFEST_VERSION,
+            "scenario_id": "all-manual",
+            "total_attempts": 0,
+            "expected_role_sequence": [],
+            "unbound_attempt_templates_sha256": sha256_json([]),
+        }
+        return {
+            "profile": "evaluation_slice_v2",
+            "authority": "synthetic_evaluation",
+            "execution_backend": "fake_evaluation",
+            "release_ready": False,
+            "roles": ["correctness"],
+            "model": "synthetic-model",
+            "schema_contracts": schema_contracts(),
+            "prompt_contracts": prompt_contracts(),
+            "redaction_contract": redaction_contract(),
+            "fake_readiness": readiness,
+            "fake_semantic_identity": identity,
+            "orchestration_contract_version": ORCHESTRATION_CONTRACT_VERSION,
+            "run_manifest_version": RUN_MANIFEST_VERSION,
+        }
+
+    def test_exact_metadata_and_resource_hash_algorithms_work_from_foreign_cwd(self) -> None:
+        original = Path.cwd()
+        with tempfile.TemporaryDirectory() as temporary:
+            os.chdir(temporary)
+            try:
+                schemas = schema_contracts()
+                prompts = prompt_contracts()
+            finally:
+                os.chdir(original)
+        self.assertEqual(set(schemas), {"reviewer-result", "verifier-result", "evaluation-completion"})
+        for name, contract in schemas.items():
+            self.assertEqual(contract["schema_version"], SCHEMA_VERSION)
+            self.assertEqual(contract["sha256"], sha256_json(load_schema(name)))
+        self.assertEqual(set(prompts), {"reviewer-correctness", "verifier"})
+        prompt_root = importlib.resources.files("local_ultra_review.resources").joinpath("prompts")
+        for name, contract in prompts.items():
+            self.assertEqual(set(contract), {"version", "sha256"})
+            self.assertEqual(
+                contract["sha256"],
+                hashlib.sha256(prompt_root.joinpath(f"{name}.md").read_bytes()).hexdigest(),
+            )
+        self.assertEqual(
+            redaction_contract(),
+            {"version": REDACTION_VERSION, "ruleset_sha256": RULESET_HASH},
+        )
+        schemas["reviewer-result"]["sha256"] = HEX_A
+        prompts["verifier"]["version"] = "mutated"
+        redaction_contract()["version"] = "mutated"
+        self.assertNotEqual(schema_contracts()["reviewer-result"]["sha256"], HEX_A)
+        self.assertNotEqual(prompt_contracts()["verifier"]["version"], "mutated")
+        self.assertEqual(redaction_contract()["version"], REDACTION_VERSION)
+
+    def test_semantic_plan_exactness_and_review_identity_binding(self) -> None:
+        semantic_plan = self.semantic_plan()
+        validate_semantic_plan(semantic_plan)
+        target_hash = HEX_A
+        expected = sha256_json(
+            {"target_identity_hash": target_hash, "semantic_plan": semantic_plan}
+        )
+        self.assertEqual(review_identity_hash(target_hash, semantic_plan), expected)
+
+        for mutation in (
+            lambda value: value.update(extra=True),
+            lambda value: value.__setitem__("run_manifest_version", "wrong"),
+            lambda value: value["fake_semantic_identity"].__setitem__("total_attempts", 1),
+            lambda value: value["fake_readiness"]["consumption_state"].__setitem__("consumed_attempts", 1),
+        ):
+            invalid = copy.deepcopy(semantic_plan)
+            mutation(invalid)
+            with self.subTest(invalid=invalid), self.assertRaises(ContractError):
+                validate_semantic_plan(invalid)
+
+        two_attempts = copy.deepcopy(semantic_plan)
+        two_attempts["fake_readiness"]["consumption_state"].update(
+            total_attempts=2, remaining_attempts=2
+        )
+        two_attempts["fake_semantic_identity"].update(
+            total_attempts=2,
+            expected_role_sequence=["reviewer", "verifier"],
+        )
+        validate_semantic_plan(two_attempts)
+        two_attempts["fake_semantic_identity"]["expected_role_sequence"] = [
+            "reviewer",
+            "reviewer",
+        ]
+        with self.assertRaises(ContractError):
+            validate_semantic_plan(two_attempts)
+
+    def test_untrusted_hash_inputs_are_safe_scanned_before_sha256(self) -> None:
+        semantic_plan = self.semantic_plan()
+        unsafe_plan = copy.deepcopy(semantic_plan)
+        unsafe_plan["model"] = TOKEN
+        disposition = {
+            "path": TOKEN,
+            "reason": "sensitive_path",
+            "atom_ids": ["atom-1"],
+            "disposition_id": "manual-" + HEX_A,
+        }
+        finding = {key: value for key, value in canonical_finding_record().items() if key != "canonical_finding_hash"}
+        finding["proof"] = [TOKEN]
+        calls = (
+            lambda: review_identity_hash(HEX_A, unsafe_plan),
+            lambda: adapter_manual_item_hash(disposition),
+            lambda: verifier_manual_item_hash(TOKEN, 0, HEX_A),
+            lambda: canonical_finding_hash(finding),
+        )
+        for call in calls:
+            with self.subTest(call=call), mock.patch(
+                "local_ultra_review.contracts.sha256_json"
+            ) as hash_json:
+                with self.assertRaises(ContractError):
+                    call()
+                hash_json.assert_not_called()
 
 
 class PackagedResourceTests(unittest.TestCase):

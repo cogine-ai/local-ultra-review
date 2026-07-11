@@ -17,9 +17,21 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from local_ultra_review import store as store_module  # noqa: E402
+from local_ultra_review.backend import (  # noqa: E402
+    FAKE_BACKEND_VERSION,
+    PROTOCOL_VERSION,
+    RUN_MANIFEST_VERSION,
+)
 from local_ultra_review.contracts import (  # noqa: E402
+    ALL_MANUAL_ASSURANCE,
+    ORCHESTRATION_CONTRACT_VERSION,
     SCHEMA_VERSION,
+    SYNTHETIC_ATTEMPT_ASSURANCE,
+    adapter_manual_item_hash,
     canonical_json_bytes,
+    prompt_contracts,
+    review_identity_hash,
+    schema_contracts,
     sha256_json,
 )
 from local_ultra_review.git_target import (  # noqa: E402
@@ -30,6 +42,7 @@ from local_ultra_review.git_target import (  # noqa: E402
 from local_ultra_review.redaction import (  # noqa: E402
     SensitiveMaterialError,
     assert_safe_sink,
+    redaction_contract,
 )
 from local_ultra_review.store import ArtifactStore, IntegrityError  # noqa: E402
 
@@ -449,33 +462,211 @@ class RedactionTests(unittest.TestCase):
             assert_safe_sink(json.dumps({"password": raw_secret}))
 
 
-def plan_for(session_root: Path) -> dict:
+def semantic_plan_for(*, total_attempts: int = 1) -> dict:
+    roles = (
+        []
+        if total_attempts == 0
+        else ["reviewer", *(["verifier"] * (total_attempts - 1))]
+    )
+    return {
+        "profile": "evaluation_slice_v2",
+        "authority": "synthetic_evaluation",
+        "execution_backend": "fake_evaluation",
+        "release_ready": False,
+        "roles": ["correctness"],
+        "model": "synthetic-model",
+        "schema_contracts": schema_contracts(),
+        "prompt_contracts": prompt_contracts(),
+        "redaction_contract": redaction_contract(),
+        "fake_readiness": {
+            "ready": True,
+            "mode": "synthetic_evaluation_only",
+            "authority": "synthetic_evaluation",
+            "execution_backend": "fake_evaluation",
+            "live_dispatch_authorized": False,
+            "live_dispatch_blockers": ["fake_backend_has_no_live_authority"],
+            "consumption_state": {
+                "total_attempts": total_attempts,
+                "consumed_attempts": 0,
+                "remaining_attempts": total_attempts,
+            },
+        },
+        "fake_semantic_identity": {
+            "backend": "fake_evaluation",
+            "backend_version": FAKE_BACKEND_VERSION,
+            "protocol_version": PROTOCOL_VERSION,
+            "run_manifest_version": RUN_MANIFEST_VERSION,
+            "scenario_id": "store-fixture",
+            "total_attempts": total_attempts,
+            "expected_role_sequence": roles,
+            "unbound_attempt_templates_sha256": (
+                sha256_json([]) if total_attempts == 0 else "f" * 64
+            ),
+        },
+        "orchestration_contract_version": ORCHESTRATION_CONTRACT_VERSION,
+        "run_manifest_version": RUN_MANIFEST_VERSION,
+    }
+
+
+def plan_for(session_root: Path, *, total_attempts: int = 1) -> dict:
+    semantic_plan = semantic_plan_for(total_attempts=total_attempts)
+    target_identity_hash = "b" * 64
     plan_without_hash = {
         "schema_version": SCHEMA_VERSION,
         "session_id": "session-001",
         "session_root": str(session_root),
         "created_at": "2026-07-11T00:00:00Z",
-        "review_identity_hash": "a" * 64,
-        "target_identity_hash": "b" * 64,
+        "review_identity_hash": review_identity_hash(target_identity_hash, semantic_plan),
+        "target_identity_hash": target_identity_hash,
+        "semantic_plan": semantic_plan,
     }
     return {**plan_without_hash, "plan_integrity_hash": sha256_json(plan_without_hash)}
 
 
 def producer() -> dict:
     return {
+        "producer_kind": "worker_attempt",
         "task_id": "reviewer-001",
-        "attempt_id": "attempt-001",
+        "attempt_hash": "e" * 64,
         "thread_id": "thread-001",
         "process_launch_id": "process-001",
-        "input_hashes": ["c" * 64],
+        "input_hashes": sorted(["c" * 64, "d" * 64]),
+    }
+
+
+def adapter_producer(operation_id: str = "adapter-target-packet") -> dict:
+    return {
+        "producer_kind": "adapter_operation",
+        "operation_id": operation_id,
+        "input_hashes": [],
+    }
+
+
+def reviewer_wrapper() -> dict:
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "task_id": "reviewer-001",
+        "packet_hash": "d" * 64,
+        "status": "completed",
+        "coverage": {"reviewed_atom_ids": ["atom-1"], "notes": "Reviewed."},
+        "candidates": [],
+    }
+    manifest = {
+        "adapter_version": FAKE_BACKEND_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "run_manifest_version": RUN_MANIFEST_VERSION,
+        "authority": "synthetic_evaluation",
+        "execution_backend": "fake_evaluation",
+        "task_id": "reviewer-001",
+        "task_hash": "c" * 64,
+        "attempt_hash": "e" * 64,
+        "packet_hash": "d" * 64,
+        "process_launch_id": "process-001",
+        "thread_id": "thread-001",
+        "synthetic_thread_id": "thread-001",
+        "observed_event_count": 2,
+        "observed_tool_call_count": 0,
+        **SYNTHETIC_ATTEMPT_ASSURANCE,
+    }
+    return {"result": result, "adapter_manifest": manifest}
+
+
+def all_manual_completion(plan: dict) -> dict:
+    disposition = {
+        "path": "asset.bin",
+        "reason": "binary_content",
+        "atom_ids": ["atom-1"],
+        "disposition_id": "manual-" + "a" * 64,
+    }
+    item_hash = adapter_manual_item_hash(disposition)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "authority": "synthetic_evaluation",
+        "authoritative_review": False,
+        "execution_backend": "fake_evaluation",
+        "profile": "evaluation_slice_v2",
+        "release_ready": False,
+        "session_id": plan["session_id"],
+        "plan_integrity_hash": plan["plan_integrity_hash"],
+        "review_identity_hash": plan["review_identity_hash"],
+        "protocol_completeness": "complete",
+        "simulated_review_verdict": "manual_review_required",
+        "reviewer_execution_state": "not_applicable_no_reviewable_atoms",
+        "worker_dispatch_state": "not_applicable_no_reviewable_atoms",
+        "coverage": {"total_atoms": 1, "reviewed_atoms": 0, "manual_atoms": 1},
+        "accounting": {
+            "raw_candidates": 0,
+            "verifier_results": 0,
+            "confirmed_candidate_dispositions": 0,
+            "canonical_findings": 0,
+            "false_positive": 0,
+            "pre_existing": 0,
+            "needs_manual_review": 0,
+            "adapter_manual_items": 1,
+        },
+        "reviewer_artifact_hash": None,
+        "verifier_artifact_hashes": [],
+        "canonical_finding_hashes": [],
+        "canonical_finding_records": [],
+        "manual_item_hashes": [item_hash],
+        "manual_item_records": [
+            {
+                "domain": "adapter_manual_disposition",
+                "disposition": disposition,
+                "manual_item_hash": item_hash,
+            }
+        ],
+        "accepted_artifact_hashes": [],
+        "assurance_contract_under_test": dict(ALL_MANUAL_ASSURANCE),
+    }
+
+
+def completed_completion(plan: dict, reviewer_envelope_hash: str) -> dict:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "authority": "synthetic_evaluation",
+        "authoritative_review": False,
+        "execution_backend": "fake_evaluation",
+        "profile": "evaluation_slice_v2",
+        "release_ready": False,
+        "session_id": plan["session_id"],
+        "plan_integrity_hash": plan["plan_integrity_hash"],
+        "review_identity_hash": plan["review_identity_hash"],
+        "protocol_completeness": "complete",
+        "simulated_review_verdict": "clean",
+        "reviewer_execution_state": "completed",
+        "worker_dispatch_state": "synthetic_attempts_accepted",
+        "coverage": {"total_atoms": 1, "reviewed_atoms": 1, "manual_atoms": 0},
+        "accounting": {
+            "raw_candidates": 0,
+            "verifier_results": 0,
+            "confirmed_candidate_dispositions": 0,
+            "canonical_findings": 0,
+            "false_positive": 0,
+            "pre_existing": 0,
+            "needs_manual_review": 0,
+            "adapter_manual_items": 0,
+        },
+        "reviewer_artifact_hash": reviewer_envelope_hash,
+        "verifier_artifact_hashes": [],
+        "canonical_finding_hashes": [],
+        "canonical_finding_records": [],
+        "manual_item_hashes": [],
+        "manual_item_records": [],
+        "accepted_artifact_hashes": [reviewer_envelope_hash],
+        "assurance_contract_under_test": dict(SYNTHETIC_ATTEMPT_ASSURANCE),
     }
 
 
 class ArtifactStoreTests(unittest.TestCase):
-    def make_store(self) -> tuple[tempfile.TemporaryDirectory[str], ArtifactStore, Path]:
+    def make_store(
+        self, *, total_attempts: int = 1
+    ) -> tuple[tempfile.TemporaryDirectory[str], ArtifactStore, Path]:
         temporary = tempfile.TemporaryDirectory()
         session = Path(temporary.name) / "session"
-        store = ArtifactStore.create(session, plan_for(session))
+        store = ArtifactStore.create(
+            session, plan_for(session, total_attempts=total_attempts)
+        )
         return temporary, store, session
 
     def test_create_is_atomic_exclusive_and_has_genesis(self) -> None:
@@ -490,6 +681,213 @@ class ArtifactStoreTests(unittest.TestCase):
         store.verify()
         with self.assertRaises(IntegrityError):
             ArtifactStore.create(session, plan_for(session))
+
+    def test_plan_binds_exact_semantic_plan_to_review_identity(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        for mutation in ("semantic", "review_identity"):
+            session = root / mutation
+            plan = plan_for(session)
+            if mutation == "semantic":
+                plan["semantic_plan"]["model"] = "different-model"
+            else:
+                plan["review_identity_hash"] = "a" * 64
+            core = {key: value for key, value in plan.items() if key != "plan_integrity_hash"}
+            plan["plan_integrity_hash"] = sha256_json(core)
+            with self.subTest(mutation=mutation), self.assertRaises(IntegrityError):
+                ArtifactStore.create(session, plan)
+
+        first_root = root / "first"
+        second_root = root / "second"
+        first = plan_for(first_root)
+        second = plan_for(second_root)
+        second["session_id"] = "session-002"
+        second["created_at"] = "2026-07-11T00:01:00Z"
+        second_core = {
+            key: value for key, value in second.items() if key != "plan_integrity_hash"
+        }
+        second["plan_integrity_hash"] = sha256_json(second_core)
+        self.assertEqual(first["review_identity_hash"], second["review_identity_hash"])
+        self.assertNotEqual(first["plan_integrity_hash"], second["plan_integrity_hash"])
+
+    def test_exact_artifact_registry_and_producer_tag_union(self) -> None:
+        temporary, store, _session = self.make_store(total_attempts=0)
+        self.addCleanup(temporary.cleanup)
+        adapter_types = (
+            "target_packet",
+            "reviewer_packet",
+            "verifier_packet",
+            "diagnostic",
+            "evaluation_report",
+            "diagnostic_report",
+            "evaluation_completion",
+        )
+        for index, artifact_type in enumerate(adapter_types):
+            payload = (
+                all_manual_completion(store._plan)
+                if artifact_type == "evaluation_completion"
+                else {"safe": artifact_type}
+            )
+            store.write_artifact(
+                artifact_type,
+                payload,
+                adapter_producer(f"adapter-{index}-{artifact_type}"),
+            )
+
+        with self.assertRaises(IntegrityError):
+            store.write_artifact("unknown_type", {"safe": True}, adapter_producer())
+        with self.assertRaises(IntegrityError):
+            store.write_artifact("target_packet", {"safe": True}, producer())
+        with self.assertRaises(IntegrityError):
+            store.write_artifact("reviewer_result", reviewer_wrapper(), adapter_producer())
+
+        for invalid in (
+            {"producer_kind": "adapter_operation", "operation_id": "none", "input_hashes": []},
+            {**producer(), "thread_id": "not_applicable"},
+            {**producer(), "extra": True},
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(IntegrityError):
+                store.write_artifact("reviewer_result", reviewer_wrapper(), invalid)
+
+    def test_worker_wrapper_is_exact_and_cross_reconciled_before_persistence(self) -> None:
+        mutations = (
+            lambda wrapper, producer_value: wrapper.update(extra=True),
+            lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("extra", True),
+            lambda wrapper, producer_value: wrapper["result"].__setitem__("task_id", "reviewer-other"),
+            lambda wrapper, producer_value: wrapper["result"].__setitem__("packet_hash", "a" * 64),
+            lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("task_id", "reviewer-other"),
+            lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("attempt_hash", "a" * 64),
+            lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("packet_hash", "a" * 64),
+            lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("process_launch_id", "process-other"),
+            lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("thread_id", "thread-other"),
+            lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("synthetic_thread_id", "thread-other"),
+            lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("adapter_version", "wrong"),
+            lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("protocol_version", "wrong"),
+            lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("run_manifest_version", "wrong"),
+            lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("authority", "canonical_review"),
+            lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("execution_backend", "codex_exec"),
+            lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("accepted_tool_calls", "not_applicable_no_dispatch"),
+            lambda wrapper, producer_value: producer_value.__setitem__("input_hashes", ["d" * 64]),
+        )
+        for index, mutate in enumerate(mutations):
+            temporary, store, session = self.make_store()
+            wrapper = reviewer_wrapper()
+            producer_value = producer()
+            mutate(wrapper, producer_value)
+            before = {
+                path.relative_to(session): path.read_bytes()
+                for path in session.rglob("*")
+                if path.is_file()
+            }
+            try:
+                with self.subTest(index=index), self.assertRaises(IntegrityError):
+                    store.write_artifact("reviewer_result", wrapper, producer_value)
+                after = {
+                    path.relative_to(session): path.read_bytes()
+                    for path in session.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(after, before)
+            finally:
+                temporary.cleanup()
+
+    def test_completion_binds_plan_attempt_count_and_persisted_worker_results(self) -> None:
+        temporary, store, _session = self.make_store(total_attempts=1)
+        self.addCleanup(temporary.cleanup)
+        reviewer = store.write_artifact(
+            "reviewer_result", reviewer_wrapper(), producer()
+        )
+        completion = completed_completion(store._plan, reviewer["envelope_hash"])
+        envelope = store.write_artifact(
+            "evaluation_completion",
+            completion,
+            adapter_producer("adapter-completion"),
+        )
+        self.assertEqual(envelope["payload"], completion)
+        store.verify()
+
+        report = store.write_artifact(
+            "evaluation_report",
+            {"view": "synthetic evaluation"},
+            adapter_producer("adapter-evaluation-report"),
+        )
+        self.assertEqual(report["artifact_type"], "evaluation_report")
+        store.verify()
+        with self.assertRaises(IntegrityError):
+            store.write_artifact(
+                "evaluation_completion",
+                completion,
+                adapter_producer("adapter-second-completion"),
+            )
+        with self.assertRaises(IntegrityError):
+            store.write_artifact("reviewer_result", reviewer_wrapper(), producer())
+        with self.assertRaises(IntegrityError):
+            store.write_artifact(
+                "diagnostic",
+                {"status": "late"},
+                adapter_producer("adapter-late-diagnostic"),
+            )
+
+    def test_schema_valid_completion_with_store_mismatch_is_rejected_before_write(self) -> None:
+        cases = ("session", "plan", "review", "reviewer_hash", "attempt_count")
+        for case in cases:
+            total_attempts = 2 if case == "attempt_count" else 1
+            temporary, store, session = self.make_store(total_attempts=total_attempts)
+            reviewer = store.write_artifact(
+                "reviewer_result", reviewer_wrapper(), producer()
+            )
+            completion = completed_completion(store._plan, reviewer["envelope_hash"])
+            if case == "session":
+                completion["session_id"] = "different-session"
+            elif case == "plan":
+                completion["plan_integrity_hash"] = "a" * 64
+            elif case == "review":
+                completion["review_identity_hash"] = "a" * 64
+            elif case == "reviewer_hash":
+                completion["reviewer_artifact_hash"] = "a" * 64
+                completion["accepted_artifact_hashes"] = ["a" * 64]
+            before = {
+                path.relative_to(session): path.read_bytes()
+                for path in session.rglob("*")
+                if path.is_file()
+            }
+            try:
+                with self.subTest(case=case), self.assertRaises(IntegrityError):
+                    store.write_artifact(
+                        "evaluation_completion",
+                        completion,
+                        adapter_producer(f"adapter-invalid-{case}"),
+                    )
+                after = {
+                    path.relative_to(session): path.read_bytes()
+                    for path in session.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(after, before)
+            finally:
+                temporary.cleanup()
+
+    def test_all_manual_completion_requires_zero_sealed_attempts_and_no_worker_results(self) -> None:
+        temporary, store, _session = self.make_store(total_attempts=0)
+        self.addCleanup(temporary.cleanup)
+        store.write_artifact(
+            "evaluation_completion",
+            all_manual_completion(store._plan),
+            adapter_producer("adapter-all-manual-completion"),
+        )
+        store.verify()
+
+        temporary_bad, bad_store, _bad_session = self.make_store(total_attempts=1)
+        try:
+            with self.assertRaises(IntegrityError):
+                bad_store.write_artifact(
+                    "evaluation_completion",
+                    all_manual_completion(bad_store._plan),
+                    adapter_producer("adapter-invalid-all-manual"),
+                )
+        finally:
+            temporary_bad.cleanup()
 
     def test_directory_publication_never_replaces_existing_destination(self) -> None:
         temporary = tempfile.TemporaryDirectory()
@@ -521,7 +919,7 @@ class ArtifactStoreTests(unittest.TestCase):
 
         with mock.patch.object(store_module.os, "write", side_effect=short_write):
             store = ArtifactStore.create(session, plan_for(session))
-            store.write_artifact("reviewer_result", {"status": "completed"}, producer())
+            store.write_artifact("reviewer_result", reviewer_wrapper(), producer())
         store.verify()
 
         failed_session = root / "failed-session"
@@ -534,7 +932,7 @@ class ArtifactStoreTests(unittest.TestCase):
         temporary, store, session = self.make_store()
         self.addCleanup(temporary.cleanup)
 
-        envelope = store.write_artifact("reviewer_result", {"status": "completed"}, producer())
+        envelope = store.write_artifact("reviewer_result", reviewer_wrapper(), producer())
 
         artifact_path = session / "artifacts" / "reviewer_result" / f'{envelope["envelope_hash"]}.json'
         self.assertTrue(artifact_path.is_file())
@@ -547,7 +945,7 @@ class ArtifactStoreTests(unittest.TestCase):
         before = sorted(path.relative_to(session) for path in session.rglob("*") if path.is_file())
 
         with self.assertRaises(SensitiveMaterialError):
-            store.write_artifact("worker_result", {"token": TOKEN}, producer())
+            store.write_artifact("target_packet", {"token": TOKEN}, adapter_producer())
 
         after = sorted(path.relative_to(session) for path in session.rglob("*") if path.is_file())
         surviving = b"".join(path.read_bytes() for path in session.rglob("*") if path.is_file())
@@ -570,11 +968,11 @@ class ArtifactStoreTests(unittest.TestCase):
             hashed_values.append(copy.deepcopy(value))
             return real_hash(value)
 
-        unsafe_producer = producer()
-        unsafe_producer["task_id"] = TOKEN
+        unsafe_producer = adapter_producer()
+        unsafe_producer["operation_id"] = TOKEN
         with mock.patch.object(store_module, "sha256_json", side_effect=capture_hash):
             with self.assertRaises(SensitiveMaterialError):
-                store.write_artifact("worker_result", {"status": "completed"}, unsafe_producer)
+                store.write_artifact("target_packet", {"status": "completed"}, unsafe_producer)
 
         after = {
             path.relative_to(session): path.read_bytes()
@@ -604,7 +1002,7 @@ class ArtifactStoreTests(unittest.TestCase):
             with self.subTest(target=target):
                 temporary, store, session = self.make_store()
                 envelope = store.write_artifact(
-                    "reviewer_result", {"status": "completed"}, producer()
+                    "reviewer_result", reviewer_wrapper(), producer()
                 )
                 artifact_path = (
                     session
@@ -639,7 +1037,7 @@ class ArtifactStoreTests(unittest.TestCase):
         temporary, store, session = self.make_store()
         self.addCleanup(temporary.cleanup)
         envelope = store.write_artifact(
-            "reviewer_result", {"status": "completed"}, producer()
+            "reviewer_result", reviewer_wrapper(), producer()
         )
         old_path = (
             session
@@ -649,6 +1047,40 @@ class ArtifactStoreTests(unittest.TestCase):
         )
         mutated = copy.deepcopy(envelope)
         mutated["input_hashes"] = ["d" * 64]
+        core = {key: value for key, value in mutated.items() if key != "envelope_hash"}
+        mutated["envelope_hash"] = sha256_json(core)
+        new_path = old_path.with_name(f'{mutated["envelope_hash"]}.json')
+        new_path.write_bytes(canonical_json_bytes(mutated))
+        old_path.unlink()
+
+        ledger_path = session / "ledger.jsonl"
+        records = [json.loads(line) for line in ledger_path.read_bytes().splitlines()]
+        records[-1]["payload"]["envelope_hash"] = mutated["envelope_hash"]
+        records[-1]["payload_hash"] = sha256_json(records[-1]["payload"])
+        event_core = {
+            key: value for key, value in records[-1].items() if key != "event_hash"
+        }
+        records[-1]["event_hash"] = sha256_json(event_core)
+        ledger_path.write_bytes(b"".join(canonical_json_bytes(item) for item in records))
+
+        with self.assertRaises(IntegrityError):
+            store.verify()
+
+    def test_rehashed_persisted_wrapper_still_reconciles_manifest_evidence(self) -> None:
+        temporary, store, session = self.make_store()
+        self.addCleanup(temporary.cleanup)
+        envelope = store.write_artifact(
+            "reviewer_result", reviewer_wrapper(), producer()
+        )
+        old_path = (
+            session
+            / "artifacts"
+            / "reviewer_result"
+            / f'{envelope["envelope_hash"]}.json'
+        )
+        mutated = copy.deepcopy(envelope)
+        mutated["payload"]["adapter_manifest"]["thread_id"] = "thread-tampered"
+        mutated["payload_hash"] = sha256_json(mutated["payload"])
         core = {key: value for key, value in mutated.items() if key != "envelope_hash"}
         mutated["envelope_hash"] = sha256_json(core)
         new_path = old_path.with_name(f'{mutated["envelope_hash"]}.json')
@@ -704,7 +1136,7 @@ class ArtifactStoreTests(unittest.TestCase):
         for target in ("plan", "artifact", "ledger"):
             with self.subTest(target=target):
                 temporary, store, session = self.make_store()
-                envelope = store.write_artifact("reviewer_result", {"status": "completed"}, producer())
+                envelope = store.write_artifact("reviewer_result", reviewer_wrapper(), producer())
                 if target == "plan":
                     path = session / "plan.json"
                     value = json.loads(path.read_text())
@@ -713,7 +1145,7 @@ class ArtifactStoreTests(unittest.TestCase):
                 elif target == "artifact":
                     path = session / "artifacts" / "reviewer_result" / f'{envelope["envelope_hash"]}.json'
                     value = json.loads(path.read_text())
-                    value["payload"]["status"] = "tampered"
+                    value["payload"]["result"]["status"] = "tampered"
                     path.write_text(json.dumps(value), encoding="utf-8")
                 else:
                     path = session / "ledger.jsonl"

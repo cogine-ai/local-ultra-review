@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -22,13 +23,15 @@ from .contracts import (
     load_schema,
     reject_worker_authority_fields,
     sha256_json,
+    synthetic_attempt_assurance,
     validate_payload,
 )
 from .redaction import SensitiveMaterialError, assert_safe_sink
 
 
-_PROTOCOL_VERSION = "v2-worker-protocol-1"
-_FAKE_BACKEND_VERSION = "fake-backend-1"
+PROTOCOL_VERSION = "v2-worker-protocol-1"
+FAKE_BACKEND_VERSION = "fake-backend-1"
+RUN_MANIFEST_VERSION = "run-manifest-v1"
 _CODEX_ADAPTER_VERSION = "codex-cli-guarded-1"
 _PLACEHOLDER = re.compile(rb"\{\{[^{}]*\}\}")
 _ALLOWED_PLACEHOLDERS = {
@@ -197,11 +200,55 @@ class WorkerUnavailable(RuntimeError):
 
 
 class WorkerBackend(Protocol):
+    @property
+    def model(self) -> str: ...
+
     def readiness(self) -> dict: ...
 
     def semantic_identity(self) -> dict: ...
 
     def run(self, task: WorkerTask, attempt_dir: Path) -> WorkerAttempt: ...
+
+
+class _FrozenDict(dict):
+    """Private JSON-object snapshot that rejects later in-process mutation."""
+
+    def _immutable(self, *_args: object, **_kwargs: object) -> None:
+        raise TypeError("scripted attempt snapshot is immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+    def __deepcopy__(self, memo: dict[int, object]) -> "_FrozenDict":
+        del memo
+        return self
+
+
+def _freeze_json(value: object) -> object:
+    if isinstance(value, Mapping):
+        return _FrozenDict({key: _freeze_json(child) for key, child in value.items()})
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return tuple(_freeze_json(child) for child in value)
+    return value
+
+
+def _snapshot_attempt(value: object) -> object:
+    copied = deepcopy(value)
+    if not isinstance(copied, ScriptedAttempt):
+        return copied
+    return ScriptedAttempt(
+        expected_role=copied.expected_role,
+        raw_events=tuple(_freeze_json(event) for event in copied.raw_events),  # type: ignore[arg-type]
+        last_message_template=bytes(copied.last_message_template),
+        process_launch_id=copied.process_launch_id,
+        return_code=copied.return_code,
+        timed_out=copied.timed_out,
+    )
 
 
 def _numeric_usage(value: object) -> bool:
@@ -501,6 +548,86 @@ def _task_hash(task: WorkerTask) -> str:
     )
 
 
+def worker_task_hash(task: WorkerTask) -> str:
+    """Validate and hash one adapter-owned worker task."""
+
+    _validate_task(task)
+    return _task_hash(task)
+
+
+_RUN_MANIFEST_BASE_FIELDS = {
+    "adapter_version",
+    "protocol_version",
+    "run_manifest_version",
+    "authority",
+    "execution_backend",
+    "task_id",
+    "task_hash",
+    "attempt_hash",
+    "packet_hash",
+    "process_launch_id",
+    "thread_id",
+    "synthetic_thread_id",
+    "observed_event_count",
+    "observed_tool_call_count",
+}
+_SENTINEL_EVIDENCE = {
+    "none",
+    "not_applicable",
+    "not-applicable",
+    "n/a",
+    "unknown",
+    "unavailable",
+    "adapter",
+}
+
+
+def validate_run_manifest(value: object) -> None:
+    """Validate exact persisted adapter evidence for one synthetic worker attempt."""
+
+    try:
+        assert_safe_sink(value)
+    except SensitiveMaterialError as error:
+        raise WorkerProtocolError("run manifest contains unsafe sensitive material") from error
+    expected_assurance = synthetic_attempt_assurance()
+    if not isinstance(value, Mapping) or set(value) != _RUN_MANIFEST_BASE_FIELDS | set(
+        expected_assurance
+    ):
+        raise WorkerProtocolError("run manifest fields do not match the contract")
+    if (
+        value["adapter_version"] != FAKE_BACKEND_VERSION
+        or value["protocol_version"] != PROTOCOL_VERSION
+        or value["run_manifest_version"] != RUN_MANIFEST_VERSION
+        or value["authority"] != "synthetic_evaluation"
+        or value["execution_backend"] != "fake_evaluation"
+    ):
+        raise WorkerProtocolError("run manifest identity/version mismatch")
+    for key in ("task_id", "process_launch_id", "thread_id", "synthetic_thread_id"):
+        child = value[key]
+        if (
+            not isinstance(child, str)
+            or not child.strip()
+            or child.strip().lower() in _SENTINEL_EVIDENCE
+        ):
+            raise WorkerProtocolError(f"run manifest {key} is invalid")
+    if value["synthetic_thread_id"] != value["thread_id"]:
+        raise WorkerProtocolError("run manifest synthetic/thread identity mismatch")
+    for key in ("task_hash", "attempt_hash", "packet_hash"):
+        if not isinstance(value[key], str) or re.fullmatch(r"[0-9a-f]{64}", value[key]) is None:
+            raise WorkerProtocolError(f"run manifest {key} is invalid")
+    for key in ("observed_event_count", "observed_tool_call_count"):
+        if (
+            not isinstance(value[key], int)
+            or isinstance(value[key], bool)
+            or value[key] < 0
+        ):
+            raise WorkerProtocolError(f"run manifest {key} is invalid")
+    if value["observed_tool_call_count"] != 0:
+        raise WorkerProtocolError("run manifest observed a forbidden tool call")
+    if {key: value[key] for key in expected_assurance} != expected_assurance:
+        raise WorkerProtocolError("run manifest assurance does not match the exact tuple")
+
+
 def _accept_scripted_attempt(
     task: WorkerTask,
     attempt: ScriptedAttempt,
@@ -586,8 +713,9 @@ def _accept_scripted_attempt(
     except ContractError as error:
         raise WorkerProtocolError("scripted evidence is not canonical JSON") from error
     manifest = {
-        "adapter_version": _FAKE_BACKEND_VERSION,
-        "protocol_version": _PROTOCOL_VERSION,
+        "adapter_version": FAKE_BACKEND_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "run_manifest_version": RUN_MANIFEST_VERSION,
         "authority": "synthetic_evaluation",
         "execution_backend": "fake_evaluation",
         "task_id": task.task_id,
@@ -599,27 +727,11 @@ def _accept_scripted_attempt(
         "synthetic_thread_id": thread_id,
         "observed_event_count": len(attempt.raw_events),
         "observed_tool_call_count": 0,
-        "worker_profile": "codex_native_guarded",
-        "worker_boundary": "guarded_unconfined",
-        "hard_worker_confinement": "not_provided",
-        "input_discipline": "adapter_packet_minimized",
-        "packet_only_read": "not_guaranteed",
-        "residual_tool_surface": "unknown",
-        "residual_tool_inventory": "unavailable",
-        "accepted_tool_calls": "none_observed",
-        "telemetry_scope": "observed_events_only",
-        "worker_child_environment": "not_verified",
-        "filesystem_write_mitigation": "not_verified",
-        "nested_web_search": "not_verified",
-        "broader_network_denial": "not_guaranteed",
-        "connector_github_denial": "not_guaranteed",
-        "ambient_secret_non_access": "not_guaranteed",
-        "context_lineage": "fresh_process_inferred",
-        "backend_stateless_attestation": "unavailable",
-        "target_execution": "not_requested",
+        **synthetic_attempt_assurance(),
     }
     try:
         assert_safe_sink(manifest)
+        validate_run_manifest(manifest)
     except SensitiveMaterialError as error:
         raise WorkerProtocolError("adapter manifest failed the safe-sink gate") from error
 
@@ -631,26 +743,88 @@ def _accept_scripted_attempt(
 class FakeBackend:
     """Deterministic protocol harness with permanently synthetic authority."""
 
-    def __init__(self, *, scenario_id: str, attempts: Sequence[ScriptedAttempt]) -> None:
+    def __init__(
+        self,
+        *,
+        scenario_id: str,
+        attempts: Sequence[ScriptedAttempt],
+        model: str = "synthetic-model",
+    ) -> None:
         if not isinstance(scenario_id, str) or not scenario_id:
             raise ValueError("scenario ID must be a nonempty string")
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("model must be a nonempty string")
         self._scenario_id = scenario_id
-        self._attempts = tuple(attempts)
+        self._model = model
+        self._attempts = tuple(_snapshot_attempt(attempt) for attempt in tuple(attempts))
         self._next_attempt = 0
         self._seen_thread_ids: set[str] = set()
         self._seen_process_launch_ids: set[str] = set()
 
-    def readiness(self) -> dict:
+    @property
+    def model(self) -> str:
+        """Return the sealed model requested by this synthetic scenario."""
+
+        return self._model
+
+    def consumption_state(self) -> dict:
+        """Return a fresh dispatch-accounting snapshot."""
+
+        total = len(self._attempts)
+        consumed = self._next_attempt
         return {
-            "ready": True,
+            "total_attempts": total,
+            "consumed_attempts": consumed,
+            "remaining_attempts": total - consumed,
+        }
+
+    def readiness(self) -> dict:
+        state = self.consumption_state()
+        pristine = state["consumed_attempts"] == 0
+        valid = True
+        try:
+            assert_safe_sink(self._scenario_id)
+            assert_safe_sink(self._model)
+            _reject_generic_identity_shapes(self._scenario_id)
+            for attempt in self._attempts:
+                _validate_scripted_attempt_before_hash(attempt)
+            roles = [attempt.expected_role for attempt in self._attempts]
+            expected_roles = (
+                []
+                if not roles
+                else ["reviewer", *(["verifier"] * (len(roles) - 1))]
+            )
+            if roles != expected_roles:
+                valid = False
+        except (AttributeError, WorkerProtocolError, SensitiveMaterialError):
+            valid = False
+        return {
+            "ready": pristine and valid,
             "mode": "synthetic_evaluation_only",
             "authority": "synthetic_evaluation",
             "execution_backend": "fake_evaluation",
             "live_dispatch_authorized": False,
-            "live_dispatch_blockers": ["fake_backend_has_no_live_authority"],
+            "live_dispatch_blockers": [
+                "fake_backend_has_no_live_authority",
+                *([] if pristine else ["fake_backend_not_pristine"]),
+                *([] if valid else ["fake_backend_scenario_invalid"]),
+            ],
+            "consumption_state": state,
         }
 
     def semantic_identity(self) -> dict:
+        state = self.consumption_state()
+        if state["consumed_attempts"] != 0:
+            raise WorkerUnavailable(
+                "fake backend is not pristine",
+                diagnostic={
+                    "status": "blocked",
+                    "reason": "fake_backend_not_pristine",
+                    "authority": "synthetic_evaluation",
+                    "live_dispatch_authorized": False,
+                    "consumption_state": state,
+                },
+            )
         templates = []
         try:
             assert_safe_sink(self._scenario_id)
@@ -669,17 +843,27 @@ class FakeBackend:
                         "timed_out": attempt.timed_out,
                     }
                 )
+            roles = [attempt.expected_role for attempt in self._attempts]
+            expected_roles = (
+                []
+                if not roles
+                else ["reviewer", *(["verifier"] * (len(roles) - 1))]
+            )
+            if roles != expected_roles:
+                raise WorkerProtocolError(
+                    "scripted attempts must be one reviewer followed by verifiers"
+                )
             templates_hash = sha256_json(templates)
         except (AttributeError, ContractError, SensitiveMaterialError) as error:
             raise WorkerProtocolError("scripted attempt templates are unsafe or invalid") from error
         return {
             "backend": "fake_evaluation",
-            "backend_version": _FAKE_BACKEND_VERSION,
-            "protocol_version": _PROTOCOL_VERSION,
+            "backend_version": FAKE_BACKEND_VERSION,
+            "protocol_version": PROTOCOL_VERSION,
+            "run_manifest_version": RUN_MANIFEST_VERSION,
             "scenario_id": self._scenario_id,
-            "expected_role_sequence": [
-                attempt.expected_role for attempt in self._attempts
-            ],
+            "total_attempts": len(self._attempts),
+            "expected_role_sequence": roles,
             "unbound_attempt_templates_sha256": templates_hash,
         }
 
@@ -963,6 +1147,12 @@ class CodexCliBackend:
         self._qualification_state = "record_unavailable"
         self._load_qualification_record()
 
+    @property
+    def model(self) -> str:
+        """Return the sealed diagnostic model identifier."""
+
+        return self._model
+
     def _child_environment(self, tmpdir: Path) -> dict[str, str]:
         environment: dict[str, str] = {}
         for key in ENVIRONMENT_ALLOWLIST:
@@ -1091,7 +1281,7 @@ class CodexCliBackend:
         return {
             "backend": "codex_cli_guarded",
             "adapter_version": _CODEX_ADAPTER_VERSION,
-            "protocol_version": _PROTOCOL_VERSION,
+            "protocol_version": PROTOCOL_VERSION,
             "model": self._model,
             "cli_version": self._cli_version,
             "cli_binary_sha256": self._cli_binary_sha256,

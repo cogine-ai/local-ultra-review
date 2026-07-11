@@ -15,12 +15,16 @@
     "review_identity_hash",
     "protocol_completeness",
     "simulated_review_verdict",
+    "reviewer_execution_state",
+    "worker_dispatch_state",
     "coverage",
     "accounting",
     "reviewer_artifact_hash",
     "verifier_artifact_hashes",
     "canonical_finding_hashes",
+    "canonical_finding_records",
     "manual_item_hashes",
+    "manual_item_records",
     "accepted_artifact_hashes",
     "assurance_contract_under_test"
   ],
@@ -59,6 +63,12 @@
     "simulated_review_verdict": {
       "enum": ["clean", "findings", "manual_review_required"]
     },
+    "reviewer_execution_state": {
+      "enum": ["completed", "not_applicable_no_reviewable_atoms"]
+    },
+    "worker_dispatch_state": {
+      "enum": ["synthetic_attempts_accepted", "not_applicable_no_reviewable_atoms"]
+    },
     "coverage": {
       "type": "object",
       "additionalProperties": false,
@@ -84,7 +94,8 @@
       "required": [
         "raw_candidates",
         "verifier_results",
-        "confirmed_findings",
+        "confirmed_candidate_dispositions",
+        "canonical_findings",
         "false_positive",
         "pre_existing",
         "needs_manual_review",
@@ -99,7 +110,11 @@
           "type": "integer",
           "minimum": 0
         },
-        "confirmed_findings": {
+        "confirmed_candidate_dispositions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "canonical_findings": {
           "type": "integer",
           "minimum": 0
         },
@@ -122,7 +137,10 @@
       }
     },
     "reviewer_artifact_hash": {
-      "$ref": "#/$defs/sha256"
+      "oneOf": [
+        {"$ref": "#/$defs/sha256"},
+        {"type": "null"}
+      ]
     },
     "verifier_artifact_hashes": {
       "$ref": "#/$defs/hashArray"
@@ -130,8 +148,16 @@
     "canonical_finding_hashes": {
       "$ref": "#/$defs/hashArray"
     },
+    "canonical_finding_records": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/canonicalFindingRecord"}
+    },
     "manual_item_hashes": {
       "$ref": "#/$defs/hashArray"
+    },
+    "manual_item_records": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/manualItemRecord"}
     },
     "accepted_artifact_hashes": {
       "$ref": "#/$defs/hashArray"
@@ -182,19 +208,19 @@
           "const": "unavailable"
         },
         "accepted_tool_calls": {
-          "const": "none_observed"
+          "enum": ["none_observed", "not_applicable_no_dispatch"]
         },
         "telemetry_scope": {
-          "const": "observed_events_only"
+          "enum": ["observed_events_only", "not_applicable_no_dispatch"]
         },
         "worker_child_environment": {
-          "enum": ["not_verified", "allowlist_preflight_passed"]
+          "const": "not_verified"
         },
         "filesystem_write_mitigation": {
-          "const": "read_only_preflight_passed"
+          "const": "not_verified"
         },
         "nested_web_search": {
-          "const": "disabled_and_observed_absent"
+          "const": "not_verified"
         },
         "broader_network_denial": {
           "const": "not_guaranteed"
@@ -206,7 +232,7 @@
           "const": "not_guaranteed"
         },
         "context_lineage": {
-          "const": "fresh_process_inferred"
+          "enum": ["fresh_process_inferred", "not_applicable_no_dispatch"]
         },
         "backend_stateless_attestation": {
           "const": "unavailable"
@@ -218,6 +244,115 @@
     }
   },
   "$defs": {
+    "nonemptyStringArray": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "confirmedInstance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["candidate_hash", "duplicate_ordinal", "verifier_result_envelope_hash", "final_severity"],
+      "properties": {
+        "candidate_hash": {"$ref": "#/$defs/sha256"},
+        "duplicate_ordinal": {"type": "integer", "minimum": 0},
+        "verifier_result_envelope_hash": {"$ref": "#/$defs/sha256"},
+        "final_severity": {"enum": ["Important", "Nit"]}
+      }
+    },
+    "rootCause": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["file", "line", "title", "failure_scenario", "evidence", "why_diff"],
+      "properties": {
+        "file": {"type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"},
+        "line": {"type": "integer", "minimum": 1},
+        "title": {"type": "string", "minLength": 1},
+        "failure_scenario": {"type": "string", "minLength": 1},
+        "evidence": {"$ref": "#/$defs/nonemptyStringArray"},
+        "why_diff": {"type": "string", "minLength": 1}
+      }
+    },
+    "canonicalFindingRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root_cause",
+        "merged_final_severity",
+        "confirmed_instances",
+        "proof",
+        "provenance",
+        "best_fix",
+        "refactor_judgment",
+        "residual_risk",
+        "canonical_finding_hash"
+      ],
+      "properties": {
+        "root_cause": {"$ref": "#/$defs/rootCause"},
+        "merged_final_severity": {"enum": ["Important", "Nit"]},
+        "confirmed_instances": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/confirmedInstance"}
+        },
+        "proof": {"$ref": "#/$defs/nonemptyStringArray"},
+        "provenance": {"$ref": "#/$defs/nonemptyStringArray"},
+        "best_fix": {"$ref": "#/$defs/nonemptyStringArray"},
+        "refactor_judgment": {"$ref": "#/$defs/nonemptyStringArray"},
+        "residual_risk": {"$ref": "#/$defs/nonemptyStringArray"},
+        "canonical_finding_hash": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "manualDisposition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "reason", "atom_ids", "disposition_id"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "reason": {"type": "string", "minLength": 1},
+        "atom_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "pattern": "^atom-.+"}
+        },
+        "disposition_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "manualItemRecord": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["domain", "disposition", "manual_item_hash"],
+          "properties": {
+            "domain": {"const": "adapter_manual_disposition"},
+            "disposition": {"$ref": "#/$defs/manualDisposition"},
+            "manual_item_hash": {"$ref": "#/$defs/sha256"}
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "domain",
+            "candidate_hash",
+            "duplicate_ordinal",
+            "verifier_result_envelope_hash",
+            "manual_item_hash"
+          ],
+          "properties": {
+            "domain": {"const": "verifier_needs_manual_review"},
+            "candidate_hash": {"$ref": "#/$defs/sha256"},
+            "duplicate_ordinal": {"type": "integer", "minimum": 0},
+            "verifier_result_envelope_hash": {"$ref": "#/$defs/sha256"},
+            "manual_item_hash": {"$ref": "#/$defs/sha256"}
+          }
+        }
+      ]
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$"

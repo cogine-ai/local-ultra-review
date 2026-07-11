@@ -18,8 +18,11 @@ from local_ultra_review.backend import (  # noqa: E402
     CodexCliBackend,
     DISABLED_FEATURES,
     ENVIRONMENT_ALLOWLIST,
+    FAKE_BACKEND_VERSION,
     FakeBackend,
     LAUNCH_POLICY_SHA256,
+    PROTOCOL_VERSION,
+    RUN_MANIFEST_VERSION,
     ScriptedAttempt,
     WORKER_ENVIRONMENT_POLICY_SHA256,
     WorkerProtocolError,
@@ -28,6 +31,7 @@ from local_ultra_review.backend import (  # noqa: E402
 )
 from local_ultra_review.contracts import (  # noqa: E402
     SCHEMA_VERSION,
+    SYNTHETIC_ATTEMPT_ASSURANCE,
     canonical_json_bytes,
     load_schema,
     sha256_json,
@@ -237,8 +241,13 @@ class FakeBackendTests(unittest.TestCase):
         self.assertEqual(reviewer.manifest["observed_tool_call_count"], 0)
         self.assertEqual(reviewer.manifest["telemetry_scope"], "observed_events_only")
         self.assertEqual(reviewer.manifest["target_execution"], "not_requested")
+        self.assertEqual(reviewer.manifest["run_manifest_version"], RUN_MANIFEST_VERSION)
+        self.assertEqual(
+            {key: reviewer.manifest[key] for key in SYNTHETIC_ATTEMPT_ASSURANCE},
+            SYNTHETIC_ATTEMPT_ASSURANCE,
+        )
 
-    def test_semantic_identity_hashes_unbound_templates_without_task_feedback(self) -> None:
+    def test_semantic_identity_seals_total_roles_and_manifest_version_then_blocks_after_use(self) -> None:
         attempts = [scripted_attempt(), scripted_attempt(role="verifier", template=verifier_payload_template())]
         backend = FakeBackend(scenario_id="stable-fixture", attempts=attempts)
         before = backend.semantic_identity()
@@ -246,12 +255,48 @@ class FakeBackendTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         backend.run(reviewer_task(task_id="reviewer-another-id"), Path(temporary.name))
-        after = backend.semantic_identity()
-
-        self.assertEqual(before, after)
         self.assertEqual(before["expected_role_sequence"], ["reviewer", "verifier"])
+        self.assertEqual(before["total_attempts"], 2)
+        self.assertEqual(before["run_manifest_version"], RUN_MANIFEST_VERSION)
+        self.assertEqual(before["backend_version"], FAKE_BACKEND_VERSION)
+        self.assertEqual(before["protocol_version"], PROTOCOL_VERSION)
         self.assertNotIn("reviewer-another-id", json.dumps(before))
         self.assertIn("unbound_attempt_templates_sha256", before)
+        with self.assertRaises(WorkerUnavailable):
+            backend.semantic_identity()
+        readiness = backend.readiness()
+        self.assertFalse(readiness["ready"])
+        self.assertEqual(
+            readiness["consumption_state"],
+            {"total_attempts": 2, "consumed_attempts": 1, "remaining_attempts": 1},
+        )
+
+    def test_attempts_are_deep_snapshotted_and_consumption_state_is_read_only(self) -> None:
+        events = [
+            {"type": "thread.started", "thread_id": "thread-snapshot"},
+            {"type": "turn.completed"},
+        ]
+        attempt = ScriptedAttempt(
+            expected_role="reviewer",
+            raw_events=tuple(events),
+            last_message_template=reviewer_payload_template(),
+            process_launch_id="process-snapshot",
+        )
+        backend = FakeBackend(scenario_id="snapshot", attempts=[attempt])
+        identity = backend.semantic_identity()
+        events[0]["thread_id"] = "caller-mutated"
+        state = backend.consumption_state()
+        state["consumed_attempts"] = 99
+
+        self.assertEqual(backend.semantic_identity(), identity)
+        self.assertEqual(
+            backend.consumption_state(),
+            {"total_attempts": 1, "consumed_attempts": 0, "remaining_attempts": 1},
+        )
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        result = backend.run(reviewer_task(), Path(temporary.name))
+        self.assertEqual(result.thread_id, "thread-snapshot")
 
     def test_semantic_identity_rejects_sensitive_scenario_or_launch_evidence(self) -> None:
         backends = (

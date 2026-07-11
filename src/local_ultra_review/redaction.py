@@ -21,7 +21,7 @@ class RedactionResult:
     ruleset_hash: str
 
 
-_RULESET_VERSION = "known-sensitive-v1"
+REDACTION_VERSION = "known-sensitive-v1"
 _SENSITIVE_KEY = re.compile(
     r"^(?:api[_-]?key|secret|password|passwd|token|access[_-]?token|private[_-]?key)$",
     re.IGNORECASE,
@@ -81,7 +81,7 @@ _SAFE_PLACEHOLDERS = {"", "redacted", "placeholder", "example", "dummy", "none",
 
 RULESET_HASH = sha256_json(
     {
-        "version": _RULESET_VERSION,
+        "version": REDACTION_VERSION,
         "detectors": [
             "private_key",
             "github_token",
@@ -95,6 +95,12 @@ RULESET_HASH = sha256_json(
         "sensitive_nested_paths": [".aws/credentials", ".docker/config.json"],
     }
 )
+
+
+def redaction_contract() -> dict:
+    """Return fresh public metadata for the accepted-sink redaction ruleset."""
+
+    return {"version": REDACTION_VERSION, "ruleset_sha256": RULESET_HASH}
 
 
 def is_sensitive_path(path: str) -> bool:
