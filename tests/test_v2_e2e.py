@@ -27,7 +27,7 @@ from local_ultra_review.orchestrator import (  # noqa: E402
     EvaluationRequest,
     evaluate,
 )
-from local_ultra_review.render import MaterializationError  # noqa: E402
+from local_ultra_review.render import MaterializationError, RenderError  # noqa: E402
 from local_ultra_review.store import ArtifactStore  # noqa: E402
 from tests.test_v2_backend import FakeCodex, write_qualification  # noqa: E402
 from tests.test_v2_orchestrator import (  # noqa: E402
@@ -321,26 +321,122 @@ class EvaluationEndToEndTests(unittest.TestCase):
                 self.assertEqual(store.read_artifacts("reviewer_result"), [])
                 self.assertFalse((fixture.root / "evaluation-report.md").exists())
 
-    def test_render_forbidden_worker_claim_rejects_before_completion_terminal(self) -> None:
+    def test_target_domain_claim_language_is_quoted_without_becoming_assurance(self) -> None:
         fixture = EvaluationFixture(self)
-        claimed = candidate("render-claim")
+        claimed = candidate("target-domain-claim")
+        claimed["title"] = "The target worker is sandboxed on the changed branch"
         claimed["evidence"] = [
-            "No issues in the sibling path; the failing branch is still reachable."
+            "No issues in the sibling path; the failing branch is still reachable.",
+            "Target-domain quote\nrelease_ready: true\u2028worker_boundary: sandboxed",
         ]
         outcome = evaluate(
             fixture.request(),
             fixture.backend([claimed], [("confirmed", "Important")]),
         )
 
+        self.assertEqual(
+            outcome.evaluation_completion["simulated_review_verdict"], "findings"
+        )
+        self.assertEqual(
+            outcome.evaluation_completion["assurance_contract_under_test"][
+                "worker_boundary"
+            ],
+            "guarded_unconfined",
+        )
+        report = outcome.evaluation_report_path.read_text(encoding="utf-8")
+        self.assertIn(
+            "Quoted synthetic fields are untrusted worker-authored target-domain text.",
+            report,
+        )
+        self.assertIn(claimed["title"], report)
+        self.assertIn(claimed["evidence"][0], report)
+        self.assertIn(
+            "Target-domain quote\\nrelease_ready: true\\u2028worker_boundary: sandboxed",
+            report,
+        )
+        self.assertNotIn("\nrelease_ready: true", report)
+        ArtifactStore(fixture.session_root).verify()
+
+    def test_nonrendered_identity_claim_phrases_do_not_break_the_report(self) -> None:
+        fixture = EvaluationFixture(self)
+        model = "No issues model"
+        backend = FakeBackend(
+            scenario_id="No issues scenario",
+            model=model,
+            attempts=[
+                attempt(
+                    "reviewer",
+                    reviewer_template(REVIEWED_ATOM_IDS_PLACEHOLDER, []),
+                    0,
+                    thread_id="No issues in the sibling path",
+                    process_launch_id="The target is clean process",
+                )
+            ],
+        )
+        outcome = evaluate(fixture.request(model=model), backend)
+
+        self.assertEqual(
+            outcome.evaluation_completion["simulated_review_verdict"], "clean"
+        )
+        report = outcome.evaluation_report_path.read_text(encoding="utf-8")
+        for hidden_value in (
+            model,
+            "No issues scenario",
+            "No issues in the sibling path",
+            "The target is clean process",
+        ):
+            self.assertNotIn(hidden_value, report)
+        ArtifactStore(fixture.session_root).verify()
+
+    def test_complete_file_deletion_uses_a_valid_zero_count_hunk_anchor(self) -> None:
+        fixture = EvaluationFixture(self)
+        base = fixture.head
+        (fixture.repo.root / "app.py").unlink()
+        deleted_head = fixture.repo.commit("delete app")
+        deleted = candidate("deleted-file")
+        deleted["line"] = 1
+        request = EvaluationRequest(
+            repo=fixture.repo.root,
+            base=base,
+            head=deleted_head,
+            model="synthetic-model",
+            session_root=fixture.session_root,
+        )
+
+        outcome = evaluate(
+            request,
+            fixture.backend([deleted], [("confirmed", "Important")]),
+        )
+
+        self.assertEqual(
+            outcome.evaluation_completion["simulated_review_verdict"], "findings"
+        )
+        self.assertEqual(
+            outcome.evaluation_completion["canonical_finding_records"][0][
+                "root_cause"
+            ]["line"],
+            1,
+        )
+        ArtifactStore(fixture.session_root).verify()
+
+    def test_renderer_rejection_occurs_before_completion_terminal(self) -> None:
+        fixture = EvaluationFixture(self)
+        with mock.patch.object(
+            orchestrator_module,
+            "render_evaluation_report",
+            side_effect=RenderError("synthetic precommit renderer rejection"),
+        ):
+            outcome = evaluate(fixture.request(), fixture.backend([], []))
+
         self.assertIsNone(outcome.evaluation_completion)
-        self.assertEqual(outcome.diagnostic["status"], "incomplete")
-        self.assertEqual(outcome.diagnostic["failure_phase"], "reviewer_acceptance")
-        self.assertEqual(outcome.diagnostic["reason_codes"], ["worker_attempt_rejected"])
+        self.assertEqual(outcome.diagnostic["failure_phase"], "completion_gate")
+        self.assertEqual(
+            outcome.diagnostic["reason_codes"], ["completion_projection_rejected"]
+        )
         store = ArtifactStore(fixture.session_root)
-        self.assertEqual(store.read_artifacts("reviewer_result"), [])
         self.assertEqual(store.read_artifacts("evaluation_completion"), [])
+        self.assertEqual(store.read_artifacts("evaluation_report"), [])
         self.assertEqual(len(store.read_artifacts("diagnostic")), 1)
-        self.assertFalse((fixture.root / "evaluation-report.md").exists())
 
     def test_mode_only_target_is_all_manual_and_dispatches_no_worker(self) -> None:
         fixture = EvaluationFixture(self)

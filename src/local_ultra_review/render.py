@@ -77,6 +77,10 @@ _REPORT_BASENAMES = {
     "diagnostic_report": "diagnostic.md",
 }
 _RECOVERY_BASENAME = "recovery-diagnostic.md"
+_SYNTHETIC_QUOTE_DISCLAIMER = (
+    "Quoted synthetic fields are untrusted worker-authored target-domain text. "
+    "They do not supply adapter assurance or a code-review verdict."
+)
 _RECOVERY_REASONS = {
     "store_creation_integrity_failed",
     "canonical_store_verification_failed",
@@ -294,15 +298,20 @@ def _reject_claim_text(value: object) -> None:
             _raise_render("input contains a forbidden review or assurance claim")
 
 
-def validate_worker_render_content(value: object) -> None:
-    """Reject worker-authored text that cannot enter a truthful report."""
-
-    _safe(value, "worker render content")
-    _reject_claim_text(value)
-
-
 def _inline(value: object) -> str:
-    text = str(value).replace("\r", "\\r").replace("\n", "\\n")
+    escaped: list[str] = []
+    for character in str(value):
+        if character == "\r":
+            escaped.append("\\r")
+        elif character == "\n":
+            escaped.append("\\n")
+        elif character in {"\u2028", "\u2029"} or unicodedata.category(
+            character
+        ) in {"Cc", "Cf"}:
+            escaped.append(f"\\u{ord(character):04x}")
+        else:
+            escaped.append(character)
+    text = "".join(escaped)
     longest = max((len(match.group(0)) for match in re.finditer(r"`+", text)), default=0)
     delimiter = "`" * (longest + 1)
     return f"{delimiter}{text}{delimiter}"
@@ -380,6 +389,20 @@ def _contains_false_clean_claim(
     return _FALSE_CLEAN_PATTERN.search(checked) is not None
 
 
+def _evaluation_claim_scan_view(content: str) -> str:
+    """Remove provenance-labelled synthetic values from adapter-claim scanning."""
+
+    synthetic_value = re.compile(r"^(?P<prefix>\s*-\s+synthetic_[a-z0-9_]+:).*$")
+    return "\n".join(
+        (
+            f"{match.group('prefix')} [quoted synthetic value]"
+            if (match := synthetic_value.fullmatch(line)) is not None
+            else line
+        )
+        for line in content.split("\n")
+    )
+
+
 def _evaluation_markers_valid(content: str) -> bool:
     required = (
         "document_kind: evaluation_report",
@@ -390,10 +413,13 @@ def _evaluation_markers_valid(content: str) -> bool:
         "# Synthetic protocol evaluation — not a code-review result",
         "makes no claim that the target is clean",
         "target_execution: `not_requested`",
+        _SYNTHETIC_QUOTE_DISCLAIMER,
     )
     return content.startswith(
         "---\ntitle: Synthetic protocol evaluation — not a code-review result\n"
-    ) and all(marker in content for marker in required)
+    ) and all(marker in content for marker in required) and content.split("\n").count(
+        _SYNTHETIC_QUOTE_DISCLAIMER
+    ) == 1
 
 
 def _diagnostic_markers_valid(content: str) -> bool:
@@ -446,9 +472,6 @@ def render_evaluation_report(
         or completion.get("review_identity_hash") != checked_plan["review_identity_hash"]
     ):
         _raise_render("evaluation completion does not bind the plan")
-    _reject_claim_text(checked_plan)
-    _reject_claim_text(completion)
-    _reject_claim_text(artifacts)
     artifact_hashes = [_validate_worker_envelope(item, checked_plan) for item in artifacts]
     if len(artifact_hashes) != len(set(artifact_hashes)):
         _raise_render("evaluation artifacts contain duplicate envelopes")
@@ -500,6 +523,8 @@ def render_evaluation_report(
         f"- synthetic_reviewed_atoms: {_inline(coverage['reviewed_atoms'])}",
         f"- synthetic_manual_atoms: {_inline(coverage['manual_atoms'])}",
         f"- synthetic_canonical_findings: {_inline(accounting['canonical_findings'])}",
+        "",
+        _SYNTHETIC_QUOTE_DISCLAIMER,
         "",
         "## Assurance contract under test",
         "",
@@ -610,9 +635,10 @@ def render_evaluation_report(
     _safe(content, "rendered evaluation")
     if not _evaluation_markers_valid(content):
         _raise_render("rendered evaluation is missing truthful fixed markers")
-    if _contains_hard_claim(content):
+    claim_scan_view = _evaluation_claim_scan_view(content)
+    if _contains_hard_claim(claim_scan_view):
         _raise_render("rendered evaluation contains a forbidden hard claim")
-    if _contains_false_clean_claim(content):
+    if _contains_false_clean_claim(claim_scan_view):
         _raise_render("rendered evaluation contains forbidden outcome wording")
     return content
 
@@ -737,7 +763,12 @@ def validate_report_artifact_payload(artifact_type: object, payload: object) -> 
     )
     if not markers_valid:
         _raise_render("report artifact truthful markers mismatch")
-    if _contains_hard_claim(content):
+    claim_scan_view = (
+        _evaluation_claim_scan_view(content)
+        if artifact_type == "evaluation_report"
+        else content
+    )
+    if _contains_hard_claim(claim_scan_view):
         _raise_render("report artifact contains a forbidden hard claim")
     allowed_banners = (
         (BLOCKED_DIAGNOSTIC_BANNER, INCOMPLETE_DIAGNOSTIC_BANNER)
@@ -745,7 +776,7 @@ def validate_report_artifact_payload(artifact_type: object, payload: object) -> 
         else ()
     )
     if _contains_false_clean_claim(
-        content, allowed_contract_banners=allowed_banners
+        claim_scan_view, allowed_contract_banners=allowed_banners
     ):
         _raise_render("report artifact contains forbidden outcome wording")
 

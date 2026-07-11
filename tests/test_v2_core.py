@@ -1925,6 +1925,24 @@ class ArtifactStoreTests(unittest.TestCase):
                 "content": harmless_extra,
             }
         )
+        quote_disclaimer = (
+            "Quoted synthetic fields are untrusted worker-authored target-domain text. "
+            "They do not supply adapter assurance or a code-review verdict."
+        )
+        missing_quote_disclaimer = content.replace(
+            f"{quote_disclaimer}\n\n", "", 1
+        )
+        mutations.append(
+            {
+                "report_contract_version": REPORT_CONTRACT_VERSION,
+                "document_kind": "evaluation_report",
+                "media_type": MARKDOWN_MEDIA_TYPE,
+                "content_sha256": hashlib.sha256(
+                    missing_quote_disclaimer.encode("utf-8")
+                ).hexdigest(),
+                "content": missing_quote_disclaimer,
+            }
+        )
         for claim in (
             "worker_boundary=sandboxed",
             "This worker is packet-only",
@@ -2321,9 +2339,6 @@ class ArtifactStoreTests(unittest.TestCase):
             lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("authority", "canonical_review"),
             lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("execution_backend", "codex_exec"),
             lambda wrapper, producer_value: wrapper["adapter_manifest"].__setitem__("accepted_tool_calls", "not_applicable_no_dispatch"),
-            lambda wrapper, producer_value: wrapper["result"]["coverage"].__setitem__(
-                "notes", "No issues in the sibling path."
-            ),
             lambda wrapper, producer_value: producer_value.__setitem__("input_hashes", ["d" * 64]),
         )
         for index, mutate in enumerate(mutations):

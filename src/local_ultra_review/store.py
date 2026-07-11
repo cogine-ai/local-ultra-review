@@ -43,7 +43,6 @@ from .render import (
     render_diagnostic_report,
     render_evaluation_report,
     validate_report_artifact_payload,
-    validate_worker_render_content,
 )
 
 
@@ -320,8 +319,7 @@ def _validate_artifact_contract(
     try:
         validate_payload(schema_name, result)
         validate_run_manifest(manifest)
-        validate_worker_render_content(result)
-    except (ContractError, RenderError, WorkerProtocolError) as error:
+    except (ContractError, WorkerProtocolError) as error:
         raise IntegrityError(f"worker result wrapper contract failed: {error}") from error
     if not isinstance(result, dict) or not isinstance(manifest, dict):
         raise IntegrityError("worker result and manifest must be objects")

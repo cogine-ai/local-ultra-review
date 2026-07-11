@@ -384,7 +384,7 @@ def _line_is_in_new_hunk_range(line: int, hunk_header: str) -> bool:
     count_text = match.group("new_count")
     count = 1 if count_text is None else int(count_text)
     if count == 0:
-        return line == start
+        return line == max(1, start)
     return start <= line < start + count
 
 

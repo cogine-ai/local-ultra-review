@@ -67,7 +67,6 @@ from .render import (
     materialize_non_authoritative_view,
     render_diagnostic_report,
     render_evaluation_report,
-    validate_worker_render_content,
     write_recovery_diagnostic,
 )
 from .store import ArtifactStore, IntegrityError
@@ -1168,17 +1167,6 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
                 semantic_prefix_hashes=semantic_prefix_hashes,
             )
         try:
-            validate_worker_render_content(reviewer_wrapper["result"])
-        except (KeyError, TypeError, RenderError):
-            return _normal_failure(
-                store,
-                plan=plan,
-                session_root=session_root,
-                phase="reviewer_acceptance",
-                reason_codes=["worker_attempt_rejected"],
-                semantic_prefix_hashes=semantic_prefix_hashes,
-            )
-        try:
             for candidate_payload in reviewer_wrapper["result"]["candidates"]:
                 validate_review_candidate_target(candidate_payload, target_packet)
         except (KeyError, TypeError, ContractError):
@@ -1310,17 +1298,6 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
                     semantic_prefix_hashes=semantic_prefix_hashes,
                 )
             try:
-                validate_worker_render_content(verifier_wrapper["result"])
-            except (KeyError, TypeError, RenderError):
-                return _normal_failure(
-                    store,
-                    plan=plan,
-                    session_root=session_root,
-                    phase="verifier_acceptance",
-                    reason_codes=["worker_attempt_rejected"],
-                    semantic_prefix_hashes=semantic_prefix_hashes,
-                )
-            try:
                 verifier_result_envelope = store.write_artifact(
                     "verifier_result", verifier_wrapper, verifier_producer
                 )
@@ -1428,7 +1405,15 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
             verifier_result_envelopes=canonical_verifier_results,
         )
         validate_payload("evaluation-completion", completion)
-    except ContractError:
+        prevalidated_report_content = render_evaluation_report(
+            plan=plan,
+            completion=completion,
+            artifacts=[*canonical_reviewer_results, *canonical_verifier_results],
+        )
+        prevalidated_report_payload = make_report_payload(
+            "evaluation_report", prevalidated_report_content
+        )
+    except (ContractError, RenderError):
         return _normal_failure(
             store,
             plan=plan,
@@ -1478,12 +1463,7 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
             "canonical_readback_integrity_failed", session_root=session_root
         )
     canonical_completion = deepcopy(completions[0]["payload"])
-    content = render_evaluation_report(
-        plan=plan,
-        completion=canonical_completion,
-        artifacts=[*report_reviewer_results, *report_verifier_results],
-    )
-    report_payload = make_report_payload("evaluation_report", content)
+    report_payload = deepcopy(prevalidated_report_payload)
     try:
         report_written = store.write_artifact(
             "evaluation_report",
