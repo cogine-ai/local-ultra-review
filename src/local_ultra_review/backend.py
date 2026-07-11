@@ -20,6 +20,7 @@ from typing import Literal, Protocol
 from .contracts import (
     ContractError,
     canonical_json_bytes,
+    is_required_evidence_sentinel,
     load_schema,
     reject_worker_authority_fields,
     sha256_json,
@@ -360,7 +361,7 @@ def _validate_task(task: WorkerTask) -> None:
     if (
         not isinstance(task.task_id, str)
         or not task.task_id
-        or _is_evidence_sentinel(task.task_id)
+        or is_required_evidence_sentinel(task.task_id)
     ):
         raise WorkerProtocolError("worker task ID is missing")
     if not isinstance(task.packet, dict):
@@ -504,7 +505,7 @@ def _validate_scripted_attempt_before_hash(attempt: object) -> ScriptedAttempt:
     if (
         not isinstance(attempt.process_launch_id, str)
         or not attempt.process_launch_id.strip()
-        or _is_evidence_sentinel(attempt.process_launch_id)
+        or is_required_evidence_sentinel(attempt.process_launch_id)
     ):
         raise WorkerProtocolError("scripted attempt has no process launch evidence")
     if not isinstance(attempt.raw_events, tuple) or any(
@@ -517,7 +518,7 @@ def _validate_scripted_attempt_before_hash(attempt: object) -> ScriptedAttempt:
     if (
         len(thread_ids) != 1
         or not isinstance(thread_ids[0], str)
-        or _is_evidence_sentinel(thread_ids[0])
+        or is_required_evidence_sentinel(thread_ids[0])
     ):
         raise WorkerProtocolError("scripted attempt requires one real thread ID")
     if not isinstance(attempt.last_message_template, bytes):
@@ -589,21 +590,6 @@ _RUN_MANIFEST_BASE_FIELDS = {
     "observed_event_count",
     "observed_tool_call_count",
 }
-_SENTINEL_EVIDENCE = {
-    "none",
-    "not_applicable",
-    "n_a",
-    "unknown",
-    "unavailable",
-    "adapter",
-}
-
-
-def _is_evidence_sentinel(value: object) -> bool:
-    if not isinstance(value, str):
-        return False
-    normalized = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
-    return normalized in _SENTINEL_EVIDENCE or normalized.startswith("not_applicable")
 
 
 def validate_run_manifest(value: object) -> None:
@@ -631,7 +617,7 @@ def validate_run_manifest(value: object) -> None:
         if (
             not isinstance(child, str)
             or not child.strip()
-            or _is_evidence_sentinel(child)
+            or is_required_evidence_sentinel(child)
         ):
             raise WorkerProtocolError(f"run manifest {key} is invalid")
     if value["synthetic_thread_id"] != value["thread_id"]:
@@ -699,7 +685,7 @@ def _accept_scripted_attempt(
     if (
         not isinstance(thread_id, str)
         or not thread_id.strip()
-        or _is_evidence_sentinel(thread_id)
+        or is_required_evidence_sentinel(thread_id)
     ):
         raise WorkerProtocolError("scripted attempt thread ID is empty")
     if thread_id in seen_thread_ids:

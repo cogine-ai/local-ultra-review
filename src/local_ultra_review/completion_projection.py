@@ -36,6 +36,9 @@ from .redaction import assert_safe_sink
 
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _GIT_HASH = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+_NORMALIZED_HUNK_HEADER = re.compile(
+    r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@$"
+)
 _RESOURCE_PACKAGE = "local_ultra_review.resources"
 _TARGET_FIELDS = {
     "schema_version",
@@ -300,16 +303,30 @@ def validate_target_packet(packet: dict, *, target_identity_hash: str) -> None:
         path = _relative_path(atom["path"], "atom path")
         if path not in metadata_by_path:
             raise ValueError("coverage atom references an unchanged path")
+        if kind == "path_metadata":
+            if path in metadata_atoms:
+                raise ValueError("coverage atoms repeat path metadata")
+            atom_metadata = {
+                key: atom[key]
+                for key in ("path", "status", "old_mode", "new_mode")
+            }
+            if atom_metadata != metadata_by_path[path]:
+                raise ValueError("path metadata atom does not match changed-path metadata")
+            metadata_atoms[path] = atom_metadata
+        else:
+            hunk_header = atom["hunk_header"]
+            if (
+                not isinstance(hunk_header, str)
+                or not hunk_header
+                or _NORMALIZED_HUNK_HEADER.fullmatch(hunk_header) is None
+            ):
+                raise ValueError("text hunk header is not normalized")
         core = {key: value for key, value in atom.items() if key != "atom_id"}
         expected_atom_id = f"atom-{sha256_json(core)}"
         if atom["atom_id"] != expected_atom_id or expected_atom_id in atom_by_id:
             raise ValueError("coverage atom ID is invalid or repeated")
         atom_by_id[expected_atom_id] = atom
         atom_order.append((path, 0 if kind == "path_metadata" else 1, atom.get("hunk_header", "")))
-        if kind == "path_metadata":
-            metadata_atoms[path] = {
-                key: atom[key] for key in ("path", "status", "old_mode", "new_mode")
-            }
     if atom_order != sorted(atom_order) or metadata_atoms != metadata_by_path:
         raise ValueError("coverage atoms are not the exact ordered path projection")
 
@@ -404,6 +421,7 @@ def build_reviewer_task_record(
 ) -> dict:
     """Build the exact reconstructable reviewer task record."""
 
+    _validate_plan(plan)
     packet = _base_worker_packet(
         plan=plan,
         target_packet=target_packet,
@@ -434,6 +452,7 @@ def build_verifier_task_record(
 ) -> dict:
     """Build the exact reconstructable ordinal-bound verifier task record."""
 
+    _validate_plan(plan)
     candidate_hash = review_candidate_hash(candidate)
     packet = _base_worker_packet(
         plan=plan,
@@ -473,6 +492,7 @@ def validate_role_task_record(
 ) -> WorkerTask:
     """Validate and reconstruct one exact persisted role task record."""
 
+    _validate_plan(plan)
     assert_safe_sink(record)
     if not isinstance(record, dict) or set(record) != _TASK_RECORD_FIELDS:
         raise ValueError("role task record fields do not match the contract")
@@ -552,7 +572,9 @@ def _validate_plan(plan: dict) -> None:
         "semantic_plan",
         "plan_integrity_hash",
     }
-    if not isinstance(plan, dict) or set(plan) != required:
+    if not isinstance(plan, Mapping):
+        raise ValueError("projection plan must be an object")
+    if set(plan) != required:
         raise ValueError("projection plan fields mismatch")
     validate_semantic_plan(plan["semantic_plan"])
     expected_review = compute_review_identity_hash(
@@ -568,8 +590,20 @@ def _validate_plan(plan: dict) -> None:
 
 def _validate_source_envelope(envelope: dict, artifact_type: str, plan: dict) -> None:
     assert_safe_sink(envelope)
-    if not isinstance(envelope, dict) or set(envelope) != _ENVELOPE_FIELDS:
+    if not isinstance(envelope, Mapping):
+        raise ValueError("source envelope must be an object")
+    if set(envelope) != _ENVELOPE_FIELDS:
         raise ValueError("source envelope fields mismatch")
+    if (
+        not isinstance(envelope["producer"], Mapping)
+        or not isinstance(envelope["input_hashes"], list)
+        or not isinstance(envelope["payload"], Mapping)
+        or not isinstance(envelope["created_at"], str)
+        or not envelope["created_at"]
+    ):
+        raise ValueError("source envelope nested shape mismatch")
+    _require_hash(envelope["payload_hash"], "source payload hash")
+    _require_hash(envelope["envelope_hash"], "source envelope hash")
     if (
         envelope["artifact_type"] != artifact_type
         or envelope["schema_version"] != SCHEMA_VERSION
@@ -652,7 +686,15 @@ def completion_source_hashes(
         *reviewer_result_envelopes,
         *verifier_result_envelopes,
     ]
-    hashes = [_require_hash(envelope.get("envelope_hash"), "source envelope hash") for envelope in envelopes]
+    hashes: list[str] = []
+    for envelope in envelopes:
+        if not isinstance(envelope, Mapping):
+            raise ValueError("semantic source envelope must be an object")
+        if set(envelope) != _ENVELOPE_FIELDS:
+            raise ValueError("semantic source envelope fields mismatch")
+        hashes.append(
+            _require_hash(envelope["envelope_hash"], "source envelope hash")
+        )
     if len(hashes) != len(set(hashes)):
         raise ValueError("semantic source envelope hashes must be unique")
     return sorted(hashes)

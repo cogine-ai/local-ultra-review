@@ -21,6 +21,7 @@ from .contracts import (
     ContractError,
     SCHEMA_VERSION,
     canonical_json_bytes,
+    is_required_evidence_sentinel,
     review_identity_hash,
     sha256_json,
     validate_payload,
@@ -64,19 +65,6 @@ _ADAPTER_ARTIFACT_TYPES = {
 }
 _WORKER_ARTIFACT_TYPES = {"reviewer_result", "verifier_result"}
 _ARTIFACT_TYPES = _ADAPTER_ARTIFACT_TYPES | _WORKER_ARTIFACT_TYPES
-_SENTINEL_EVIDENCE = {
-    "none",
-    "not_applicable",
-    "n_a",
-    "unknown",
-    "unavailable",
-    "adapter",
-}
-
-
-def _is_evidence_sentinel(value: str) -> bool:
-    normalized = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
-    return normalized in _SENTINEL_EVIDENCE or normalized.startswith("not_applicable")
 
 
 def _now() -> str:
@@ -249,7 +237,7 @@ def _validate_producer(producer: object) -> list[str]:
             if (
                 not isinstance(child, str)
                 or not child.strip()
-                or _is_evidence_sentinel(child)
+                or is_required_evidence_sentinel(child)
             ):
                 raise IntegrityError(f"invalid worker producer {key}")
         _validate_hash(producer["attempt_hash"], "producer attempt hash")
@@ -261,7 +249,7 @@ def _validate_producer(producer: object) -> list[str]:
         if (
             not isinstance(operation_id, str)
             or not operation_id.strip()
-            or _is_evidence_sentinel(operation_id)
+            or is_required_evidence_sentinel(operation_id)
         ):
             raise IntegrityError("invalid adapter producer operation ID")
     else:

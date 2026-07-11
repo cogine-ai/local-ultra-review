@@ -1158,6 +1158,99 @@ class CompletionProjectionTests(unittest.TestCase):
                     target_identity_hash=evidence[0]["target_identity_hash"],
                 )
 
+    def test_target_packet_rejects_duplicate_or_mismatched_path_metadata_atoms(self) -> None:
+        target = strict_target_packet()
+        original = target["coverage_atoms"][0]
+        duplicate_core = {
+            "kind": "path_metadata",
+            "path": original["path"],
+            "status": "A",
+            "old_mode": original["old_mode"],
+            "new_mode": original["new_mode"],
+        }
+        duplicate = {
+            **duplicate_core,
+            "atom_id": f"atom-{sha256_json(duplicate_core)}",
+        }
+        target["coverage_atoms"] = [duplicate, original]
+        target["reviewable_atom_ids"] = sorted(
+            atom["atom_id"] for atom in target["coverage_atoms"]
+        )
+        with self.assertRaises(ContractError):
+            validate_target_packet(target, target_identity_hash="b" * 64)
+
+        mismatched = strict_target_packet()
+        mismatched_core = {
+            key: value
+            for key, value in mismatched["coverage_atoms"][0].items()
+            if key != "atom_id"
+        }
+        mismatched_core["new_mode"] = "100755"
+        mismatched_atom = {
+            **mismatched_core,
+            "atom_id": f"atom-{sha256_json(mismatched_core)}",
+        }
+        mismatched["coverage_atoms"] = [mismatched_atom]
+        mismatched["reviewable_atom_ids"] = [mismatched_atom["atom_id"]]
+        with self.assertRaises(ContractError):
+            validate_target_packet(mismatched, target_identity_hash="b" * 64)
+
+    def test_target_packet_rejects_non_normalized_text_hunk_headers(self) -> None:
+        for header in (
+            "",
+            "not-a-hunk",
+            "@@ -garbage +garbage @@",
+            "@@ -1 +1 @@ trailing",
+        ):
+            target = strict_target_packet()
+            hunk_core = {
+                "kind": "text_hunk",
+                "path": "app.py",
+                "hunk_header": header,
+            }
+            hunk = {**hunk_core, "atom_id": f"atom-{sha256_json(hunk_core)}"}
+            target["coverage_atoms"].append(hunk)
+            target["reviewable_atom_ids"] = sorted(
+                atom["atom_id"] for atom in target["coverage_atoms"]
+            )
+            with self.subTest(header=header), self.assertRaises(ContractError):
+                validate_target_packet(target, target_identity_hash="b" * 64)
+
+    def test_real_git_target_packet_matches_strict_projection_contract(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        repo = GitRepo(Path(temporary.name))
+        repo.write_text("app.py", "VALUE = 1\n")
+        base = repo.commit("base")
+        repo.write_text("app.py", "VALUE = 2\n")
+        head = repo.commit("head")
+        target = seal_two_dot_target(repo.root, base, head)
+        packet = build_review_packet(target)
+        validate_target_packet(
+            packet, target_identity_hash=target.target_identity_hash
+        )
+
+    def test_projection_public_apis_reject_bad_plan_and_envelope_shapes(self) -> None:
+        evidence = projection_evidence(
+            candidates=[strict_candidate("A")], dispositions=["confirmed"]
+        )
+        with self.assertRaises(ContractError):
+            build_reviewer_task_record(
+                plan={},
+                target_packet=evidence[1]["payload"],
+                target_packet_payload_hash=evidence[1]["payload_hash"],
+                timeout_seconds=30,
+            )
+        for envelope in (None, {}, {"envelope_hash": "a" * 64}):
+            with self.subTest(envelope=envelope), self.assertRaises(ContractError):
+                completion_source_hashes(
+                    target_packet_envelope=envelope,
+                    reviewer_packet_envelopes=(),
+                    verifier_packet_envelopes=(),
+                    reviewer_result_envelopes=(),
+                    verifier_result_envelopes=(),
+                )
+
     def test_role_task_records_are_exact_reconstructable_and_session_independent(self) -> None:
         evidence = projection_evidence(
             candidates=[strict_candidate("A")], dispositions=["confirmed"]
@@ -1639,12 +1732,31 @@ class ArtifactStoreTests(unittest.TestCase):
             {"producer_kind": "adapter_operation", "operation_id": "none", "input_hashes": []},
             {**producer(), "thread_id": "not_applicable"},
             {**producer(), "process_launch_id": "Not Applicable No Dispatch"},
+            {**producer(), "thread_id": "NotApplicableNoDispatch"},
+            {**producer(), "process_launch_id": "notapplicable_no_dispatch"},
             {**producer(), "thread_id": "N/A"},
             {**producer(), "extra": True},
         ):
             with self.subTest(invalid=invalid), self.assertRaises(IntegrityError):
                 store_module._validate_artifact_contract(
                     "reviewer_result", reviewer_wrapper(), invalid
+                )
+
+        for field, sentinel in (
+            ("thread_id", "NotApplicableNoDispatch"),
+            ("process_launch_id", "notapplicable_no_dispatch"),
+        ):
+            wrapper = reviewer_wrapper()
+            producer_value = producer()
+            producer_value[field] = sentinel
+            wrapper["adapter_manifest"][field] = sentinel
+            if field == "thread_id":
+                wrapper["adapter_manifest"]["synthetic_thread_id"] = sentinel
+            with self.subTest(
+                matched_field=field, sentinel=sentinel
+            ), self.assertRaises(IntegrityError):
+                store_module._validate_artifact_contract(
+                    "reviewer_result", wrapper, producer_value
                 )
 
     def test_worker_wrapper_is_exact_and_cross_reconciled_before_persistence(self) -> None:

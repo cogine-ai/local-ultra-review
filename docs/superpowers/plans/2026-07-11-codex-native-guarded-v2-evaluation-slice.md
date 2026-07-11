@@ -505,6 +505,25 @@ corrections are part of Task 3.5 acceptance and supersede any looser wording abo
   inspection failure reports `unavailable` in readiness, semantic identity, and the
   blocked diagnostic.
 
+### Second re-review corrections
+
+- Required-evidence sentinel recognition has one public contract helper shared by
+  backend and Store. It applies Unicode NFKC normalization, `casefold()`, removes
+  every non-alphanumeric character, rejects the exact collapsed sentinel vocabulary,
+  and rejects every collapsed value beginning `notapplicable`. Delimiter-free forms
+  such as `NotApplicableNoDispatch` and `notapplicable_no_dispatch` therefore fail in
+  Fake readiness/run, persisted manifests, and matched Store producers.
+- A strict target packet contains exactly one `path_metadata` atom per changed path.
+  Duplicate metadata atoms reject before any overwrite; every metadata atom exactly
+  equals its `changed_path_metadata` record. Every `text_hunk` header is a nonempty
+  normalized numeric Git range of the form
+  `@@ -<start>[,<count>] +<start>[,<count>] @@`. Validation does not attempt to parse
+  or reconstruct the complete redacted diff.
+- Public completion-projection builders and validators explicitly validate plan,
+  mapping, and exact envelope shapes before field access. Representative malformed
+  caller input raises `ContractError`; the API does not broadly catch `KeyError` or
+  `AttributeError`, so internal programming faults remain visible.
+
 ### TDD sequence
 
 1. Test exact semantic-plan fields/constants, exact resource-hash algorithms, public manifest metadata, review-identity binding, and session-field exclusion.

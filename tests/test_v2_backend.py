@@ -305,6 +305,8 @@ class FakeBackendTests(unittest.TestCase):
             "not_applicable_no_dispatch",
             "Not-Applicable-Else",
             "not applicable later",
+            "NotApplicableNoDispatch",
+            "notapplicable_no_dispatch",
             "N/A",
         )
         for sentinel in sentinels:
@@ -338,11 +340,16 @@ class FakeBackendTests(unittest.TestCase):
                 thread_backend.run(reviewer_task(), Path(tempfile.mkdtemp()))
 
         accepted = self.run_attempt(scripted_attempt())
-        for field in ("task_id", "thread_id", "synthetic_thread_id", "process_launch_id"):
-            manifest = copy.deepcopy(accepted.manifest)
-            manifest[field] = "Not Applicable No Dispatch"
-            with self.subTest(field=field), self.assertRaises(WorkerProtocolError):
-                validate_run_manifest(manifest)
+        for sentinel in ("NotApplicableNoDispatch", "notapplicable_no_dispatch"):
+            for field in ("task_id", "thread_id", "process_launch_id"):
+                manifest = copy.deepcopy(accepted.manifest)
+                manifest[field] = sentinel
+                if field == "thread_id":
+                    manifest["synthetic_thread_id"] = sentinel
+                with self.subTest(
+                    field=field, sentinel=sentinel
+                ), self.assertRaises(WorkerProtocolError):
+                    validate_run_manifest(manifest)
 
     def test_recursive_snapshot_rejects_in_place_union(self) -> None:
         backend = FakeBackend(scenario_id="frozen", attempts=[scripted_attempt()])

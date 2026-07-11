@@ -10,6 +10,7 @@ from importlib import resources
 import json
 from pathlib import PurePosixPath
 import re
+import unicodedata
 from types import MappingProxyType
 from typing import Any
 
@@ -55,6 +56,9 @@ _PROMPT_VERSIONS = {
     "verifier": "verifier-v1",
 }
 _HASH = re.compile(r"^[0-9a-f]{64}$")
+_REQUIRED_EVIDENCE_SENTINELS = frozenset(
+    {"none", "notapplicable", "na", "unknown", "unavailable", "adapter"}
+)
 
 _RESOURCE_PACKAGE = "local_ultra_review.resources"
 _SCHEMA_FILES = {
@@ -83,6 +87,19 @@ _WORKER_AUTHORITY_FIELDS = frozenset(
 
 class ContractError(ValueError):
     """Raised when a value violates a V2 contract."""
+
+
+def is_required_evidence_sentinel(value: object) -> bool:
+    """Return whether required identity evidence collapses to a sentinel value."""
+
+    if not isinstance(value, str):
+        return False
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    collapsed = "".join(character for character in normalized if character.isalnum())
+    return (
+        collapsed in _REQUIRED_EVIDENCE_SENTINELS
+        or collapsed.startswith("notapplicable")
+    )
 
 
 def canonical_json_bytes(value: object) -> bytes:
