@@ -32,6 +32,7 @@ from local_ultra_review.backend import (  # noqa: E402
     WorkerUnavailable,
 )
 from local_ultra_review import orchestrator as orchestrator_module  # noqa: E402
+from local_ultra_review import render as render_module  # noqa: E402
 from local_ultra_review.completion_projection import review_candidate_hash  # noqa: E402
 from local_ultra_review.contracts import (  # noqa: E402
     ALL_MANUAL_ASSURANCE,
@@ -54,6 +55,13 @@ from local_ultra_review.orchestrator import (  # noqa: E402
     EvaluationRequest,
     evaluate,
     validate_evaluation_diagnostic,
+)
+from local_ultra_review.render import (  # noqa: E402
+    MaterializationError,
+    RenderError,
+    render_diagnostic_report,
+    render_evaluation_report,
+    write_recovery_diagnostic,
 )
 from local_ultra_review.store import ArtifactStore, IntegrityError  # noqa: E402
 
@@ -522,20 +530,58 @@ class DiagnosticContractTests(unittest.TestCase):
                     post_store_diagnostic(foreign_reason, phase=phase)
                 )
 
-    def test_outcome_requires_exactly_one_channel_and_no_paths(self) -> None:
+    def test_outcome_requires_exactly_one_channel_and_exact_absolute_path(self) -> None:
         diagnostic = post_store_diagnostic()
-        EvaluationOutcome(None, diagnostic, (), None, None, None)
-        EvaluationOutcome(None, None, ("canonical_store_verification_failed",), None, None, None)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        diagnostic_path = root / "diagnostic.md"
+        recovery_path = root / "recovery-diagnostic.md"
+        diagnostic_path.write_text("diagnostic", encoding="utf-8")
+        recovery_path.write_text("recovery", encoding="utf-8")
+        EvaluationOutcome(None, diagnostic, (), None, diagnostic_path, None)
+        EvaluationOutcome(
+            None,
+            None,
+            ("canonical_store_verification_failed",),
+            None,
+            None,
+            recovery_path,
+        )
         invalid = (
             (None, None, (), None, None, None),
             ({"result": "synthetic"}, None, (), None, None, None),
             ({}, diagnostic, (), None, None, None),
             (None, None, ("unknown",), None, None, None),
-            (None, diagnostic, (), Path("report"), None, None),
+            (None, diagnostic, (), None, None, None),
+            (None, diagnostic, (), root / "evaluation-report.md", None, None),
+            (None, diagnostic, (), None, Path("diagnostic.md"), None),
+            (None, diagnostic, (), None, root / "report.md", None),
+            (None, diagnostic, (), None, root / "missing" / "diagnostic.md", None),
+            (
+                None,
+                None,
+                ("canonical_store_verification_failed",),
+                None,
+                None,
+                root / "diagnostic.md",
+            ),
         )
         for args in invalid:
             with self.subTest(args=args), self.assertRaises(ValueError):
                 EvaluationOutcome(*args)
+
+        directory_path = root / "directory" / "diagnostic.md"
+        directory_path.mkdir(parents=True)
+        with self.assertRaises(ValueError):
+            EvaluationOutcome(None, diagnostic, (), None, directory_path, None)
+
+        symlink_root = root / "symlink"
+        symlink_root.mkdir()
+        symlink_path = symlink_root / "diagnostic.md"
+        symlink_path.symlink_to(diagnostic_path)
+        with self.assertRaises(ValueError):
+            EvaluationOutcome(None, diagnostic, (), None, symlink_path, None)
 
         for codes in (
             (
@@ -548,9 +594,11 @@ class DiagnosticContractTests(unittest.TestCase):
             ),
         ):
             with self.subTest(codes=codes), self.assertRaises(ValueError):
-                EvaluationOutcome(None, None, codes, None, None, None)
+                EvaluationOutcome(None, None, codes, None, None, recovery_path)
         with self.assertRaises(ValueError):
-            EvaluationOutcome(None, diagnostic, [], None, None, None)  # type: ignore[arg-type]
+            EvaluationOutcome(  # type: ignore[arg-type]
+                None, diagnostic, [], None, diagnostic_path, None
+            )
 
     def test_public_validation_rejects_unhashable_list_elements_as_value_errors(self) -> None:
         malformed_reasons = post_store_diagnostic()
@@ -919,7 +967,7 @@ class EvaluationFlowTests(unittest.TestCase):
                 self.assertFalse((root / "session").exists())
                 self.assertFalse(fake.semantic_probe.exists())
 
-    def test_clean_and_all_manual_complete_without_materialized_paths(self) -> None:
+    def test_clean_and_all_manual_complete_with_truthful_reports(self) -> None:
         clean = EvaluationFixture(self)
         clean_outcome = evaluate(clean.request(), clean.backend([], []))
         completion = clean_outcome.evaluation_completion
@@ -933,13 +981,14 @@ class EvaluationFlowTests(unittest.TestCase):
             dict(SYNTHETIC_ATTEMPT_ASSURANCE),
         )
         self.assertEqual(
-            (clean_outcome.evaluation_report_path, clean_outcome.diagnostic_path,
-             clean_outcome.recovery_diagnostic_path),
-            (None, None, None),
+            clean_outcome.evaluation_report_path,
+            (clean.session_root.parent / "evaluation-report.md").resolve(),
         )
+        self.assertIsNone(clean_outcome.diagnostic_path)
+        self.assertIsNone(clean_outcome.recovery_diagnostic_path)
         store = ArtifactStore(clean.session_root)
         self.assertEqual(len(store.read_artifacts("evaluation_completion")), 1)
-        self.assertEqual(store.read_artifacts("evaluation_report"), [])
+        self.assertEqual(len(store.read_artifacts("evaluation_report")), 1)
         self.assertFalse((clean.session_root / "report.md").exists())
 
         manual = EvaluationFixture(self, kind="manual")
@@ -955,6 +1004,10 @@ class EvaluationFlowTests(unittest.TestCase):
         self.assertEqual(
             manual_completion["assurance_contract_under_test"],
             dict(ALL_MANUAL_ASSURANCE),
+        )
+        self.assertEqual(
+            manual_outcome.evaluation_report_path,
+            (manual.session_root.parent / "evaluation-report.md").resolve(),
         )
         self.assertEqual(backend.consumption_state(), {
             "total_attempts": 0,
@@ -1226,7 +1279,7 @@ class EvaluationFlowTests(unittest.TestCase):
         self.assertNotIn(
             completion_envelope["envelope_hash"], completion["accepted_artifact_hashes"]
         )
-        self.assertEqual(store.read_artifacts("evaluation_report"), [])
+        self.assertEqual(len(store.read_artifacts("evaluation_report")), 1)
         self.assertEqual(store.read_artifacts("diagnostic_report"), [])
 
     def test_partial_and_unknown_coverage_are_incomplete_not_clean(self) -> None:
@@ -2185,6 +2238,302 @@ class EvaluationFlowTests(unittest.TestCase):
         self.assertFalse(fixture.execution_canary.exists())
         self.assertFalse((fixture.session_root / "diagnostic.md").exists())
         self.assertFalse((fixture.session_root / "recovery-diagnostic.md").exists())
+
+    def test_task5_materializes_truthful_exclusive_views(self) -> None:
+        clean = EvaluationFixture(self)
+        clean_outcome = evaluate(clean.request(), clean.backend([], []))
+        expected_evaluation = (clean.session_root.parent / "evaluation-report.md").resolve()
+        self.assertEqual(clean_outcome.evaluation_report_path, expected_evaluation)
+        self.assertIsNone(clean_outcome.diagnostic_path)
+        self.assertIsNone(clean_outcome.recovery_diagnostic_path)
+        text = expected_evaluation.read_text(encoding="utf-8")
+        self.assertIn("# Synthetic protocol evaluation — not a code-review result", text)
+        self.assertIn("authority: synthetic_evaluation", text)
+        self.assertIn("authoritative_review: false", text)
+        self.assertIn("profile: evaluation_slice_v2", text)
+        self.assertIn("release_ready: false", text)
+        self.assertIn("simulated_review_verdict: `clean`", text)
+        self.assertIn("makes no claim that the target is clean", text)
+        self.assertIn("target_execution: `not_requested`", text)
+        self.assertNotIn("# Local Ultra Review Report", text)
+        self.assertNotIn("authoritative_review=true", text)
+        self.assertFalse((clean.session_root.parent / "report.md").exists())
+        self.assertFalse((clean.session_root / "evaluation-report.md").exists())
+        self.assertEqual(
+            {path.name for path in clean.session_root.iterdir()},
+            {"plan.json", "ledger.jsonl", "artifacts"},
+        )
+        store = ArtifactStore(clean.session_root)
+        reports = store.read_artifacts("evaluation_report")
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["payload"]["content"], text)
+
+        primer = EvaluationFixture(self)
+        blocked_backend = primer.backend([], [])
+        evaluate(primer.request(), blocked_backend)
+        blocked = EvaluationFixture(self)
+        blocked_request = EvaluationRequest(
+            repo=blocked.repo.root,
+            base=blocked.base,
+            head=blocked.head,
+            model="synthetic-model",
+            session_root=blocked.root / "new-parent" / "session",
+        )
+        blocked_outcome = evaluate(blocked_request, blocked_backend)
+        expected_diagnostic = (
+            blocked_request.session_root.parent / "diagnostic.md"
+        ).resolve()
+        self.assertEqual(blocked_outcome.diagnostic_path, expected_diagnostic)
+        self.assertIsNone(blocked_outcome.evaluation_report_path)
+        diagnostic_text = expected_diagnostic.read_text(encoding="utf-8")
+        self.assertIn("# Synthetic protocol diagnostic — not a code-review result", diagnostic_text)
+        self.assertIn("state: `blocked`", diagnostic_text)
+        self.assertIn("residual_tool_surface: `unknown`", diagnostic_text)
+        self.assertIn("worker_child_environment: `not_verified`", diagnostic_text)
+        self.assertNotIn("simulated_review_verdict", diagnostic_text)
+        self.assertFalse(blocked_request.session_root.exists())
+
+    def test_task5_all_manual_report_says_no_worker_was_dispatched(self) -> None:
+        fixture = EvaluationFixture(self, kind="manual")
+        outcome = evaluate(
+            fixture.request(), FakeBackend(scenario_id="task5-all-manual", attempts=[])
+        )
+        assert outcome.evaluation_report_path is not None
+        text = outcome.evaluation_report_path.read_text(encoding="utf-8")
+        self.assertIn("No worker was dispatched for this all-manual fixture.", text)
+        self.assertNotIn("zero tool calls", text.casefold())
+
+    def test_task5_findings_and_manual_items_stay_explicitly_synthetic(self) -> None:
+        findings = EvaluationFixture(self)
+        findings_outcome = evaluate(
+            findings.request(),
+            findings.backend([candidate("rendered")], [("confirmed", "Important")]),
+        )
+        assert findings_outcome.evaluation_report_path is not None
+        findings_text = findings_outcome.evaluation_report_path.read_text(encoding="utf-8")
+        self.assertIn("simulated_review_verdict: `findings`", findings_text)
+        self.assertIn("### Synthetic fixture finding 1", findings_text)
+        self.assertIn("synthetic_title: `Candidate rendered`", findings_text)
+        self.assertIn("synthetic_severity: `Important`", findings_text)
+
+        manual = EvaluationFixture(self, kind="manual")
+        manual_outcome = evaluate(
+            manual.request(), FakeBackend(scenario_id="render-manual", attempts=[])
+        )
+        assert manual_outcome.evaluation_report_path is not None
+        manual_text = manual_outcome.evaluation_report_path.read_text(encoding="utf-8")
+        self.assertIn("simulated_review_verdict: `manual_review_required`", manual_text)
+        self.assertIn("### Synthetic fixture manual item 1", manual_text)
+        self.assertIn("synthetic_manual_domain: `adapter_manual_disposition`", manual_text)
+        self.assertNotIn("No worker calls were observed", manual_text)
+
+    def test_task5_post_store_failure_persists_then_materializes_diagnostic(self) -> None:
+        fixture = EvaluationFixture(self)
+        outcome = evaluate(
+            fixture.request(),
+            FakeBackend(scenario_id="render-worker-failure", attempts=[]),
+        )
+        assert outcome.diagnostic is not None
+        self.assertEqual(outcome.diagnostic["status"], "incomplete")
+        self.assertEqual(outcome.diagnostic["reason_codes"], ["scripted_attempts_exhausted"])
+        expected = (fixture.session_root.parent / "diagnostic.md").resolve()
+        self.assertEqual(outcome.diagnostic_path, expected)
+        self.assertIsNone(outcome.evaluation_report_path)
+        text = expected.read_text(encoding="utf-8")
+        self.assertIn("state: `incomplete`", text)
+        self.assertIn("- `scripted_attempts_exhausted`", text)
+        self.assertNotRegex(text.casefold(), r"\b(no issues|no confirmed findings|pass)\b")
+        store = ArtifactStore(fixture.session_root)
+        self.assertEqual(len(store.read_artifacts("diagnostic")), 1)
+        reports = store.read_artifacts("diagnostic_report")
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]["payload"]["content"], text)
+
+    def test_task5_renderer_rejects_bad_authority_hard_claims_and_tampered_inputs(self) -> None:
+        fixture = EvaluationFixture(self)
+        outcome = evaluate(fixture.request(), fixture.backend([], []))
+        assert outcome.evaluation_completion is not None
+        store = ArtifactStore(fixture.session_root)
+        plan = store._plan
+        artifacts = [
+            *store.read_artifacts("reviewer_result"),
+            *store.read_artifacts("verifier_result"),
+        ]
+        expected = render_evaluation_report(
+            plan=plan,
+            completion=outcome.evaluation_completion,
+            artifacts=artifacts,
+        )
+        assert outcome.evaluation_report_path is not None
+        self.assertEqual(expected, outcome.evaluation_report_path.read_text(encoding="utf-8"))
+
+        mutations: list[tuple[dict, dict, list[dict]]] = []
+        bad_authority = copy.deepcopy(outcome.evaluation_completion)
+        bad_authority["authority"] = "canonical_review"
+        mutations.append((plan, bad_authority, artifacts))
+        hard_claim = copy.deepcopy(outcome.evaluation_completion)
+        hard_claim["assurance_contract_under_test"]["hard_worker_confinement"] = "provided"
+        mutations.append((plan, hard_claim, artifacts))
+        bad_plan = copy.deepcopy(plan)
+        bad_plan["semantic_plan"]["release_ready"] = True
+        mutations.append((bad_plan, outcome.evaluation_completion, artifacts))
+        bad_hashes = copy.deepcopy(outcome.evaluation_completion)
+        bad_hashes["accepted_artifact_hashes"] = []
+        mutations.append((plan, bad_hashes, artifacts))
+        tampered_artifacts = copy.deepcopy(artifacts)
+        tampered_artifacts[0]["payload"]["result"]["coverage"]["notes"] = (
+            "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        )
+        mutations.append((plan, outcome.evaluation_completion, tampered_artifacts))
+        for mutation_plan, mutation_completion, mutation_artifacts in mutations:
+            with self.subTest(mutation=mutation_completion.get("authority")), self.assertRaises(
+                RenderError
+            ):
+                render_evaluation_report(
+                    plan=mutation_plan,
+                    completion=mutation_completion,
+                    artifacts=mutation_artifacts,
+                )
+
+    def test_task5_diagnostic_renderer_rejects_result_claims_and_bad_assurance(self) -> None:
+        assurance = copy.deepcopy(post_store_diagnostic()["assurance_state"])
+        text = render_diagnostic_report(
+            plan=None,
+            state="blocked",
+            reasons=["canonical_inventory_oracle_unavailable"],
+            assurance_state=assurance,
+        )
+        self.assertIn("pre_session: true", text)
+        self.assertNotIn("target_identity", text)
+        self.assertNotIn("simulated_review_verdict", text)
+        with self.assertRaises(RenderError):
+            render_diagnostic_report(
+                plan=None,
+                state="clean",
+                reasons=["no_issues"],
+                assurance_state=assurance,
+            )
+        assurance["worker_child_environment"] = "verified"
+        with self.assertRaises(RenderError):
+            render_diagnostic_report(
+                plan=None,
+                state="blocked",
+                reasons=["worker_unavailable"],
+                assurance_state=assurance,
+            )
+
+    def test_task5_recovery_writer_is_atomic_restricted_and_sanitized(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        destination = root / "recovery-diagnostic.md"
+        first = write_recovery_diagnostic(
+            sibling_path=destination,
+            reason_codes=["canonical_store_verification_failed"],
+        )
+        self.assertEqual(first, destination)
+        self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+        first_text = destination.read_text(encoding="utf-8")
+        self.assertIn("canonical state could not be verified", first_text)
+        self.assertNotIn("target", first_text.casefold())
+        self.assertNotIn("private", first_text)
+        write_recovery_diagnostic(
+            sibling_path=destination,
+            reason_codes=["artifact_commit_state_uncertain"],
+        )
+        self.assertIn("artifact_commit_state_uncertain", destination.read_text())
+        self.assertFalse(any(root.glob(".*.tmp-*")))
+
+        for forbidden in ("report.md", "other.md"):
+            with self.subTest(forbidden=forbidden), self.assertRaises(MaterializationError):
+                write_recovery_diagnostic(
+                    sibling_path=root / forbidden,
+                    reason_codes=["canonical_store_verification_failed"],
+                )
+
+        symlink_root = root / "symlink-case"
+        symlink_root.mkdir()
+        symlink_target = symlink_root / "outside.txt"
+        symlink_target.write_text("untouched", encoding="utf-8")
+        symlink = symlink_root / "recovery-diagnostic.md"
+        symlink.symlink_to(symlink_target)
+        with self.assertRaisesRegex(
+            MaterializationError, "materialized view could not be written"
+        ):
+            write_recovery_diagnostic(
+                sibling_path=symlink,
+                reason_codes=["canonical_store_verification_failed"],
+            )
+        self.assertEqual(symlink_target.read_text(), "untouched")
+
+        ancestor_root = root / "ancestor-case"
+        outside_root = root / "outside-case"
+        ancestor_root.mkdir()
+        outside_root.mkdir()
+        (ancestor_root / "link").symlink_to(outside_root, target_is_directory=True)
+        with self.assertRaises(MaterializationError):
+            write_recovery_diagnostic(
+                sibling_path=ancestor_root
+                / "link"
+                / "new"
+                / "recovery-diagnostic.md",
+                reason_codes=["canonical_store_verification_failed"],
+            )
+        self.assertFalse((outside_root / "new").exists())
+
+    def test_task5_materializer_holds_parent_directory_against_symlink_swap(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        parent = root / "parent"
+        moved = root / "moved-parent"
+        outside = root / "outside"
+        parent.mkdir()
+        outside.mkdir()
+        destination = parent / "recovery-diagnostic.md"
+        real_open = render_module.os.open
+        swapped = False
+
+        def swap_before_temporary_open(path, flags, mode=0o777, *, dir_fd=None):
+            nonlocal swapped
+            if (
+                not swapped
+                and dir_fd is not None
+                and isinstance(path, str)
+                and path.startswith(".recovery-diagnostic.md.tmp-")
+            ):
+                parent.rename(moved)
+                parent.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return real_open(path, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(render_module.os, "open", side_effect=swap_before_temporary_open):
+            with self.assertRaisesRegex(
+                MaterializationError, "^materialized view could not be written$"
+            ):
+                write_recovery_diagnostic(
+                    sibling_path=destination,
+                    reason_codes=["canonical_store_verification_failed"],
+                )
+        self.assertTrue(swapped)
+        self.assertFalse((outside / "recovery-diagnostic.md").exists())
+        self.assertFalse(any(moved.glob(".recovery-diagnostic.md.tmp-*")))
+
+    def test_task5_materialization_io_failure_never_returns_a_path(self) -> None:
+        fixture = EvaluationFixture(self, kind="manual")
+        with mock.patch(
+            "local_ultra_review.render.os.replace",
+            side_effect=OSError("private destination detail"),
+        ):
+            with self.assertRaisesRegex(
+                MaterializationError, "^materialized view could not be written$"
+            ):
+                evaluate(
+                    fixture.request(),
+                    FakeBackend(scenario_id="materialization-failure", attempts=[]),
+                )
+        self.assertFalse((fixture.session_root.parent / "evaluation-report.md").exists())
+        self.assertFalse(any(fixture.session_root.parent.glob(".*.tmp-*")))
 
 
 if __name__ == "__main__":

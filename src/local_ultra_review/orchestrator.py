@@ -1,8 +1,4 @@
-"""Guarded V2 synthetic reviewer/verifier orchestration.
-
-Task 4 owns only in-memory outcomes and canonical Store artifacts. Rendering and the
-CLI deliberately arrive in later tasks.
-"""
+"""Guarded V2 synthetic reviewer/verifier orchestration and truthful views."""
 
 from __future__ import annotations
 
@@ -14,6 +10,7 @@ import inspect
 import os
 from pathlib import Path
 import re
+import stat
 import unicodedata
 import uuid
 
@@ -54,6 +51,13 @@ from .redaction import (
     SensitiveMaterialError,
     assert_safe_sink,
     redaction_contract,
+)
+from .render import (
+    make_report_payload,
+    materialize_non_authoritative_view,
+    render_diagnostic_report,
+    render_evaluation_report,
+    write_recovery_diagnostic,
 )
 from .store import ArtifactStore, IntegrityError
 
@@ -228,15 +232,6 @@ class EvaluationOutcome:
         )
         if channels != 1:
             raise ValueError("evaluation outcome must contain exactly one result channel")
-        if any(
-            path is not None
-            for path in (
-                self.evaluation_report_path,
-                self.diagnostic_path,
-                self.recovery_diagnostic_path,
-            )
-        ):
-            raise ValueError("Task 4 outcomes cannot contain materialized paths")
         if self.evaluation_completion is not None and not isinstance(
             self.evaluation_completion, dict
         ):
@@ -258,6 +253,45 @@ class EvaluationOutcome:
                 != tuple(sorted(set(self.recovery_reason_codes)))
             ):
                 raise ValueError("integrity recovery reason codes are invalid")
+
+        if self.evaluation_completion is not None:
+            expected = (
+                self.evaluation_report_path,
+                "evaluation-report.md",
+                self.diagnostic_path,
+                self.recovery_diagnostic_path,
+            )
+        elif self.diagnostic is not None:
+            expected = (
+                self.diagnostic_path,
+                "diagnostic.md",
+                self.evaluation_report_path,
+                self.recovery_diagnostic_path,
+            )
+        else:
+            expected = (
+                self.recovery_diagnostic_path,
+                "recovery-diagnostic.md",
+                self.evaluation_report_path,
+                self.diagnostic_path,
+            )
+        path, basename, foreign_one, foreign_two = expected
+        try:
+            resolved_path = path.resolve(strict=True) if isinstance(path, Path) else None
+            path_mode = os.lstat(path).st_mode if isinstance(path, Path) else 0
+        except (OSError, RuntimeError):
+            resolved_path = None
+            path_mode = 0
+        if (
+            not isinstance(path, Path)
+            or not path.is_absolute()
+            or path != resolved_path
+            or path.name != basename
+            or not stat.S_ISREG(path_mode)
+            or foreign_one is not None
+            or foreign_two is not None
+        ):
+            raise ValueError("evaluation outcome path does not match its result channel")
 
 
 def _sorted_unique_strings(value: object, *, allowlist: set[str], label: str) -> list[str]:
@@ -631,17 +665,25 @@ def validate_evaluation_diagnostic(value: object) -> None:
     raise ValueError("diagnostic kind is invalid")
 
 
-def _outcome_completion(payload: dict) -> EvaluationOutcome:
-    return EvaluationOutcome(payload, None, (), None, None, None)
+def _sibling_view_path(session_root: Path, basename: str) -> Path:
+    return session_root.expanduser().resolve().parent / basename
 
 
-def _outcome_diagnostic(payload: dict) -> EvaluationOutcome:
+def _outcome_completion(payload: dict, path: Path) -> EvaluationOutcome:
+    return EvaluationOutcome(payload, None, (), path, None, None)
+
+
+def _outcome_diagnostic(payload: dict, path: Path) -> EvaluationOutcome:
     validate_evaluation_diagnostic(payload)
-    return EvaluationOutcome(None, deepcopy(payload), (), None, None, None)
+    return EvaluationOutcome(None, deepcopy(payload), (), None, path, None)
 
 
-def _outcome_recovery(code: str) -> EvaluationOutcome:
-    return EvaluationOutcome(None, None, (code,), None, None, None)
+def _outcome_recovery(code: str, *, session_root: Path) -> EvaluationOutcome:
+    path = write_recovery_diagnostic(
+        sibling_path=_sibling_view_path(session_root, "recovery-diagnostic.md"),
+        reason_codes=[code],
+    )
+    return EvaluationOutcome(None, None, (code,), None, None, path)
 
 
 def _validate_request(request: object) -> EvaluationRequest:
@@ -666,7 +708,11 @@ def _validate_request(request: object) -> EvaluationRequest:
 
 
 def _pre_session_diagnostic(
-    readiness: dict, *, phase: str, reason_codes: list[str]
+    readiness: dict,
+    *,
+    phase: str,
+    reason_codes: list[str],
+    session_root: Path,
 ) -> EvaluationOutcome:
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -684,7 +730,19 @@ def _pre_session_diagnostic(
         "completion_created": False,
         "backend_readiness": deepcopy(readiness),
     }
-    return _outcome_diagnostic(payload)
+    validate_evaluation_diagnostic(payload)
+    content = render_diagnostic_report(
+        plan=None,
+        state=payload["status"],
+        reasons=payload["reason_codes"],
+        assurance_state=dict(_ASSURANCE_STATE),
+    )
+    path = materialize_non_authoritative_view(
+        sibling_path=_sibling_view_path(session_root, "diagnostic.md"),
+        content=content,
+        document_kind="diagnostic_report",
+    )
+    return _outcome_diagnostic(payload, path)
 
 
 def _post_store_payload(*, phase: str, reason_codes: list[str]) -> dict:
@@ -726,6 +784,8 @@ def _adapter_producer(operation_id: str, input_hashes: list[str]) -> dict:
 def _normal_failure(
     store: ArtifactStore,
     *,
+    plan: dict,
+    session_root: Path,
     phase: str,
     reason_codes: list[str],
     semantic_prefix_hashes: list[str],
@@ -733,7 +793,9 @@ def _normal_failure(
     try:
         store.verify()
     except (IntegrityError, OSError):
-        return _outcome_recovery("canonical_store_verification_failed")
+        return _outcome_recovery(
+            "canonical_store_verification_failed", session_root=session_root
+        )
     payload = _post_store_payload(phase=phase, reason_codes=reason_codes)
     validate_evaluation_diagnostic(payload)
     producer = _adapter_producer(
@@ -742,18 +804,65 @@ def _normal_failure(
     try:
         written = store.write_artifact("diagnostic", payload, producer)
     except (IntegrityError, OSError):
-        return _outcome_recovery("terminal_commit_state_uncertain")
+        return _outcome_recovery(
+            "terminal_commit_state_uncertain", session_root=session_root
+        )
     try:
         store.verify()
     except (IntegrityError, OSError):
-        return _outcome_recovery("canonical_store_verification_failed")
+        return _outcome_recovery(
+            "canonical_store_verification_failed", session_root=session_root
+        )
     try:
         diagnostics = _read_exact_artifacts(store, "diagnostic", [written])
     except (IntegrityError, OSError):
-        return _outcome_recovery("canonical_readback_integrity_failed")
+        return _outcome_recovery(
+            "canonical_readback_integrity_failed", session_root=session_root
+        )
     if len(diagnostics) != 1 or diagnostics[0].get("payload") != payload:
-        return _outcome_recovery("canonical_readback_integrity_failed")
-    return _outcome_diagnostic(diagnostics[0]["payload"])
+        return _outcome_recovery(
+            "canonical_readback_integrity_failed", session_root=session_root
+        )
+
+    canonical_payload = deepcopy(diagnostics[0]["payload"])
+    content = render_diagnostic_report(
+        plan=plan,
+        state=canonical_payload["status"],
+        reasons=canonical_payload["reason_codes"],
+        assurance_state=canonical_payload["assurance_state"],
+    )
+    report_payload = make_report_payload("diagnostic_report", content)
+    try:
+        report_written = store.write_artifact(
+            "diagnostic_report",
+            report_payload,
+            _adapter_producer(
+                "adapter-diagnostic-report", [diagnostics[0]["envelope_hash"]]
+            ),
+        )
+    except (IntegrityError, OSError):
+        return _outcome_recovery(
+            "artifact_commit_state_uncertain", session_root=session_root
+        )
+    try:
+        store.verify()
+        reports = _read_exact_artifacts(
+            store, "diagnostic_report", [report_written]
+        )
+    except (IntegrityError, OSError):
+        return _outcome_recovery(
+            "canonical_readback_integrity_failed", session_root=session_root
+        )
+    if len(reports) != 1 or reports[0].get("payload") != report_payload:
+        return _outcome_recovery(
+            "canonical_readback_integrity_failed", session_root=session_root
+        )
+    path = materialize_non_authoritative_view(
+        sibling_path=_sibling_view_path(session_root, "diagnostic.md"),
+        content=reports[0]["payload"]["content"],
+        document_kind="diagnostic_report",
+    )
+    return _outcome_diagnostic(canonical_payload, path)
 
 
 def _semantic_plan(
@@ -901,9 +1010,10 @@ def _backend_capability(backend: object, name: str) -> object:
 
 
 def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOutcome:
-    """Run one synthetic evaluation protocol and return no materialized view."""
+    """Run one synthetic evaluation protocol and materialize its truthful view."""
 
     request = _validate_request(request)
+    session_root = request.session_root.expanduser().resolve()
     try:
         readiness = deepcopy(backend.readiness())
         assert_safe_sink(readiness)
@@ -919,7 +1029,10 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
                 - {"fake_backend_has_no_live_authority"}
             ) or ["fake_backend_not_ready"]
         return _pre_session_diagnostic(
-            readiness, phase="backend_readiness", reason_codes=reasons
+            readiness,
+            phase="backend_readiness",
+            reason_codes=reasons,
+            session_root=session_root,
         )
 
     backend_model = _backend_capability(backend, "model")
@@ -930,6 +1043,7 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
             readiness,
             phase="backend_binding",
             reason_codes=["request_backend_model_mismatch"],
+            session_root=session_root,
         )
     consumption_oracle = _backend_capability(backend, "consumption_state")
     if not callable(consumption_oracle):
@@ -937,6 +1051,7 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
             readiness,
             phase="backend_binding",
             reason_codes=["synthetic_consumption_state_unavailable"],
+            session_root=session_root,
         )
 
     # This capture intentionally precedes target sealing so a malformed backend
@@ -955,6 +1070,7 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
             readiness,
             phase="backend_binding",
             reason_codes=["backend_semantic_identity_invalid"],
+            session_root=session_root,
         )
 
     try:
@@ -967,7 +1083,6 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
     except (TargetError, ContractError, SensitiveMaterialError) as error:
         raise EvaluationInputError("target cannot be sealed for evaluation") from error
 
-    session_root = request.session_root.expanduser().resolve()
     review_hash = review_identity_hash(target.target_identity_hash, semantic_plan)
     plan_core = {
         "schema_version": SCHEMA_VERSION,
@@ -989,7 +1104,9 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
     try:
         store = ArtifactStore.create(session_root, plan)
     except (IntegrityError, OSError):
-        return _outcome_recovery("store_creation_integrity_failed")
+        return _outcome_recovery(
+            "store_creation_integrity_failed", session_root=session_root
+        )
 
     semantic_prefix_hashes: list[str] = []
     try:
@@ -1001,7 +1118,9 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
             ),
         )
     except (IntegrityError, OSError):
-        return _outcome_recovery("artifact_commit_state_uncertain")
+        return _outcome_recovery(
+            "artifact_commit_state_uncertain", session_root=session_root
+        )
     semantic_prefix_hashes.append(target_envelope["envelope_hash"])
 
     reviewer_packet_written: list[dict] = []
@@ -1030,6 +1149,8 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
         except ContractError:
             return _normal_failure(
                 store,
+                plan=plan,
+                session_root=session_root,
                 phase="reviewer_acceptance",
                 reason_codes=["semantic_contract_rejected"],
                 semantic_prefix_hashes=semantic_prefix_hashes,
@@ -1043,7 +1164,9 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
                 ),
             )
         except (IntegrityError, OSError):
-            return _outcome_recovery("artifact_commit_state_uncertain")
+            return _outcome_recovery(
+                "artifact_commit_state_uncertain", session_root=session_root
+            )
         reviewer_packet_written.append(reviewer_packet_envelope)
         semantic_prefix_hashes.append(reviewer_packet_envelope["envelope_hash"])
 
@@ -1067,6 +1190,8 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
             )
             return _normal_failure(
                 store,
+                plan=plan,
+                session_root=session_root,
                 phase="reviewer_dispatch",
                 reason_codes=[reason],
                 semantic_prefix_hashes=semantic_prefix_hashes,
@@ -1074,6 +1199,8 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
         except (WorkerProtocolError, ContractError, SensitiveMaterialError):
             return _normal_failure(
                 store,
+                plan=plan,
+                session_root=session_root,
                 phase="reviewer_acceptance",
                 reason_codes=["worker_attempt_rejected"],
                 semantic_prefix_hashes=semantic_prefix_hashes,
@@ -1083,7 +1210,9 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
                 "reviewer_result", reviewer_wrapper, reviewer_producer
             )
         except (IntegrityError, OSError):
-            return _outcome_recovery("artifact_commit_state_uncertain")
+            return _outcome_recovery(
+                "artifact_commit_state_uncertain", session_root=session_root
+            )
         reviewer_result_written.append(reviewer_result_envelope)
         semantic_prefix_hashes.append(reviewer_result_envelope["envelope_hash"])
 
@@ -1094,13 +1223,17 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
                 [reviewer_result_envelope],
             )
         except (IntegrityError, OSError):
-            return _outcome_recovery("canonical_readback_integrity_failed")
+            return _outcome_recovery(
+                "canonical_readback_integrity_failed", session_root=session_root
+            )
         reviewer_result = canonical_reviewer_results[0]["payload"]["result"]
         if reviewer_result["coverage"]["reviewed_atom_ids"] != target_packet[
             "reviewable_atom_ids"
         ]:
             return _normal_failure(
                 store,
+                plan=plan,
+                session_root=session_root,
                 phase="reviewer_acceptance",
                 reason_codes=["coverage_accounting_failed"],
                 semantic_prefix_hashes=semantic_prefix_hashes,
@@ -1131,6 +1264,8 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
             except ContractError:
                 return _normal_failure(
                     store,
+                    plan=plan,
+                    session_root=session_root,
                     phase="verifier_acceptance",
                     reason_codes=["semantic_contract_rejected"],
                     semantic_prefix_hashes=semantic_prefix_hashes,
@@ -1148,7 +1283,9 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
                     ),
                 )
             except (IntegrityError, OSError):
-                return _outcome_recovery("artifact_commit_state_uncertain")
+                return _outcome_recovery(
+                    "artifact_commit_state_uncertain", session_root=session_root
+                )
             verifier_packet_written.append(verifier_packet_envelope)
             semantic_prefix_hashes.append(verifier_packet_envelope["envelope_hash"])
 
@@ -1172,6 +1309,8 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
                 )
                 return _normal_failure(
                     store,
+                    plan=plan,
+                    session_root=session_root,
                     phase="verifier_dispatch",
                     reason_codes=[reason],
                     semantic_prefix_hashes=semantic_prefix_hashes,
@@ -1179,6 +1318,8 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
             except (WorkerProtocolError, ContractError, SensitiveMaterialError):
                 return _normal_failure(
                     store,
+                    plan=plan,
+                    session_root=session_root,
                     phase="verifier_acceptance",
                     reason_codes=["worker_attempt_rejected"],
                     semantic_prefix_hashes=semantic_prefix_hashes,
@@ -1188,14 +1329,18 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
                     "verifier_result", verifier_wrapper, verifier_producer
                 )
             except (IntegrityError, OSError):
-                return _outcome_recovery("artifact_commit_state_uncertain")
+                return _outcome_recovery(
+                    "artifact_commit_state_uncertain", session_root=session_root
+                )
             verifier_result_written.append(verifier_result_envelope)
             semantic_prefix_hashes.append(verifier_result_envelope["envelope_hash"])
 
     try:
         store.verify()
     except (IntegrityError, OSError):
-        return _outcome_recovery("canonical_store_verification_failed")
+        return _outcome_recovery(
+            "canonical_store_verification_failed", session_root=session_root
+        )
     try:
         canonical_targets = _read_exact_artifacts(
             store, "target_packet", [target_envelope]
@@ -1221,7 +1366,9 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
             verifier_result_written,
         )
     except (IntegrityError, OSError):
-        return _outcome_recovery("canonical_readback_integrity_failed")
+        return _outcome_recovery(
+            "canonical_readback_integrity_failed", session_root=session_root
+        )
 
     expected_attempts = 0
     if target_packet["reviewable_atom_ids"]:
@@ -1241,6 +1388,8 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
     ):
         return _normal_failure(
             store,
+            plan=plan,
+            session_root=session_root,
             phase="completion_gate",
             reason_codes=["scripted_attempt_accounting_mismatch"],
             semantic_prefix_hashes=semantic_prefix_hashes,
@@ -1258,6 +1407,8 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
         )
         return _normal_failure(
             store,
+            plan=plan,
+            session_root=session_root,
             phase="completion_gate",
             reason_codes=[reason],
             semantic_prefix_hashes=semantic_prefix_hashes,
@@ -1284,6 +1435,8 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
     except ContractError:
         return _normal_failure(
             store,
+            plan=plan,
+            session_root=session_root,
             phase="completion_gate",
             reason_codes=["completion_projection_rejected"],
             semantic_prefix_hashes=semantic_prefix_hashes,
@@ -1295,17 +1448,74 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
             _adapter_producer("adapter-evaluation-completion", sources),
         )
     except (IntegrityError, OSError):
-        return _outcome_recovery("terminal_commit_state_uncertain")
+        return _outcome_recovery(
+            "terminal_commit_state_uncertain", session_root=session_root
+        )
     try:
         store.verify()
     except (IntegrityError, OSError):
-        return _outcome_recovery("canonical_store_verification_failed")
+        return _outcome_recovery(
+            "canonical_store_verification_failed", session_root=session_root
+        )
     try:
         completions = _read_exact_artifacts(
             store, "evaluation_completion", [completion_envelope]
         )
     except (IntegrityError, OSError):
-        return _outcome_recovery("canonical_readback_integrity_failed")
+        return _outcome_recovery(
+            "canonical_readback_integrity_failed", session_root=session_root
+        )
     if len(completions) != 1 or completions[0].get("payload") != completion:
-        return _outcome_recovery("canonical_readback_integrity_failed")
-    return _outcome_completion(deepcopy(completions[0]["payload"]))
+        return _outcome_recovery(
+            "canonical_readback_integrity_failed", session_root=session_root
+        )
+
+    try:
+        report_reviewer_results = _read_exact_artifacts(
+            store, "reviewer_result", canonical_reviewer_results
+        )
+        report_verifier_results = _read_exact_artifacts(
+            store, "verifier_result", canonical_verifier_results
+        )
+    except (IntegrityError, OSError):
+        return _outcome_recovery(
+            "canonical_readback_integrity_failed", session_root=session_root
+        )
+    canonical_completion = deepcopy(completions[0]["payload"])
+    content = render_evaluation_report(
+        plan=plan,
+        completion=canonical_completion,
+        artifacts=[*report_reviewer_results, *report_verifier_results],
+    )
+    report_payload = make_report_payload("evaluation_report", content)
+    try:
+        report_written = store.write_artifact(
+            "evaluation_report",
+            report_payload,
+            _adapter_producer(
+                "adapter-evaluation-report", [completions[0]["envelope_hash"]]
+            ),
+        )
+    except (IntegrityError, OSError):
+        return _outcome_recovery(
+            "artifact_commit_state_uncertain", session_root=session_root
+        )
+    try:
+        store.verify()
+        reports = _read_exact_artifacts(
+            store, "evaluation_report", [report_written]
+        )
+    except (IntegrityError, OSError):
+        return _outcome_recovery(
+            "canonical_readback_integrity_failed", session_root=session_root
+        )
+    if len(reports) != 1 or reports[0].get("payload") != report_payload:
+        return _outcome_recovery(
+            "canonical_readback_integrity_failed", session_root=session_root
+        )
+    path = materialize_non_authoritative_view(
+        sibling_path=_sibling_view_path(session_root, "evaluation-report.md"),
+        content=reports[0]["payload"]["content"],
+        document_kind="evaluation_report",
+    )
+    return _outcome_completion(canonical_completion, path)

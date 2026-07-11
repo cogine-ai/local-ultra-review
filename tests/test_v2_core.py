@@ -58,6 +58,13 @@ from local_ultra_review.redaction import (  # noqa: E402
     assert_safe_sink,
     redaction_contract,
 )
+from local_ultra_review.render import (  # noqa: E402
+    MARKDOWN_MEDIA_TYPE,
+    REPORT_CONTRACT_VERSION,
+    make_report_payload,
+    render_diagnostic_report,
+    render_evaluation_report,
+)
 from local_ultra_review.store import ArtifactStore, IntegrityError  # noqa: E402
 
 
@@ -679,6 +686,38 @@ def completed_completion(plan: dict, reviewer_envelope_hash: str) -> dict:
         "manual_item_records": [],
         "accepted_artifact_hashes": [reviewer_envelope_hash],
         "assurance_contract_under_test": dict(SYNTHETIC_ATTEMPT_ASSURANCE),
+    }
+
+
+def strict_post_store_diagnostic() -> dict:
+    assurance = {
+        "worker_boundary": "guarded_unconfined",
+        "hard_worker_confinement": "not_provided",
+        "packet_only_read": "not_guaranteed",
+        "residual_tool_surface": "unknown",
+        "residual_tool_inventory": "unavailable",
+        "worker_child_environment": "not_verified",
+        "filesystem_write_mitigation": "not_verified",
+        "nested_web_search": "not_verified",
+        "backend_stateless_attestation": "unavailable",
+        "target_execution": "not_requested",
+    }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "diagnostic_contract_version": "evaluation-diagnostic-v1",
+        "diagnostic_kind": "post_store_incomplete",
+        "status": "incomplete",
+        "profile": "evaluation_slice_v2",
+        "authority": "non_authoritative_diagnostic",
+        "authoritative_review": False,
+        "release_ready": False,
+        "protocol_completeness": "incomplete",
+        "result_state": "not_available",
+        "target_execution": "not_requested",
+        "completion_created": False,
+        "failure_phase": "reviewer_dispatch",
+        "reason_codes": ["worker_unavailable"],
+        "assurance_state": assurance,
     }
 
 
@@ -1611,10 +1650,15 @@ class ArtifactStoreTests(unittest.TestCase):
         success_temp, success, _ = self.make_store(total_attempts=0)
         self.addCleanup(success_temp.cleanup)
         sources = write_store_evidence(success, all_manual=True)
-        _completion, completion_envelope = self.write_derived_completion(success, sources)
+        completion, completion_envelope = self.write_derived_completion(success, sources)
+        success_content = render_evaluation_report(
+            plan=success._plan,
+            completion=completion,
+            artifacts=[],
+        )
         success.write_artifact(
             "evaluation_report",
-            {"view": "success"},
+            make_report_payload("evaluation_report", success_content),
             {
                 "producer_kind": "adapter_operation",
                 "operation_id": "adapter-evaluation-report",
@@ -1646,12 +1690,19 @@ class ArtifactStoreTests(unittest.TestCase):
         failure.write_artifact(
             "reviewer_packet", pending, adapter_producer("adapter-reviewer-packet")
         )
+        diagnostic_payload = strict_post_store_diagnostic()
         diagnostic = failure.write_artifact(
-            "diagnostic", {"status": "blocked"}, adapter_producer("adapter-diagnostic")
+            "diagnostic", diagnostic_payload, adapter_producer("adapter-diagnostic")
+        )
+        diagnostic_content = render_diagnostic_report(
+            plan=failure._plan,
+            state=diagnostic_payload["status"],
+            reasons=diagnostic_payload["reason_codes"],
+            assurance_state=diagnostic_payload["assurance_state"],
         )
         failure.write_artifact(
             "diagnostic_report",
-            {"view": "failure"},
+            make_report_payload("diagnostic_report", diagnostic_content),
             {
                 "producer_kind": "adapter_operation",
                 "operation_id": "adapter-diagnostic-report",
@@ -1668,6 +1719,137 @@ class ArtifactStoreTests(unittest.TestCase):
                     {"late": artifact_type},
                     adapter_producer(f"adapter-conflict-{artifact_type}"),
                 )
+
+    def test_report_artifact_requires_exact_payload_hash_markers_and_terminal_projection(self) -> None:
+        def completed_store() -> tuple[
+            tempfile.TemporaryDirectory[str], ArtifactStore, dict, dict, str
+        ]:
+            temporary, store, _session = self.make_store(total_attempts=0)
+            sources = write_store_evidence(store, all_manual=True)
+            completion, terminal = self.write_derived_completion(store, sources)
+            content = render_evaluation_report(
+                plan=store._plan, completion=completion, artifacts=[]
+            )
+            return temporary, store, completion, terminal, content
+
+        valid_temp, valid, _completion, terminal, content = completed_store()
+        self.addCleanup(valid_temp.cleanup)
+        payload = make_report_payload("evaluation_report", content)
+        self.assertEqual(
+            set(payload),
+            {
+                "report_contract_version",
+                "document_kind",
+                "media_type",
+                "content_sha256",
+                "content",
+            },
+        )
+        self.assertEqual(payload["report_contract_version"], REPORT_CONTRACT_VERSION)
+        self.assertEqual(payload["media_type"], MARKDOWN_MEDIA_TYPE)
+        valid.write_artifact(
+            "evaluation_report",
+            payload,
+            {
+                "producer_kind": "adapter_operation",
+                "operation_id": "adapter-valid-report",
+                "input_hashes": [terminal["envelope_hash"]],
+            },
+        )
+        valid.verify()
+
+        mutations: list[dict] = [
+            {"view": "synthetic evaluation"},
+            {**payload, "extra": True},
+            {**payload, "report_contract_version": "other"},
+            {**payload, "document_kind": "diagnostic_report"},
+            {**payload, "media_type": "text/plain; charset=utf-8"},
+            {**payload, "content_sha256": "0" * 64},
+        ]
+        harmless_extra = f"{content}\nAdditional synthetic note.\n"
+        mutations.append(
+            {
+                "report_contract_version": REPORT_CONTRACT_VERSION,
+                "document_kind": "evaluation_report",
+                "media_type": MARKDOWN_MEDIA_TYPE,
+                "content_sha256": hashlib.sha256(
+                    harmless_extra.encode("utf-8")
+                ).hexdigest(),
+                "content": harmless_extra,
+            }
+        )
+        for claim in (
+            "worker_boundary=sandboxed",
+            "This worker is packet-only",
+            "hard_worker_confinement=provided",
+            "residual_tool_surface=no_tools",
+            "worker_child_environment=verified",
+            "authoritative_review=true",
+            "release_ready=true",
+            "authority=canonical_review",
+            "profile=production_review",
+            "document_kind=canonical_report",
+            "The target is clean",
+            "This ｗｏｒｋｅｒ is ｓａｎｄｂｏｘｅｄ",
+            "The tar\u200bget is clean",
+            "authoritative_review: **true**",
+            "release_ready: `true`",
+            "worker_boundary: `sandboxed`",
+            "The target **is clean**",
+            "The target is <b>clean</b>",
+            "No **issues**",
+            "authoritative_review: __true__",
+            "worker_boundary: _sandboxed_",
+            "The target _is_ clean",
+            "[The target][subject] _is_ [clean][verdict]",
+            "[No][prefix] __issues__",
+            "The target is cl<!-- hidden -->ean",
+            "The target is ~~not ~~clean",
+            "makes ~~no claim that~~ the target is clean",
+            "The target is <del>not </del>clean",
+            "The target is <span hidden>not </span>clean",
+            'The target is <span style="display:none">not </span>clean',
+            "The target is cl\ufe0fean",
+        ):
+            claimed_content = f"{content}\n{claim}\n"
+            mutations.append(
+                {
+                    "report_contract_version": REPORT_CONTRACT_VERSION,
+                    "document_kind": "evaluation_report",
+                    "media_type": MARKDOWN_MEDIA_TYPE,
+                    "content_sha256": hashlib.sha256(
+                        claimed_content.encode("utf-8")
+                    ).hexdigest(),
+                    "content": claimed_content,
+                }
+            )
+
+        for index, mutation in enumerate(mutations):
+            temporary, store, _completion, terminal, _content = completed_store()
+            try:
+                before = {
+                    path.relative_to(store.session_root): path.read_bytes()
+                    for path in store.session_root.rglob("*")
+                    if path.is_file()
+                }
+                with self.subTest(index=index), self.assertRaises(IntegrityError):
+                    store.write_artifact(
+                        "evaluation_report",
+                        mutation,
+                        {
+                            "producer_kind": "adapter_operation",
+                            "operation_id": f"adapter-bad-report-{index}",
+                            "input_hashes": [terminal["envelope_hash"]],
+                        },
+                    )
+                after = {
+                    path.relative_to(store.session_root): path.read_bytes()
+                    for path in store.session_root.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(after, before)
+            finally:
+                temporary.cleanup()
 
     def test_create_is_atomic_exclusive_and_has_genesis(self) -> None:
         temporary, store, session = self.make_store()
@@ -1726,6 +1908,24 @@ class ArtifactStoreTests(unittest.TestCase):
             payload = (
                 all_manual_completion(plan)
                 if artifact_type == "evaluation_completion"
+                else make_report_payload(
+                    artifact_type,
+                    (
+                        render_evaluation_report(
+                            plan=plan,
+                            completion=all_manual_completion(plan),
+                            artifacts=[],
+                        )
+                        if artifact_type == "evaluation_report"
+                        else render_diagnostic_report(
+                            plan=plan,
+                            state="incomplete",
+                            reasons=["worker_unavailable"],
+                            assurance_state=strict_post_store_diagnostic()["assurance_state"],
+                        )
+                    ),
+                )
+                if artifact_type in {"evaluation_report", "diagnostic_report"}
                 else {"safe": artifact_type}
             )
             store_module._validate_artifact_contract(
@@ -1828,9 +2028,14 @@ class ArtifactStoreTests(unittest.TestCase):
         self.assertEqual(envelope["payload"], completion)
         store.verify()
 
+        content = render_evaluation_report(
+            plan=store._plan,
+            completion=completion,
+            artifacts=[*sources[3], *sources[4]],
+        )
         report = store.write_artifact(
             "evaluation_report",
-            {"view": "synthetic evaluation"},
+            make_report_payload("evaluation_report", content),
             {
                 "producer_kind": "adapter_operation",
                 "operation_id": "adapter-evaluation-report",

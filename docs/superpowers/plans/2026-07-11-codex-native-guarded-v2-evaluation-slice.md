@@ -697,16 +697,22 @@ def write_recovery_diagnostic(*, sibling_path: Path, reason_codes: list[str]) ->
   `{report_contract_version, document_kind, media_type, content_sha256, content}`.
   `document_kind` must match `evaluation_report` or `diagnostic_report`, `media_type`
   is fixed to UTF-8 Markdown, and `content_sha256` is the SHA-256 of the exact UTF-8
-  materialized bytes. Store verification validates this payload contract and the
-  report's truthful fixed markers; an arbitrary adapter-authored dictionary is not a
-  valid report artifact.
+  materialized bytes. Store verification validates this payload contract and then
+  deterministically re-renders the expected bytes from the canonical terminal plus
+  canonical reviewer/verifier envelopes; payload equality is exact. Truthful fixed
+  markers and visible Markdown/HTML-equivalent claim normalization are defense in
+  depth, not the authority boundary. An arbitrary adapter-authored dictionary is not
+  a valid report artifact.
 - For evaluation and normal post-Store diagnostic rendering, first persist rendered bytes as a content-addressed `evaluation_report` or `diagnostic_report` artifact and commit its ledger event. Verify the Store, then atomically materialize the non-authoritative view as a sibling `evaluation-report.md` or `diagnostic.md` **outside** the canonical session directory; the Store root continues to contain only `plan.json`, `ledger.jsonl`, and `artifacts/`.
 - A pre-session blocked diagnostic has no Store by design. Validate the strict Task 4 diagnostic object, then atomically materialize a sibling `diagnostic.md` marked non-authoritative/pre-session with no target or result claim. A materialized view is never the authority.
 - `write_recovery_diagnostic` is used only after integrity failure, writes outside the session directory with staging+fsync+atomic rename, contains only stable reason codes (no unsafe-payload digest), makes no target/result claims, and labels itself non-authoritative because canonical state could not be verified.
 - Materialization has one implementation-owned path. It accepts only the exact sibling
   basenames `evaluation-report.md`, `diagnostic.md`, or `recovery-diagnostic.md`, so
-  `report.md` is structurally unreachable. It writes a mode-0600 staging file, fsyncs,
-  atomically replaces an existing regular non-symlink view, and fsyncs the parent.
+  `report.md` is structurally unreachable. It walks/creates the absolute parent one
+  no-follow component at a time, retains the final directory descriptor, and uses
+  `dir_fd` operations for the mode-0600 staging file, destination stat, atomic replace,
+  parent fsync, and nonblocking no-follow readback. Parent inode identity is checked
+  before publication and after readback.
   Replacing a prior materialized view is allowed because the view is explicitly
   non-authoritative; a symlink/non-regular destination or any failed/uncertain write
   raises a sanitized materialization error and never returns a path.

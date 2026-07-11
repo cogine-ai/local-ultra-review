@@ -35,6 +35,13 @@ from .completion_projection import (
     validate_target_packet,
 )
 from .redaction import SensitiveMaterialError, assert_safe_sink
+from .render import (
+    RenderError,
+    make_report_payload,
+    render_diagnostic_report,
+    render_evaluation_report,
+    validate_report_artifact_payload,
+)
 
 
 class IntegrityError(RuntimeError):
@@ -288,6 +295,11 @@ def _validate_artifact_contract(
                 validate_payload("evaluation-completion", payload)
             except ContractError as error:
                 raise IntegrityError(f"evaluation completion contract failed: {error}") from error
+        elif artifact_type in {"evaluation_report", "diagnostic_report"}:
+            try:
+                validate_report_artifact_payload(artifact_type, payload)
+            except RenderError as error:
+                raise IntegrityError("report artifact contract failed") from error
         return input_hashes
 
     if producer_kind != "worker_attempt":
@@ -409,6 +421,32 @@ def _validate_session_sequence(plan: dict, envelopes: list[dict]) -> None:
                 raise IntegrityError("artifact follows a terminal outside its one matching report")
             if envelope["input_hashes"] != [terminal_envelope["envelope_hash"]]:
                 raise IntegrityError("report inputs must exactly reference its terminal artifact")
+            try:
+                if terminal_type == "evaluation_completion":
+                    expected_content = render_evaluation_report(
+                        plan=plan,
+                        completion=terminal_envelope["payload"],
+                        artifacts=[*reviewer_results, *verifier_results],
+                    )
+                else:
+                    diagnostic = terminal_envelope["payload"]
+                    expected_content = render_diagnostic_report(
+                        plan=plan,
+                        state=diagnostic["status"],
+                        reasons=diagnostic["reason_codes"],
+                        assurance_state=diagnostic["assurance_state"],
+                    )
+                expected_payload = make_report_payload(
+                    expected_report, expected_content
+                )
+            except (KeyError, TypeError, RenderError) as error:
+                raise IntegrityError(
+                    "report cannot be projected from its canonical terminal"
+                ) from error
+            if envelope["payload"] != expected_payload:
+                raise IntegrityError(
+                    "report payload is not the exact canonical terminal projection"
+                )
             report_seen = True
             continue
 
