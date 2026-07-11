@@ -1341,13 +1341,17 @@ class CodexCliBackend:
         if self._cli_diagnostic_state == "binary_inspection_failed":
             blockers.append("cli_binary_inspection_failed")
         blockers = sorted(set(blockers))
-        environment_preflight = self._environment_preflight or {
-            "status": "not_run",
-            "evidence_owner": "adapter_host",
-            "semantic_invocation": False,
-            "worker_environment_policy_sha256": WORKER_ENVIRONMENT_POLICY_SHA256,
-            "environment_values_recorded": False,
-        }
+        environment_preflight = (
+            deepcopy(self._environment_preflight)
+            if self._environment_preflight is not None
+            else {
+                "status": "not_run",
+                "evidence_owner": "adapter_host",
+                "semantic_invocation": False,
+                "worker_environment_policy_sha256": WORKER_ENVIRONMENT_POLICY_SHA256,
+                "environment_values_recorded": False,
+            }
+        )
         return {
             "ready": False,
             "diagnostic_ready": False,
@@ -1567,8 +1571,8 @@ class CodexCliBackend:
             assert_safe_sink(evidence)
         except SensitiveMaterialError as error:
             raise WorkerUnavailable("environment preflight evidence was unsafe") from error
-        self._environment_preflight = evidence
-        return evidence
+        self._environment_preflight = deepcopy(evidence)
+        return deepcopy(self._environment_preflight)
 
     def run(self, task: WorkerTask, attempt_dir: Path) -> WorkerAttempt:
         del task, attempt_dir

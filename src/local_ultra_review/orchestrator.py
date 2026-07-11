@@ -10,6 +10,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import inspect
 import os
 from pathlib import Path
 import re
@@ -128,16 +129,31 @@ _POST_STORE_PHASES = {
     "verifier_acceptance",
     "completion_gate",
 }
-_POST_STORE_REASONS = {
-    "worker_unavailable",
-    "scripted_attempts_exhausted",
-    "worker_attempt_rejected",
-    "semantic_contract_rejected",
-    "coverage_accounting_failed",
-    "scripted_attempts_leftover",
-    "scripted_attempt_accounting_mismatch",
-    "completion_projection_rejected",
+_POST_STORE_REASON_BY_PHASE = {
+    "reviewer_dispatch": {
+        "worker_unavailable",
+        "scripted_attempts_exhausted",
+    },
+    "reviewer_acceptance": {
+        "worker_attempt_rejected",
+        "semantic_contract_rejected",
+        "coverage_accounting_failed",
+    },
+    "verifier_dispatch": {
+        "worker_unavailable",
+        "scripted_attempts_exhausted",
+    },
+    "verifier_acceptance": {
+        "worker_attempt_rejected",
+        "semantic_contract_rejected",
+    },
+    "completion_gate": {
+        "scripted_attempts_leftover",
+        "scripted_attempt_accounting_mismatch",
+        "completion_projection_rejected",
+    },
 }
+_POST_STORE_REASONS = set().union(*_POST_STORE_REASON_BY_PHASE.values())
 _BINDING_REASONS = {
     "request_backend_model_mismatch",
     "synthetic_consumption_state_unavailable",
@@ -234,20 +250,22 @@ class EvaluationOutcome:
             validate_evaluation_diagnostic(self.diagnostic)
         if self.recovery_reason_codes:
             if (
-                self.recovery_reason_codes
+                any(
+                    not isinstance(code, str) or code not in _RECOVERY_REASONS
+                    for code in self.recovery_reason_codes
+                )
+                or self.recovery_reason_codes
                 != tuple(sorted(set(self.recovery_reason_codes)))
-                or any(code not in _RECOVERY_REASONS for code in self.recovery_reason_codes)
             ):
                 raise ValueError("integrity recovery reason codes are invalid")
 
 
 def _sorted_unique_strings(value: object, *, allowlist: set[str], label: str) -> list[str]:
-    if (
-        not isinstance(value, list)
-        or not value
-        or value != sorted(set(value))
-        or any(not isinstance(item, str) or item not in allowlist for item in value)
-    ):
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{label} must be sorted unique allowlisted strings")
+    if any(not isinstance(item, str) or item not in allowlist for item in value):
+        raise ValueError(f"{label} must be sorted unique allowlisted strings")
+    if value != sorted(set(value)):
         raise ValueError(f"{label} must be sorted unique allowlisted strings")
     return value
 
@@ -372,11 +390,11 @@ def _validate_environment_preflight(value: object) -> None:
         "host_runtime_added_keys",
     ):
         items = value[field]
-        if (
-            not isinstance(items, list)
-            or items != sorted(set(items))
-            or any(not isinstance(item, str) or not item for item in items)
+        if not isinstance(items, list) or any(
+            not isinstance(item, str) or not item for item in items
         ):
+            raise ValueError(f"Codex preflight {field} must be sorted unique strings")
+        if items != sorted(set(items)):
             raise ValueError(f"Codex preflight {field} must be sorted unique strings")
     policy_keys = set(ENVIRONMENT_ALLOWLIST) | {"TMPDIR"}
     if any(
@@ -441,6 +459,15 @@ def _validate_codex_readiness(value: Mapping[str, object]) -> None:
         "unexecuted_nofollow_file_object",
     }:
         raise ValueError("Codex CLI binary identity scope is invalid")
+    if (
+        value["qualification_state"]
+        == "not_evaluable_without_object_bound_version_probe"
+        and value["cli_binary_identity_scope"]
+        != "unexecuted_nofollow_file_object"
+    ):
+        raise ValueError(
+            "Codex non-evaluable qualification requires a no-follow file object"
+        )
     blockers = _sorted_unique_strings(
         value["live_dispatch_blockers"],
         allowlist=_CODEX_BLOCKERS,
@@ -588,13 +615,16 @@ def validate_evaluation_diagnostic(value: object) -> None:
         }
         if any(value.get(key) != expected for key, expected in fixed.items()):
             raise ValueError("post-Store diagnostic fixed state is invalid")
-        if value.get("failure_phase") not in _POST_STORE_PHASES:
+        phase = value.get("failure_phase")
+        if phase not in _POST_STORE_PHASES:
             raise ValueError("post-Store diagnostic failure phase is invalid")
-        _sorted_unique_strings(
+        reasons = _sorted_unique_strings(
             value.get("reason_codes"),
             allowlist=_POST_STORE_REASONS,
             label="post-Store reasons",
         )
+        if any(reason not in _POST_STORE_REASON_BY_PHASE[phase] for reason in reasons):
+            raise ValueError("post-Store diagnostic reason is impossible for its phase")
         if value.get("assurance_state") != _ASSURANCE_STATE:
             raise ValueError("post-Store assurance state is not exact")
         return
@@ -856,6 +886,20 @@ def _read_exact_artifacts(
     return values
 
 
+_MISSING_BACKEND_CAPABILITY = object()
+
+
+def _backend_capability(backend: object, name: str) -> object:
+    """Read a statically present capability without masking descriptor failures."""
+
+    descriptor = inspect.getattr_static(
+        backend, name, _MISSING_BACKEND_CAPABILITY
+    )
+    if descriptor is _MISSING_BACKEND_CAPABILITY:
+        return _MISSING_BACKEND_CAPABILITY
+    return getattr(backend, name)
+
+
 def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOutcome:
     """Run one synthetic evaluation protocol and return no materialized view."""
 
@@ -864,7 +908,7 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
         readiness = deepcopy(backend.readiness())
         assert_safe_sink(readiness)
         readiness_kind = _readiness_kind(readiness)
-    except (ContractError, SensitiveMaterialError, ValueError) as error:
+    except (ContractError, SensitiveMaterialError, TypeError, ValueError) as error:
         raise WorkerProtocolError("backend readiness contract is invalid") from error
     if readiness_kind == "codex" or readiness.get("ready") is not True:
         if readiness_kind == "codex":
@@ -878,9 +922,8 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
             readiness, phase="backend_readiness", reason_codes=reasons
         )
 
-    try:
-        backend_model = backend.model
-    except AttributeError:
+    backend_model = _backend_capability(backend, "model")
+    if backend_model is _MISSING_BACKEND_CAPABILITY:
         backend_model = None
     if backend_model != request.model:
         return _pre_session_diagnostic(
@@ -888,7 +931,7 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
             phase="backend_binding",
             reason_codes=["request_backend_model_mismatch"],
         )
-    consumption_oracle = getattr(backend, "consumption_state", None)
+    consumption_oracle = _backend_capability(backend, "consumption_state")
     if not callable(consumption_oracle):
         return _pre_session_diagnostic(
             readiness,
@@ -1188,7 +1231,14 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
         expected_attempts = 1 + len(persisted_candidates)
     try:
         state = _validate_consumption_state(deepcopy(consumption_oracle()))
-    except (ContractError, SensitiveMaterialError, TypeError, ValueError):
+    except (
+        ContractError,
+        SensitiveMaterialError,
+        TypeError,
+        ValueError,
+        WorkerProtocolError,
+        WorkerUnavailable,
+    ):
         return _normal_failure(
             store,
             phase="completion_gate",

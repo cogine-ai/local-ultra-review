@@ -1202,9 +1202,19 @@ class CodexCliBackendTests(unittest.TestCase):
         self.assertNotIn("EVAL_ONLY_DO_NOT_LEAK_123456", rendered)
         self.assertNotIn("must-not-pass", rendered)
 
+        sealed_evidence = copy.deepcopy(evidence)
+        evidence["status"] = "failed"
+        evidence["child_environment_keys"].append("CALLER_MUTATION")
         readiness = backend.readiness()
-        self.assertEqual(readiness["environment_preflight"], evidence)
+        self.assertEqual(readiness["environment_preflight"], sealed_evidence)
         self.assertFalse(readiness["live_dispatch_authorized"])
+
+        readiness["environment_preflight"]["descendant_environment_keys"].append(
+            "SECOND_CALLER_MUTATION"
+        )
+        self.assertEqual(
+            backend.readiness()["environment_preflight"], sealed_evidence
+        )
 
     def test_matching_record_cannot_qualify_without_object_bound_version_probe(self) -> None:
         _temporary, _fake_codex, record, backend = self.make_backend()

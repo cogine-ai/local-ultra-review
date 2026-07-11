@@ -588,9 +588,21 @@ claims.
   `target_execution=not_requested`, a bounded failure phase, sorted allowlisted reason
   codes, and the exact conservative guarded limitation state. Its artifact envelope,
   not the payload, binds session and review identity.
+- Post-Store reason codes are phase-bound, not merely globally allowlisted:
+  reviewer/verifier dispatch accepts only unavailable/exhausted dispatch reasons;
+  reviewer acceptance additionally owns coverage failure; verifier acceptance owns
+  only attempt/semantic rejection; and the completion gate owns only leftover,
+  accounting-mismatch, or projection-rejection reasons. Impossible phase/reason
+  pairs are invalid diagnostics.
 - `EvaluationOutcome` is an exclusive three-way result: canonical completion,
   diagnostic, or a nonempty sorted unique integrity-recovery code tuple. Task 4 always
   leaves all materialized path fields `None`.
+
+Public diagnostic/outcome validation checks element types before uniqueness/sorting,
+so malformed unhashable arrays fail as `ValueError`; malformed backend readiness is
+then normalized to `WorkerProtocolError` at the orchestration boundary. A Codex
+qualification state of `not_evaluable_without_object_bound_version_probe` is valid
+only with `cli_binary_identity_scope=unexecuted_nofollow_file_object`.
 
 Normal worker/schema/coverage/attempt-accounting failures are mapped to stable reason
 codes and never include exception text. A post-Store normal failure first verifies the
@@ -607,8 +619,17 @@ blocks before target seal/Store. Request/backend model mismatch is likewise a
 pre-session diagnostic. Invalid request/target inputs remain input errors for Task 6
 rather than fabricated evaluation outcomes.
 
+Model and consumption capabilities are checked for static presence before access:
+true absence maps to the stable pre-session binding diagnostic, while an
+`AttributeError` raised inside a present descriptor is a programming failure and
+propagates. At the final consumption gate, only known oracle contract failures
+(`WorkerUnavailable` or `WorkerProtocolError`, alongside the existing validation
+failures) map to `scripted_attempt_accounting_mismatch`; unrelated runtime or
+attribute failures propagate.
+
 - `evaluate` is the only phase-transition owner: backend readiness -> model/consumption binding -> one semantic-identity capture -> seal target -> create semantic plan/store -> packet -> reviewer -> verifier(s) -> synthetic evaluation gate. It must not call V1 scripts.
 - A backend with `readiness.ready != true` performs no target seal, Store creation, semantic invocation, semantic plan, review identity, or completion. Task 4 returns only a strict non-authoritative pre-session diagnostic object; it materializes no external file. A blocked Codex diagnostic includes `ready=false`, `diagnostic_ready=false`, `cli_version=null`, `version_probe_executed=false`, `object_bound_executable_binding=unavailable`, `live_dispatch_authorized=false`, `semantic_subprocess_launched=false`, and no synthetic verdict. A matching record has exactly the inventory-oracle and object-bound-version blockers; independently invalid/expired/mismatched records may add their corresponding qualification blocker. A passing environment canary changes none of these fixed states/blockers.
+- Codex environment-preflight evidence is stored as a private deep copy. Both `preflight_worker_environment()` and every `readiness()` call return fresh deep copies, so caller mutation cannot rewrite later readiness or evaluation truth.
 - For a ready pristine Fake backend, reject any request/backend model or consumption-capability mismatch, then capture and validate `semantic_identity()` exactly once **before target sealing**. This preserves the truthful pre-session `backend_semantic_identity_invalid` branch (`target_sealed=false`). Its reviewer template contains only the public whole-node `{{REVIEWED_ATOM_IDS}}` sentinel, never literal sealed atom IDs. After target sealing, build and validate the exact Task 3.5 semantic plan from the already-captured readiness/identity snapshots, then derive review identity from target identity plus the complete semantic plan. No task ID is derived before this identity exists. Worker packets exclude session ID/path/time and plan-integrity hash.
 - Reviewer task ID is a stable hash of review identity plus role. Reviewer packet hash binds the complete packet. At Fake run time the reviewer coverage sentinel binds structurally from that packet to the exact sealed **reviewable** atom array; the accepted result must equal the array exactly, with no missing, unknown, reordered, or literal-unbound atoms.
 - More precisely, reviewer coverage must equal the reviewable atom set exactly, while adapter manual dispositions must equal the manual atom set exactly. The two sets must be disjoint and their union must equal every changed-path/hunk atom.

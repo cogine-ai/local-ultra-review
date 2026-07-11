@@ -29,6 +29,7 @@ from local_ultra_review.backend import (  # noqa: E402
     ScriptedAttempt,
     WorkerProtocolError,
     WorkerAttempt,
+    WorkerUnavailable,
 )
 from local_ultra_review import orchestrator as orchestrator_module  # noqa: E402
 from local_ultra_review.completion_projection import review_candidate_hash  # noqa: E402
@@ -331,7 +332,11 @@ def pre_session_diagnostic(readiness: dict, reasons: list[str]) -> dict:
     }
 
 
-def post_store_diagnostic(reason: str = "worker_attempt_rejected") -> dict:
+def post_store_diagnostic(
+    reason: str = "worker_attempt_rejected",
+    *,
+    phase: str = "reviewer_acceptance",
+) -> dict:
     return {
         "schema_version": SCHEMA_VERSION,
         "diagnostic_contract_version": DIAGNOSTIC_CONTRACT_VERSION,
@@ -345,7 +350,7 @@ def post_store_diagnostic(reason: str = "worker_attempt_rejected") -> dict:
         "result_state": "not_available",
         "target_execution": "not_requested",
         "completion_created": False,
-        "failure_phase": "reviewer_acceptance",
+        "failure_phase": phase,
         "reason_codes": [reason],
         "assurance_state": {
             "worker_boundary": "guarded_unconfined",
@@ -469,6 +474,54 @@ class DiagnosticContractTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 validate_evaluation_diagnostic(value)
 
+    def test_post_store_phase_reason_matrix_is_exact(self) -> None:
+        matrix = {
+            "reviewer_dispatch": {
+                "worker_unavailable",
+                "scripted_attempts_exhausted",
+            },
+            "reviewer_acceptance": {
+                "worker_attempt_rejected",
+                "semantic_contract_rejected",
+                "coverage_accounting_failed",
+            },
+            "verifier_dispatch": {
+                "worker_unavailable",
+                "scripted_attempts_exhausted",
+            },
+            "verifier_acceptance": {
+                "worker_attempt_rejected",
+                "semantic_contract_rejected",
+            },
+            "completion_gate": {
+                "scripted_attempts_leftover",
+                "scripted_attempt_accounting_mismatch",
+                "completion_projection_rejected",
+            },
+        }
+        for phase, reasons in matrix.items():
+            for reason in reasons:
+                with self.subTest(valid=(phase, reason)):
+                    validate_evaluation_diagnostic(
+                        post_store_diagnostic(reason, phase=phase)
+                    )
+
+        phases = tuple(matrix)
+        for phase, reasons in matrix.items():
+            foreign_reason = next(
+                reason
+                for other_phase in phases
+                if other_phase != phase
+                for reason in matrix[other_phase]
+                if reason not in reasons
+            )
+            with self.subTest(invalid=(phase, foreign_reason)), self.assertRaises(
+                ValueError
+            ):
+                validate_evaluation_diagnostic(
+                    post_store_diagnostic(foreign_reason, phase=phase)
+                )
+
     def test_outcome_requires_exactly_one_channel_and_no_paths(self) -> None:
         diagnostic = post_store_diagnostic()
         EvaluationOutcome(None, diagnostic, (), None, None, None)
@@ -498,6 +551,35 @@ class DiagnosticContractTests(unittest.TestCase):
                 EvaluationOutcome(None, None, codes, None, None, None)
         with self.assertRaises(ValueError):
             EvaluationOutcome(None, diagnostic, [], None, None, None)  # type: ignore[arg-type]
+
+    def test_public_validation_rejects_unhashable_list_elements_as_value_errors(self) -> None:
+        malformed_reasons = post_store_diagnostic()
+        malformed_reasons["reason_codes"] = [{}]
+        with self.assertRaises(ValueError):
+            validate_evaluation_diagnostic(malformed_reasons)
+
+        malformed_environment = pre_session_diagnostic(
+            codex_readiness(canary=True),
+            [
+                "canonical_inventory_oracle_unavailable",
+                "object_bound_version_probe_unavailable",
+            ],
+        )
+        malformed_environment["backend_readiness"]["environment_preflight"][
+            "child_environment_keys"
+        ] = [{}]
+        with self.assertRaises(ValueError):
+            validate_evaluation_diagnostic(malformed_environment)
+
+        with self.assertRaises(ValueError):
+            EvaluationOutcome(
+                None,
+                None,
+                ({},),  # type: ignore[arg-type]
+                None,
+                None,
+                None,
+            )
 
     def test_diagnostic_nested_mutations_and_false_wording_are_rejected(self) -> None:
         mutations: list[dict] = []
@@ -639,6 +721,24 @@ class DiagnosticContractTests(unittest.TestCase):
         )
         mutations.append(forged_canary)
 
+        impossible_scope = pre_session_diagnostic(
+            codex_readiness(),
+            [
+                "canonical_inventory_oracle_unavailable",
+                "cli_binary_inspection_failed",
+                "object_bound_version_probe_unavailable",
+            ],
+        )
+        impossible_scope["backend_readiness"][
+            "cli_binary_identity_scope"
+        ] = "unavailable"
+        impossible_scope["backend_readiness"]["live_dispatch_blockers"] = [
+            "canonical_inventory_oracle_unavailable",
+            "cli_binary_inspection_failed",
+            "object_bound_version_probe_unavailable",
+        ]
+        mutations.append(impossible_scope)
+
         for value in mutations:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 validate_evaluation_diagnostic(value)
@@ -715,6 +815,30 @@ class DiagnosticContractTests(unittest.TestCase):
         seal.assert_not_called()
         self.assertFalse((root / "session").exists())
 
+    def test_unhashable_backend_readiness_is_wrapped_as_worker_protocol_error(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        malformed = fake_readiness()
+        malformed["live_dispatch_blockers"] = [{}]
+
+        class MalformedReadiness:
+            model = "synthetic-model"
+
+            def readiness(self):
+                return malformed
+
+        request = EvaluationRequest(
+            repo=root / "unused",
+            base="base",
+            head="head",
+            model="synthetic-model",
+            session_root=root / "session",
+        )
+        with self.assertRaisesRegex(WorkerProtocolError, "readiness contract"):
+            evaluate(request, MalformedReadiness())
+        self.assertFalse((root / "session").exists())
+
 
 class EvaluationFlowTests(unittest.TestCase):
     def test_actual_codex_and_passing_canary_block_before_target_or_store(self) -> None:
@@ -727,6 +851,12 @@ class EvaluationFlowTests(unittest.TestCase):
                 if run_canary:
                     evidence = backend.preflight_worker_environment(root / "canary")
                     self.assertEqual(evidence["status"], "passed")
+                    evidence["status"] = "failed"
+                    evidence["child_environment_keys"].append("CALLER_MUTATION")
+                    readiness_alias = backend.readiness()
+                    readiness_alias["environment_preflight"][
+                        "descendant_environment_keys"
+                    ].append("SECOND_CALLER_MUTATION")
                 request = EvaluationRequest(
                     repo=root / "repository-is-never-opened",
                     base="base-ref",
@@ -775,6 +905,16 @@ class EvaluationFlowTests(unittest.TestCase):
                 if run_canary:
                     self.assertEqual(
                         snapshot["environment_preflight"]["status"], "passed"
+                    )
+                    self.assertNotIn(
+                        "CALLER_MUTATION",
+                        snapshot["environment_preflight"]["child_environment_keys"],
+                    )
+                    self.assertNotIn(
+                        "SECOND_CALLER_MUTATION",
+                        snapshot["environment_preflight"][
+                            "descendant_environment_keys"
+                        ],
                     )
                 self.assertFalse((root / "session").exists())
                 self.assertFalse(fake.semantic_probe.exists())
@@ -1426,6 +1566,65 @@ class EvaluationFlowTests(unittest.TestCase):
                     [],
                 )
 
+    def test_consumption_oracle_contract_exceptions_are_sanitized_only(self) -> None:
+        known = (
+            WorkerUnavailable("oracle unavailable", diagnostic={"private": "detail"}),
+            WorkerProtocolError("oracle protocol private detail"),
+        )
+        for error in known:
+            with self.subTest(known=type(error).__name__):
+                fixture = EvaluationFixture(self)
+                delegate = fixture.backend([], [])
+
+                class KnownOracleFailure:
+                    model = "synthetic-model"
+
+                    def readiness(self):
+                        return delegate.readiness()
+
+                    def semantic_identity(self):
+                        return delegate.semantic_identity()
+
+                    def consumption_state(self):
+                        raise error
+
+                    def run(self, task, attempt_dir):
+                        return delegate.run(task, attempt_dir)
+
+                outcome = evaluate(fixture.request(), KnownOracleFailure())
+                self.assertEqual(
+                    outcome.diagnostic["reason_codes"],
+                    ["scripted_attempt_accounting_mismatch"],
+                )
+                self.assertNotIn("private", json.dumps(outcome.diagnostic))
+
+        programming = (
+            RuntimeError("oracle programming error"),
+            AttributeError("oracle attribute programming error"),
+        )
+        for error in programming:
+            with self.subTest(programming=type(error).__name__):
+                fixture = EvaluationFixture(self)
+                delegate = fixture.backend([], [])
+
+                class ProgrammingOracleFailure:
+                    model = "synthetic-model"
+
+                    def readiness(self):
+                        return delegate.readiness()
+
+                    def semantic_identity(self):
+                        return delegate.semantic_identity()
+
+                    def consumption_state(self):
+                        raise error
+
+                    def run(self, task, attempt_dir):
+                        return delegate.run(task, attempt_dir)
+
+                with self.assertRaises(type(error)):
+                    evaluate(fixture.request(), ProgrammingOracleFailure())
+
     def test_model_missing_consumption_reused_fake_and_bad_identity_short_circuit(self) -> None:
         fixture = EvaluationFixture(self)
         base_backend = fixture.backend([], [])
@@ -1455,6 +1654,61 @@ class EvaluationFlowTests(unittest.TestCase):
             ["synthetic_consumption_state_unavailable"],
         )
         self.assertFalse(missing_fixture.session_root.exists())
+
+        missing_model_fixture = EvaluationFixture(self)
+        missing_model_delegate = missing_model_fixture.backend([], [])
+
+        class MissingModel:
+            def readiness(self):
+                return missing_model_delegate.readiness()
+
+            def consumption_state(self):
+                raise AssertionError("model binding must stop before consumption")
+
+        missing_model = evaluate(missing_model_fixture.request(), MissingModel())
+        self.assertEqual(
+            missing_model.diagnostic["reason_codes"],
+            ["request_backend_model_mismatch"],
+        )
+        self.assertFalse(missing_model_fixture.session_root.exists())
+
+        descriptor_fixture = EvaluationFixture(self)
+        descriptor_delegate = descriptor_fixture.backend([], [])
+
+        class ModelDescriptorProgrammingError:
+            @property
+            def model(self):
+                raise AttributeError("internal model descriptor error")
+
+            def readiness(self):
+                return descriptor_delegate.readiness()
+
+            def consumption_state(self):
+                raise AssertionError("model descriptor must stop before consumption")
+
+        with self.assertRaisesRegex(AttributeError, "model descriptor error"):
+            evaluate(descriptor_fixture.request(), ModelDescriptorProgrammingError())
+        self.assertFalse(descriptor_fixture.session_root.exists())
+
+        consumption_descriptor_fixture = EvaluationFixture(self)
+        consumption_descriptor_delegate = consumption_descriptor_fixture.backend([], [])
+
+        class ConsumptionDescriptorProgrammingError:
+            model = "synthetic-model"
+
+            @property
+            def consumption_state(self):
+                raise AttributeError("internal consumption descriptor error")
+
+            def readiness(self):
+                return consumption_descriptor_delegate.readiness()
+
+        with self.assertRaisesRegex(AttributeError, "consumption descriptor error"):
+            evaluate(
+                consumption_descriptor_fixture.request(),
+                ConsumptionDescriptorProgrammingError(),
+            )
+        self.assertFalse(consumption_descriptor_fixture.session_root.exists())
 
         reused_fixture = EvaluationFixture(self)
         reused_backend = reused_fixture.backend([], [])
