@@ -1229,7 +1229,12 @@ class CodexCliBackend:
             raise ValueError("model identifier contains unsafe sensitive material") from error
         self._codex_path = _lexical_absolute_path(Path(codex_path))
         self._model = model
-        self._qualification_record_path = Path(qualification_record).expanduser().resolve()
+        try:
+            self._qualification_record_path = (
+                Path(qualification_record).expanduser().resolve()
+            )
+        except (OSError, RuntimeError) as error:
+            raise WorkerProtocolError("qualification record path is invalid") from error
         source_environment = os.environ if parent_environment is None else parent_environment
         self._parent_environment = {
             str(key): str(value)

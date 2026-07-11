@@ -202,8 +202,8 @@ def build_review_packet(target: SealedTarget) -> dict: ...
 - Resolve both refs with `git rev-parse --verify <ref>^{commit}` exactly once.
 - Reject a non-repository, equal SHAs, dirty index/worktree, untracked files, submodule dirt in the checkout, empty diff, absolute/escaping paths, and undecodable path metadata. Do not silently reject or omit an otherwise valid mixed binary/special diff: classify it into a manual partition.
 - Use `git diff --raw -z --no-renames <base_sha>..<head_sha --`, `git diff --numstat -z --no-renames ...`, and `git diff --no-ext-diff --no-textconv --no-renames ...`. Parse delete/add as separate paths; never enable heuristic rename detection.
-- Every raw changed path creates one deterministic path-metadata atom containing status and old/new modes. Every textual hunk creates one additional hunk atom. Therefore mode-only and empty-file changes still have an atom.
-- Binary, submodule, sensitive-path, unparseable, or materially redacted atoms receive adapter-owned manual dispositions. Reviewer-covered and manual atom sets are disjoint and their exact union is every atom. A mixed text+binary target can continue only as `manual_review_required`, never simulated clean.
+- Every raw changed path creates one deterministic path-metadata atom containing status and old/new modes. Every textual hunk creates one additional hunk atom. Therefore mode-only and empty-file changes still have an atom. A regular-file `100644`/`100755` mode-only change receives the adapter-owned `mode_only_change` manual disposition; it cannot be delegated to the synthetic reviewer or yield simulated clean.
+- Binary, submodule, sensitive-path, unparseable, mode-only, or materially redacted atoms receive adapter-owned manual dispositions. Reviewer-covered and manual atom sets are disjoint and their exact union is every atom. A mixed text+binary target can continue only as `manual_review_required`, never simulated clean.
 - `target_identity_hash` includes repository identity, base/head SHAs, the **redacted** safe-diff hash, changed-path metadata, every atom, every redaction/manual disposition, and redaction-ruleset hash. It excludes session path, wall clock, session ID, worker/model/backend inputs, raw-diff hash, blob IDs for sensitive paths, and raw sensitive bytes. The fixed commit SHAs seal the original Git objects without persisting a standalone secret-derived digest. Task 4 builds the broader `review_identity_hash`.
 - The packet contains fixed SHAs, only the redacted/withheld diff representation, changed-path metadata, reviewable atoms, manual dispositions, profile, and an untrusted-content warning. It contains no local repository path or raw sensitive value.
 
@@ -737,6 +737,10 @@ def write_recovery_diagnostic(*, sibling_path: Path, reason_codes: list[str]) ->
 **Files:**
 
 - Modify: `src/local_ultra_review/orchestrator.py`
+- Modify: `src/local_ultra_review/backend.py`
+- Modify: `src/local_ultra_review/render.py`
+- Modify: `src/local_ultra_review/git_target.py`
+- Extend: `tests/test_v2_core.py`
 - Create: `tests/test_v2_e2e.py`
 - Create: `tests/test_v2_live.py`
 

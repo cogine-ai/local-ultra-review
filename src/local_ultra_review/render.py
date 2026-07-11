@@ -308,6 +308,13 @@ def _inline(value: object) -> str:
     return f"{delimiter}{text}{delimiter}"
 
 
+def _append_synthetic_values(lines: list[str], label: str, values: list[str]) -> None:
+    lines.append(f"- synthetic_{label}:")
+    lines.extend(
+        f"  - synthetic_{label}_item: {_inline(value)}" for value in values
+    )
+
+
 def _normalized_claim_text(content: str) -> str:
     normalized = unicodedata.normalize("NFKC", html.unescape(content))
     for _iteration in range(3):
@@ -496,8 +503,57 @@ def render_evaluation_report(
                 f"- synthetic_severity: {_inline(record['merged_final_severity'])}",
                 f"- synthetic_location: {_inline(str(root['file']) + ':' + str(root['line']))}",
                 f"- synthetic_failure_scenario: {_inline(root['failure_scenario'])}",
+                f"- synthetic_why_diff: {_inline(root['why_diff'])}",
             ]
         )
+        _append_synthetic_values(lines, "evidence", root["evidence"])
+        lines.append("- synthetic_confirmed_instances:")
+        for instance in record["confirmed_instances"]:
+            lines.extend(
+                [
+                    "  - synthetic_confirmed_instance:",
+                    f"    - synthetic_candidate_hash: {_inline(instance['candidate_hash'])}",
+                    f"    - synthetic_duplicate_ordinal: {_inline(instance['duplicate_ordinal'])}",
+                    "    - synthetic_verifier_result_envelope_hash: "
+                    + _inline(instance["verifier_result_envelope_hash"]),
+                    f"    - synthetic_instance_final_severity: {_inline(instance['final_severity'])}",
+                ]
+            )
+        for label in (
+            "proof",
+            "provenance",
+            "best_fix",
+            "refactor_judgment",
+            "residual_risk",
+        ):
+            _append_synthetic_values(lines, label, record[label])
+        lines.append(
+            "- synthetic_canonical_finding_hash: "
+            + _inline(record["canonical_finding_hash"])
+        )
+
+    if completion["verifier_disposition_records"]:
+        lines.extend(["", "## Synthetic fixture verifier dispositions", ""])
+        for index, disposition in enumerate(
+            completion["verifier_disposition_records"], start=1
+        ):
+            lines.extend(
+                [
+                    f"### Synthetic fixture verifier disposition {index}",
+                    "",
+                    f"- synthetic_candidate_hash: {_inline(disposition['candidate_hash'])}",
+                    f"- synthetic_duplicate_ordinal: {_inline(disposition['duplicate_ordinal'])}",
+                    "- synthetic_verifier_result_envelope_hash: "
+                    + _inline(disposition["verifier_result_envelope_hash"]),
+                    f"- synthetic_disposition: {_inline(disposition['disposition'])}",
+                    "- synthetic_final_severity: "
+                    + _inline(
+                        "null"
+                        if disposition["final_severity"] is None
+                        else disposition["final_severity"]
+                    ),
+                ]
+            )
     for index, record in enumerate(completion["manual_item_records"], start=1):
         lines.extend(
             [
@@ -508,6 +564,29 @@ def render_evaluation_report(
                 f"- synthetic_manual_item_hash: {_inline(record['manual_item_hash'])}",
             ]
         )
+        if record["domain"] == "adapter_manual_disposition":
+            disposition = record["disposition"]
+            lines.extend(
+                [
+                    f"- synthetic_manual_path: {_inline(disposition['path'])}",
+                    f"- synthetic_manual_reason: {_inline(disposition['reason'])}",
+                    f"- synthetic_manual_disposition_id: {_inline(disposition['disposition_id'])}",
+                    "- synthetic_manual_atom_ids:",
+                    *(
+                        f"  - synthetic_manual_atom_id: {_inline(atom_id)}"
+                        for atom_id in disposition["atom_ids"]
+                    ),
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"- synthetic_candidate_hash: {_inline(record['candidate_hash'])}",
+                    f"- synthetic_duplicate_ordinal: {_inline(record['duplicate_ordinal'])}",
+                    "- synthetic_verifier_result_envelope_hash: "
+                    + _inline(record["verifier_result_envelope_hash"]),
+                ]
+            )
     content = "\n".join(lines) + "\n"
     _safe(content, "rendered evaluation")
     if not _evaluation_markers_valid(content):

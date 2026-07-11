@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass
@@ -11,12 +12,14 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import unicodedata
 import uuid
 
 from .backend import (
     RUN_MANIFEST_VERSION,
     WORKER_ENVIRONMENT_POLICY_SHA256,
+    CodexCliBackend,
     ENVIRONMENT_ALLOWLIST,
     WorkerAttempt,
     WorkerBackend,
@@ -53,6 +56,8 @@ from .redaction import (
     redaction_contract,
 )
 from .render import (
+    MaterializationError,
+    RenderError,
     make_report_payload,
     materialize_non_authoritative_view,
     render_diagnostic_report,
@@ -666,7 +671,15 @@ def validate_evaluation_diagnostic(value: object) -> None:
 
 
 def _sibling_view_path(session_root: Path, basename: str) -> Path:
-    return session_root.expanduser().resolve().parent / basename
+    return session_root.parent / basename
+
+
+def _contains_output_control(value: str) -> bool:
+    return any(
+        character in "\r\n\u2028\u2029"
+        or unicodedata.category(character) in {"Cc", "Cf"}
+        for character in value
+    )
 
 
 def _outcome_completion(payload: dict, path: Path) -> EvaluationOutcome:
@@ -697,14 +710,25 @@ def _validate_request(request: object) -> EvaluationRequest:
             raise EvaluationInputError(f"{field} must be a nonempty string")
     if request.base == request.head:
         raise EvaluationInputError("base and head must name different revisions")
-    session_root = request.session_root.expanduser().resolve()
+    try:
+        session_root = request.session_root.expanduser().resolve()
+    except (OSError, RuntimeError) as error:
+        raise EvaluationInputError("session root cannot be resolved safely") from error
+    if _contains_output_control(str(session_root)):
+        raise EvaluationInputError("session root contains terminal control characters")
     try:
         assert_safe_sink({"model": request.model, "session_root": str(session_root)})
     except SensitiveMaterialError as error:
         raise EvaluationInputError("request contains unsafe persisted input") from error
     if os.path.lexists(session_root):
         raise EvaluationInputError("session root must not already exist")
-    return request
+    return EvaluationRequest(
+        repo=request.repo,
+        base=request.base,
+        head=request.head,
+        model=request.model,
+        session_root=session_root,
+    )
 
 
 def _pre_session_diagnostic(
@@ -1013,7 +1037,7 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
     """Run one synthetic evaluation protocol and materialize its truthful view."""
 
     request = _validate_request(request)
-    session_root = request.session_root.expanduser().resolve()
+    session_root = request.session_root
     try:
         readiness = deepcopy(backend.readiness())
         assert_safe_sink(readiness)
@@ -1519,3 +1543,127 @@ def evaluate(request: EvaluationRequest, backend: WorkerBackend) -> EvaluationOu
         document_kind="evaluation_report",
     )
     return _outcome_completion(canonical_completion, path)
+
+
+class _CliArgumentError(ValueError):
+    """Raised without retaining or echoing untrusted command-line values."""
+
+
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, _message: str) -> None:
+        raise _CliArgumentError("invalid command line")
+
+
+def _argument_parser() -> argparse.ArgumentParser:
+    parser = _SafeArgumentParser(
+        prog="local-ultra-review-v2",
+        description="Run the guarded V2 protocol evaluation slice.",
+        allow_abbrev=False,
+    )
+    commands = parser.add_subparsers(
+        dest="command",
+        required=True,
+        parser_class=_SafeArgumentParser,
+    )
+    evaluate_parser = commands.add_parser(
+        "evaluate",
+        help="evaluate one explicit two-dot target",
+        allow_abbrev=False,
+    )
+    for option, help_text in (
+        ("--repo", "repository path"),
+        ("--base", "explicit base revision"),
+        ("--head", "explicit head revision"),
+        ("--model", "explicit model identifier"),
+        ("--session-root", "new canonical session path"),
+        ("--codex-path", "Codex CLI file path"),
+        ("--qualification-record", "adapter-owned diagnostic record"),
+    ):
+        evaluate_parser.add_argument(option, required=True, help=help_text)
+    return parser
+
+
+def _emit_outcome(outcome: EvaluationOutcome) -> int:
+    if outcome.evaluation_completion is not None:
+        path = outcome.evaluation_report_path
+        authority = outcome.evaluation_completion["authority"]
+        status = "complete"
+        exit_code = 0
+    elif outcome.diagnostic is not None:
+        path = outcome.diagnostic_path
+        authority = outcome.diagnostic["authority"]
+        status = outcome.diagnostic["status"]
+        exit_code = 3
+    else:
+        path = outcome.recovery_diagnostic_path
+        authority = "non_authoritative"
+        status = "integrity_failure"
+        exit_code = 4
+    if path is None:
+        print("status=integrity_failure", file=sys.stderr)
+        return 4
+    path_text = str(path)
+    summary = f"authority={authority} status={status}"
+    if _contains_output_control(path_text) or _contains_output_control(summary):
+        print("status=integrity_failure", file=sys.stderr)
+        return 4
+    print(path_text)
+    print(summary)
+    return exit_code
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the only production CLI path: blocked Codex diagnostic evaluation."""
+
+    try:
+        arguments = _argument_parser().parse_args(argv)
+    except _CliArgumentError:
+        print("status=input_error", file=sys.stderr)
+        return 2
+    for field in (
+        "repo",
+        "base",
+        "head",
+        "model",
+        "session_root",
+        "codex_path",
+        "qualification_record",
+    ):
+        value = getattr(arguments, field)
+        if not isinstance(value, str) or not value or _contains_output_control(value):
+            print("status=input_error", file=sys.stderr)
+            return 2
+    request = EvaluationRequest(
+        repo=Path(arguments.repo),
+        base=arguments.base,
+        head=arguments.head,
+        model=arguments.model,
+        session_root=Path(arguments.session_root),
+    )
+    try:
+        backend = CodexCliBackend(
+            codex_path=Path(arguments.codex_path),
+            model=arguments.model,
+            qualification_record=Path(arguments.qualification_record),
+        )
+    except (SensitiveMaterialError, ValueError, WorkerProtocolError):
+        print("status=input_error", file=sys.stderr)
+        return 2
+    try:
+        outcome = evaluate(request, backend)
+    except (
+        ContractError,
+        EvaluationInputError,
+        SensitiveMaterialError,
+        WorkerProtocolError,
+    ):
+        print("status=input_error", file=sys.stderr)
+        return 2
+    except (IntegrityError, MaterializationError, RenderError):
+        print("status=integrity_failure", file=sys.stderr)
+        return 4
+    return _emit_outcome(outcome)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

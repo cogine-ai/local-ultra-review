@@ -337,13 +337,22 @@ def seal_two_dot_target(repo: Path, base: str, head: str) -> SealedTarget:
             }
         )
         atoms.append(metadata)
-        for header in _normalized_hunks(raw_path_diff):
+        hunk_headers = _normalized_hunks(raw_path_diff)
+        for header in hunk_headers:
             atoms.append(_atom({"kind": "text_hunk", "path": path, "hunk_header": header}))
 
         redaction = classify_and_redact_diff(raw_path_diff, (record,))
         safe_parts.append(redaction.safe_diff_text.rstrip("\n"))
         for hint in redaction.manual_dispositions:
             manual_hints.append((path, hint["reason"], hint.get("hunk_header")))
+        if (
+            not hunk_headers
+            and record["status"] == "M"
+            and record["old_mode"] in {"100644", "100755"}
+            and record["new_mode"] in {"100644", "100755"}
+            and record["old_mode"] != record["new_mode"]
+        ):
+            manual_hints.append((path, "mode_only_change", None))
 
     atoms.sort(key=lambda item: (item["path"], 0 if item["kind"] == "path_metadata" else 1, item.get("hunk_header", "")))
     manual: list[dict] = []

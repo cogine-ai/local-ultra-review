@@ -215,6 +215,20 @@ class GitTargetTests(unittest.TestCase):
         self.assertTrue(
             any(atom["path"] == "mode.sh" and atom["kind"] == "path_metadata" for atom in target.coverage_atoms)
         )
+        self.assertTrue(
+            any(
+                item["path"] == "mode.sh"
+                and item["reason"] == "mode_only_change"
+                for item in target.manual_dispositions
+            )
+        )
+        mode_atom_ids = {
+            atom["atom_id"]
+            for atom in target.coverage_atoms
+            if atom["path"] == "mode.sh"
+        }
+        self.assertTrue(mode_atom_ids <= manual)
+        self.assertFalse(mode_atom_ids & reviewed)
 
     def test_symlink_and_gitlink_are_manual_not_omitted(self) -> None:
         temporary, repo = self.make_repo()
