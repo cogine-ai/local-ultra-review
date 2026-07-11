@@ -670,7 +670,9 @@ attribute failures propagate.
 
 - Create: `src/local_ultra_review/render.py`
 - Modify: `src/local_ultra_review/orchestrator.py`
+- Modify: `src/local_ultra_review/store.py`
 - Extend: `tests/test_v2_orchestrator.py`
+- Extend: `tests/test_v2_core.py`
 
 ### Required interfaces
 
@@ -681,15 +683,38 @@ def render_diagnostic_report(*, plan: dict | None, state: str, reasons: list[str
 def write_recovery_diagnostic(*, sibling_path: Path, reason_codes: list[str]) -> Path: ...
 ```
 
+- `artifacts` in `render_evaluation_report` is exactly the canonical Store readback of
+  accepted `reviewer_result` and `verifier_result` envelopes (empty for an all-manual
+  completion). The renderer verifies each envelope and requires its exact hash set to
+  equal `completion.accepted_artifact_hashes`; it never consumes in-memory attempts.
 - Evaluation rendering is allowed only after store verification and a schema-valid synthetic evaluation-completion artifact.
 - Task 5 is the sole owner of materialized diagnostic/recovery files. It consumes Task 4's structured pre-session diagnostic, canonical post-Store diagnostic artifact, or in-memory integrity reason codes; Task 4 contains no duplicate external-file writer.
 - The first heading and front matter say **Synthetic protocol evaluation — not a code-review result**, `authority=synthetic_evaluation`, `authoritative_review=false`, `profile=evaluation_slice_v2`, and `release_ready=false`. It states that even a simulated `clean` fixture makes no claim that the target is clean.
 - The exact complete-review banner is forbidden in fake/evaluation output. `evaluation-report.md` may show `simulated_review_verdict`, confirmed fixture findings, and manual fixture items only when every label remains explicitly synthetic.
 - Diagnostic rendering states the actual incomplete/blocked state, reason codes, and current guarded limitations (`residual_tool_surface=unknown`, `worker_child_environment=not_verified`). It must not contain false-clean phrases as outcome claims.
 - Renderer rejects missing/mismatched synthetic authority, selected-profile positive hard claims, completion/artifact hash mismatch, unsafe sensitive bytes, or any attempt to materialize fake output as `report.md`.
+- A canonical report artifact has the exact payload
+  `{report_contract_version, document_kind, media_type, content_sha256, content}`.
+  `document_kind` must match `evaluation_report` or `diagnostic_report`, `media_type`
+  is fixed to UTF-8 Markdown, and `content_sha256` is the SHA-256 of the exact UTF-8
+  materialized bytes. Store verification validates this payload contract and the
+  report's truthful fixed markers; an arbitrary adapter-authored dictionary is not a
+  valid report artifact.
 - For evaluation and normal post-Store diagnostic rendering, first persist rendered bytes as a content-addressed `evaluation_report` or `diagnostic_report` artifact and commit its ledger event. Verify the Store, then atomically materialize the non-authoritative view as a sibling `evaluation-report.md` or `diagnostic.md` **outside** the canonical session directory; the Store root continues to contain only `plan.json`, `ledger.jsonl`, and `artifacts/`.
 - A pre-session blocked diagnostic has no Store by design. Validate the strict Task 4 diagnostic object, then atomically materialize a sibling `diagnostic.md` marked non-authoritative/pre-session with no target or result claim. A materialized view is never the authority.
 - `write_recovery_diagnostic` is used only after integrity failure, writes outside the session directory with staging+fsync+atomic rename, contains only stable reason codes (no unsafe-payload digest), makes no target/result claims, and labels itself non-authoritative because canonical state could not be verified.
+- Materialization has one implementation-owned path. It accepts only the exact sibling
+  basenames `evaluation-report.md`, `diagnostic.md`, or `recovery-diagnostic.md`, so
+  `report.md` is structurally unreachable. It writes a mode-0600 staging file, fsyncs,
+  atomically replaces an existing regular non-symlink view, and fsyncs the parent.
+  Replacing a prior materialized view is allowed because the view is explicitly
+  non-authoritative; a symlink/non-regular destination or any failed/uncertain write
+  raises a sanitized materialization error and never returns a path.
+- `EvaluationOutcome` remains an exclusive three-way channel, and Task 5 makes its
+  paths exact: completion has only an absolute `evaluation-report.md`, diagnostic has
+  only an absolute `diagnostic.md`, and integrity recovery has only an absolute
+  `recovery-diagnostic.md`. No public Task 5 outcome may claim a channel while leaving
+  its corresponding materialized path absent.
 
 ### TDD sequence
 
