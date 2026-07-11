@@ -40,14 +40,23 @@ _PROVIDER_TOKENS: tuple[tuple[str, re.Pattern[str]], ...] = (
 _SECRET_KEY_PATTERN = (
     r"(?:api[_-]?key|secret|password|passwd|token|access[_-]?token|private[_-]?key)"
 )
-_QUOTED_ASSIGNMENT = re.compile(
-    rf"(?i)[\"']?{_SECRET_KEY_PATTERN}[\"']?\s*[=:]\s*"
-    rf"(?P<quote>[\"'])(?P<value>[^\r\n]*?)(?P=quote)"
+_DOUBLE_QUOTED_ASSIGNMENT = re.compile(
+    rf'(?i)[\"\']?{_SECRET_KEY_PATTERN}[\"\']?\s*[=:]\s*"'
+    rf'(?P<value>(?:\\.|[^"\\\r\n])*)"'
+)
+_SINGLE_QUOTED_ASSIGNMENT = re.compile(
+    rf"(?i)[\"']?{_SECRET_KEY_PATTERN}[\"']?\s*[=:]\s*'"
+    rf"(?P<value>(?:\\.|[^'\\\r\n])*)'"
 )
 _UNQUOTED_ASSIGNMENT = re.compile(
     rf"(?i)[\"']?{_SECRET_KEY_PATTERN}[\"']?\s*[=:]\s*"
     rf"(?P<value>(?!(?:redacted|placeholder|example|dummy|none|null)(?:\b|$))"
     rf"[^\s\"',#}}\]]{{8,}})"
+)
+_ASSIGNMENT_PATTERNS = (
+    _DOUBLE_QUOTED_ASSIGNMENT,
+    _SINGLE_QUOTED_ASSIGNMENT,
+    _UNQUOTED_ASSIGNMENT,
 )
 _SENSITIVE_BASENAMES = {
     "credentials",
@@ -125,7 +134,7 @@ def _redact_text(text: str, path: str) -> tuple[str, tuple[dict, ...]]:
     for reason, pattern in _PROVIDER_TOKENS:
         for match in pattern.finditer(text):
             matches.append((match.start(), match.end(), 2, reason))
-    for pattern in (_QUOTED_ASSIGNMENT, _UNQUOTED_ASSIGNMENT):
+    for pattern in _ASSIGNMENT_PATTERNS:
         for match in pattern.finditer(text):
             if _is_safe_placeholder(match.group("value")):
                 continue
@@ -227,7 +236,7 @@ def classify_and_redact_diff(
 def _unsafe_string(value: str) -> bool:
     if _PRIVATE_KEY.search(value):
         return True
-    for pattern in (_QUOTED_ASSIGNMENT, _UNQUOTED_ASSIGNMENT):
+    for pattern in _ASSIGNMENT_PATTERNS:
         if any(not _is_safe_placeholder(match.group("value")) for match in pattern.finditer(value)):
             return True
     return any(pattern.search(value) for _reason, pattern in _PROVIDER_TOKENS)

@@ -320,6 +320,11 @@ class GitTargetTests(unittest.TestCase):
 
         run(["git", "config", "diff.noprefix", "true"], repo.root)
         run(["git", "config", "diff.algorithm", "histogram"], repo.root)
+        git_dir = Path(str(run(["git", "rev-parse", "--git-dir"], repo.root)).strip())
+        if not git_dir.is_absolute():
+            git_dir = repo.root / git_dir
+        (git_dir / "info").mkdir(exist_ok=True)
+        (git_dir / "info/attributes").write_text("app.py -diff\n", encoding="utf-8")
         repo.write_text(".gitattributes", "app.py -diff\n")
         repo.write_text("app.py", "VALUE = 3\n")
         repo.commit("later attributes")
@@ -424,6 +429,24 @@ class RedactionTests(unittest.TestCase):
         self.assertTrue(
             any(item["reason"] == "sensitive_content_redacted" for item in target.manual_dispositions)
         )
+
+    def test_json_escaped_quotes_do_not_truncate_secret_redaction(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        repo = GitRepo(Path(temporary.name))
+        repo.write_text("config.json", "{}\n")
+        base = repo.commit("base")
+        raw_secret = 'correct horse, "battery" staple'
+        repo.write_text("config.json", json.dumps({"password": raw_secret}) + "\n")
+        head = repo.commit("secret")
+
+        target = seal_two_dot_target(repo.root, base, head)
+        packet = json.dumps(build_review_packet(target), sort_keys=True)
+        self.assertNotIn("battery", packet)
+        self.assertNotIn("staple", packet)
+        self.assertIn("[REDACTED:secret_assignment:", target.redacted_diff_text)
+        with self.assertRaises(SensitiveMaterialError):
+            assert_safe_sink(json.dumps({"password": raw_secret}))
 
 
 def plan_for(session_root: Path) -> dict:

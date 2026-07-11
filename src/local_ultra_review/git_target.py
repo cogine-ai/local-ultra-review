@@ -7,6 +7,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import tempfile
 
 from .contracts import SCHEMA_VERSION, sha256_json
 from .redaction import RULESET_HASH, assert_safe_sink, classify_and_redact_diff
@@ -33,7 +34,13 @@ _HUNK = re.compile(rb"^@@\s+(-[^ ]+)\s+(\+[^ ]+)\s+@@", re.MULTILINE)
 _REGULAR_MODES = {"000000", "100644", "100755"}
 
 
-def _git(root: Path, args: list[str], *, attr_source: str | None = None) -> bytes:
+def _git(
+    root: Path,
+    args: list[str],
+    *,
+    attr_source: str | None = None,
+    repository_view: dict[str, str] | None = None,
+) -> bytes:
     environment = os.environ.copy()
     environment.update(
         {
@@ -47,6 +54,17 @@ def _git(root: Path, args: list[str], *, attr_source: str | None = None) -> byte
     )
     environment.pop("GIT_EXTERNAL_DIFF", None)
     environment.pop("GIT_DIFF_OPTS", None)
+    for key in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+    ):
+        environment.pop(key, None)
+    if repository_view is not None:
+        environment.update(repository_view)
     if attr_source is None:
         environment.pop("GIT_ATTR_SOURCE", None)
     else:
@@ -213,40 +231,87 @@ def seal_two_dot_target(repo: Path, base: str, head: str) -> SealedTarget:
         raise TargetError("base and head resolve to the same commit")
 
     range_arg = f"{base_sha}..{head_sha}"
-    raw_records = _parse_raw(
-        _git(
-            root,
-            [
-                "diff",
-                "--raw",
-                "-z",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-renames",
-                range_arg,
-                "--",
-            ],
-            attr_source=head_sha,
+    try:
+        object_directory = (
+            _git(root, ["rev-parse", "--path-format=absolute", "--git-path", "objects"])
+            .decode("utf-8")
+            .strip()
         )
-    )
-    if not raw_records:
-        raise TargetError("target diff is empty")
-    binary_by_path = _parse_numstat(
-        _git(
-            root,
-            [
-                "diff",
-                "--numstat",
-                "-z",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-renames",
-                range_arg,
-                "--",
-            ],
-            attr_source=head_sha,
+    except UnicodeDecodeError as error:
+        raise TargetError("repository object directory is invalid") from error
+    if not Path(object_directory).is_dir():
+        raise TargetError("repository object directory is unavailable")
+    with tempfile.TemporaryDirectory(prefix="local-ultra-review-git-view-") as temporary_git:
+        isolated_git = Path(temporary_git) / "repo.git"
+        _git(root, ["init", "--bare", "-q", str(isolated_git)])
+        repository_view = {
+            "GIT_DIR": str(isolated_git),
+            "GIT_OBJECT_DIRECTORY": object_directory,
+        }
+        raw_records = _parse_raw(
+            _git(
+                root,
+                [
+                    "diff",
+                    "--raw",
+                    "-z",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-renames",
+                    range_arg,
+                    "--",
+                ],
+                attr_source=head_sha,
+                repository_view=repository_view,
+            )
         )
-    )
+        if not raw_records:
+            raise TargetError("target diff is empty")
+        binary_by_path = _parse_numstat(
+            _git(
+                root,
+                [
+                    "diff",
+                    "--numstat",
+                    "-z",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-renames",
+                    range_arg,
+                    "--",
+                ],
+                attr_source=head_sha,
+                repository_view=repository_view,
+            )
+        )
+        raw_path_diffs = {
+            record["path"]: _git(
+                root,
+                [
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--no-renames",
+                    range_arg,
+                    "--",
+                    f":(literal){record['path']}",
+                ],
+                attr_source=head_sha,
+                repository_view=repository_view,
+            )
+            for record in raw_records
+        }
+        roots = sorted(
+            line
+            for line in _git(
+                root,
+                ["rev-list", "--max-parents=0", base_sha],
+                repository_view=repository_view,
+            )
+            .decode("ascii")
+            .splitlines()
+            if line
+        )
     if set(binary_by_path) != {record["path"] for record in raw_records}:
         raise TargetError("raw and numstat changed-path manifests disagree")
 
@@ -259,19 +324,7 @@ def seal_two_dot_target(repo: Path, base: str, head: str) -> SealedTarget:
         special_reason = _special_reason(record)
         if special_reason:
             record["special_reason"] = special_reason
-        raw_path_diff = _git(
-            root,
-            [
-                "diff",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-renames",
-                range_arg,
-                "--",
-                f":(literal){path}",
-            ],
-            attr_source=head_sha,
-        )
+        raw_path_diff = raw_path_diffs[path]
         if not raw_path_diff:
             record["special_reason"] = "unparseable_diff"
         metadata = _atom(
@@ -334,11 +387,6 @@ def seal_two_dot_target(repo: Path, base: str, head: str) -> SealedTarget:
         }
         for record in raw_records
     ]
-    roots = sorted(
-        line
-        for line in _git(root, ["rev-list", "--max-parents=0", base_sha]).decode("ascii").splitlines()
-        if line
-    )
     identity_payload = {
         "schema_version": SCHEMA_VERSION,
         "repository_roots": roots,
